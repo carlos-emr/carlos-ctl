@@ -193,6 +193,78 @@ would not see the repository. Runs outside the timer unit's sandbox, so it
 can also restore to paths the unit itself may not write.
 .SS Provisioning
 .TP
+.B finish-install
+Finish an installation whose database provisioning did not run, and start the
+EMR. Every provisioning step in the package's postinst is deliberately
+non\-fatal \(em a database that is unreachable must not leave dpkg
+half\-configured and block the rest of an apt transaction \(em so an install
+can end with no clinical schema while apt still reports success. The postinst
+records that in
+.IR /var/lib/carlos\-emr/.install\-incomplete ,
+.B check
+reports it, and this command completes it: configuration, the MariaDB settings drop\-in, the
+accounts, the schema, the seeded administrator credential, and the
+demonstration dataset if the install asked for one.
+.IP
+It is idempotent, so a step that already succeeded is detected and skipped, and
+it can be re\-run after fixing whatever stopped the install. DrugRef answering
+nothing on loopback is usually this same failure seen from the other end: it
+shares the application server that never started.
+.IP
+Any failed required or requested step returns nonzero and keeps the install
+pending. Fix the reported error, then run the command again. A failed service
+start also restores the marker. If the marker cannot be written, automatic
+retry is not assured; retry manually after fixing the filesystem.
+.IP
+Only one provisioning run at a time: an exclusive lock on
+.I /var/lib/carlos-emr/.finish-install.lock
+is held for the life of the run, so a hand\-typed repair, the boot\-time
+provisioner and the package's own configure \(em which takes the same file
+\(em cannot both provision accounts or both generate an administrator
+credential. A second run by hand is refused and names the first; at boot it
+leaves the work to whoever holds the lock.
+.IP
+The credential guard the postinst and this command use \(em
+.I /var/lib/carlos-emr/.seed-credential-live
+\(em is what blocks a start of
+.BR carlos\-emr.service ;
+disabling a unit does not. If that file cannot be written while the published
+.B carlosdoc
+credential may still be live, the unit is MASKED instead and the failure says
+so. A later successful
+.B finish-install
+unmasks it; do not unmask it by hand before the credential has been replaced.
+.IP
+While
+.B import-o19
+is copying a clinic's database this command refuses to run: it consults the
+same shipped guard
+.BR carlos\-emr.service
+runs as its
+.B ExecCondition=
+\(em settings, grants and a migration would all land inside a half\-copied
+schema. At boot it records that and stops there instead of failing, so the
+boot after the import finishes completes the install.
+.IP
+DrugRef data is provisioned separately. An empty drugref2 database requires
+.BR "dpkg-reconfigure carlos-emr-drugref" .
+Existing tables without a seed-completion marker require a backup and
+administrator review before reloading; populated databases are left alone.
+Run
+.B check
+and test a prescribing lookup after recovery.
+.IP
+.B carlos\-emr\-provision.service
+runs
+.B finish-install --boot
+once at each boot, ordered before
+.BR carlos\-emr.service ,
+so an install interrupted by a database that went away completes by itself. In
+that mode it does nothing without the marker, and it will NOT migrate a schema
+that already has tables: an upgrade migration is a decision taken after a
+verified backup, with
+.BR db-migrate .
+.TP
 .B init-config
 Re\-render AND APPLY the derived configuration from
 .IR /etc/carlos\-emr/carlos\-emr.env :
@@ -209,7 +281,10 @@ Replace the seeded
 administrator password and PIN with random values and write them to
 .IR /etc/carlos\-emr/initial\-admin.txt .
 The migrations seed that account with a hash published in the CARLOS source
-repository, so this runs at install time by default.
+repository, so this runs at install time by default. If a failed installation
+left a credential guard or disabled service, use
+.B finish-install
+to complete recovery and restore service startup.
 .TP
 .B db-users
 Create the databases and the least\-privilege accounts (the verb name
@@ -512,6 +587,18 @@ WAF policy and site exclusions.
 .TP
 .I /etc/nginx/sites-available/carlos-emr
 The front door.
+.TP
+.I /var/lib/carlos-emr/.install-incomplete
+Present when the installer could not provision the database. Names the reason
+and what the install asked for; removed by a successful
+.B finish-install
+or reconfigure.
+.TP
+.I /var/lib/carlos-emr/.finish-install.lock
+The lock that keeps a hand\-typed
+.BR finish-install ,
+the boot\-time provisioner and the package's own configure from provisioning
+at the same time.
 .TP
 .I /var/lib/carlos-emr/o19-import/
 Workspace of an OSCAR 19 import (root\-only, created by
