@@ -13,6 +13,7 @@ import csv
 import io
 import os
 import shutil
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -1322,8 +1323,14 @@ class TestArchiveCsvNulls(unittest.TestCase):
         # the stored four-character string 'NULL', never SQL NULL
         self.assertEqual(rows[3], ["3", "NULL"])
 
-    @unittest.skipUnless(hasattr(csv, "QUOTE_NOTNULL"),
-                         "interpreter predates csv.QUOTE_NOTNULL (3.12)")
+    # 3.13, not "has csv.QUOTE_NOTNULL": 3.12 introduced the constant and
+    # honours it when WRITING (the export is correct there, and the raw
+    # assertion below would hold), but its reader ignores it and hands a
+    # bare NULL cell back as '' -- the documented degradation the test
+    # above tolerates. The reader was fixed in 3.13; Ubuntu 26.04, the
+    # target, ships 3.14.
+    @unittest.skipUnless(sys.version_info >= (3, 13),
+                         "csv reader honours QUOTE_NOTNULL from 3.13")
     def test_sql_null_is_distinguishable_from_an_empty_string(self):
         # the whole reason the writer asks for QUOTE_NOTNULL: on the
         # interpreter the package actually ships against, a stored '' and
