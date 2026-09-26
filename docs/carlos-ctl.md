@@ -72,7 +72,7 @@ Notes a first-time operator should not learn the hard way:
 
 ## Post-install configuration, in order
 
-The first-hour walkthrough in [docs/install-deb.md](install-deb.md#quickstart--the-first-hour)
+The first-hour walkthrough in [docs/install-deb.md](https://github.com/carlos-emr/carlos/blob/develop/docs/install-deb.md#quickstart--the-first-hour)
 covers this end to end; the short version, in the order that retires the most
 risk first:
 
@@ -120,7 +120,7 @@ it. Everything runs with `sudo`.
 | `db-info` | Show the Flyway schema migration state |
 | `db-validate` | Verify the schema matches the deployed WAR |
 | `db-migrate` | Apply pending migrations — **back up first** |
-| `db-baseline` | Adopt an existing pre-Flyway (OSCAR 19 / OpenO) database: reconcile the live schema up to the genesis, prepare the adopted data for the forward migrations, then stamp (`--dry-run`, `--stamp-only`) — see [OSCAR 19 adoption](oscar19-legacy-adoption.md) |
+| `db-baseline` | Adopt an existing pre-Flyway (OSCAR 19 / OpenO) database: reconcile the live schema up to the genesis, prepare the adopted data for the forward migrations, then stamp (`--dry-run`, `--stamp-only`) — see [OSCAR 19 adoption](https://github.com/carlos-emr/carlos/blob/develop/docs/oscar19-legacy-adoption.md) |
 | `db-repair` | Fix `flyway_schema_history` after a failed migration |
 | `db-apply-settings` | Restart MariaDB if it is not running the settings in the CARLOS drop-in |
 | `db-dump` | Consistent dump to stdout |
@@ -184,5 +184,5 @@ sudo carlos-ctl destroy-data --confirm <server-name>
   runs as whom, TLS, WAF tuning and the false-positive workflow, backups and
   point-in-time restore, upgrades, log retention as a compliance decision,
   and troubleshooting.
-- [docs/install-deb.md](install-deb.md) — installation, the first hour, and
+- [docs/install-deb.md](https://github.com/carlos-emr/carlos/blob/develop/docs/install-deb.md) — installation, the first hour, and
   a first-day troubleshooting table.

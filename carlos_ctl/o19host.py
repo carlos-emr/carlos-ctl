@@ -56,6 +56,27 @@ SERVICE_USER = "carlos"
 STAGING_ACCOUNT_HOSTS = ("localhost", "%")
 
 
+#: the executables a `client_base_argv` may name as the mariadb client;
+#: anything before that element on the argv is the deployment's runner
+CLIENT_EXECUTABLES = ("mariadb", "mysql")
+
+
+def client_index(argv: Sequence[str]) -> int:
+    """Index of the mariadb client executable on a `client_base_argv`
+    result: 0 for the deb (`mariadb ...`), later for a deployment that
+    wraps it in a runner (`podman exec -i db mariadb ...`). Raises
+    ValueError when no element is a known client, so a port whose argv
+    names something else is refused loudly rather than having its
+    runner's own options rewritten as connection options."""
+    for i, a in enumerate(argv):
+        if os.path.basename(a) in CLIENT_EXECUTABLES:
+            return i
+    raise ValueError(
+        "client_base_argv names no mariadb client executable ({0}); "
+        "a Host port must end its runner prefix with one of {1}".format(
+            list(argv), ", ".join(CLIENT_EXECUTABLES)))
+
+
 class Host(object):
 
     """The deb package's deployment, and the base every other implements.
@@ -186,10 +207,17 @@ class Host(object):
         partially failed restore into a successful client exit."""
         from .o19import import (STAGING_SCHEMA, staging_init_command,
                                 strip_client_identity)
-        tail = strip_client_identity(list(base_argv)[1:])
-        return (["mariadb", "--defaults-extra-file=" + client_cnf,
-                 "--user=" + STAGING_USER, "--local-infile=0",
-                 "--max-allowed-packet=1G"] + tail
+        argv = list(base_argv)
+        client = client_index(argv)
+        # Everything BEFORE the client executable is the runner a
+        # deployment wraps it in (`podman exec -i db mariadb ...`) and is
+        # kept as-is; the connection tail after it is what gets its
+        # identity replaced.
+        tail = strip_client_identity(argv[client + 1:])
+        return (argv[:client]
+                + [argv[client], "--defaults-extra-file=" + client_cnf,
+                   "--user=" + STAGING_USER, "--local-infile=0",
+                   "--max-allowed-packet=1G"] + tail
                 + ["--binary-mode", "--skip-force", "--one-database",
                    "--init-command=" + staging_init_command(
                        statement_timeout),

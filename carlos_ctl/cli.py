@@ -305,7 +305,11 @@ def _verb_usage(verb: str) -> str:
     for line in _USAGE.splitlines():
         # The verb column ends at the first double space before the description.
         head = line[len("  carlos-ctl "):].split("  ", 1)[0] if line.startswith("  carlos-ctl ") else ""
-        names_verb = verb in [name.strip() for name in head.split(" / ")]
+        # "start / stop" lists alternatives; "import-o19 (experimental)" and
+        # "destroy-data --confirm <server-name>" carry a note or arguments
+        # after the verb, so the first token is matched too
+        names_verb = verb in [name.strip() for name in head.split(" / ")] \
+            or head.split(" ", 1)[0] == verb
         if names_verb or (lines and line.startswith(" " * 34)):
             lines.append(line)
         elif lines:
@@ -340,8 +344,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     # carlos-emr` -- say so in one line instead of failing on whichever
     # missing file the verb reaches first. After the argument gates, so a
     # mistyped command is still answered as a mistyped command, and never
-    # for --help.
-    if rest not in (["-h"], ["--help"], ["help"]):
+    # for --help: a help request on a host without carlos-emr is answered
+    # from this file's own usage table, because the verbs' fuller help
+    # lives behind that package's files (import-o19 builds its parser
+    # after loading the manifests carlos-emr ships, cert and backup are
+    # the package's helper scripts) and would fail instead of helping.
+    if rest in (["-h"], ["--help"], ["help"]):
+        if not util.carlos_emr_installed():
+            print(f"usage:\n{_verb_usage(verb)}\n\n"
+                  f"(carlos-emr is not installed on this host; the full "
+                  f"help for '{verb}' is available once it is)")
+            return 0
+    else:
         require_carlos_emr(verb)
     try:
         return int(handler(rest) or 0)

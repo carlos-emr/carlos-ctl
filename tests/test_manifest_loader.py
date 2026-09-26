@@ -34,6 +34,10 @@ def _write(directory, file_kind, **overrides):
     envelope overridable (a wrong format, a wrong kind)."""
     body = {"format": o19manifest.MANIFEST_FORMAT, "kind": file_kind,
             "generator": "test", "SCHEMA_MAP_VERSION": "o19map-0+test"}
+    # every key the format requires, so the envelope tests exercise the
+    # envelope and not the completeness check
+    for key in o19manifest.REQUIRED_KEYS.get(file_kind, ()):
+        body.setdefault(key, {})
     body.update(overrides)
     path = os.path.join(directory, o19manifest.MANIFEST_FILES[file_kind])
     with open(path, "w", encoding="utf-8") as fh:
@@ -54,10 +58,47 @@ class TestEnvelope(unittest.TestCase):
     def test_a_good_file_returns_the_data_keys_only(self):
         _write(self.tmp.name, "o19map-props", KEYS={"a": 1})
         data = o19manifest.load("o19map-props")
-        self.assertEqual(data, {"SCHEMA_MAP_VERSION": "o19map-0+test",
-                                "KEYS": {"a": 1}})
+        self.assertEqual(data["SCHEMA_MAP_VERSION"], "o19map-0+test")
+        self.assertEqual(data["KEYS"], {"a": 1})
         for envelope_key in ("format", "kind", "generator"):
             self.assertNotIn(envelope_key, data)
+        self.assertEqual(
+            set(data), set(o19manifest.REQUIRED_KEYS["o19map-props"])
+            | {"SCHEMA_MAP_VERSION"})
+
+    def test_a_boolean_format_is_not_format_one(self):
+        # JSON true == 1 in Python; the envelope check is on the TYPE too
+        _write(self.tmp.name, "o19map-props", format=True)
+        with self.assertRaises(o19manifest.ManifestError) as caught:
+            o19manifest.load("o19map-props")
+        self.assertIn("format", str(caught.exception))
+
+    def test_a_key_the_format_requires_cannot_be_missing(self):
+        # right envelope, hole in the data: refused here as ONE message
+        # naming the key, not a KeyError from the first consumer to read it
+        path = _write(self.tmp.name, "o19map-schema")
+        with open(path, encoding="utf-8") as fh:
+            body = json.load(fh)
+        del body["PRIMITIVE_COLUMNS"], body["PROFILES"]
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(body, fh)
+        with self.assertRaises(o19manifest.ManifestError) as caught:
+            o19manifest.load("o19map-schema")
+        message = str(caught.exception)
+        self.assertIn("PRIMITIVE_COLUMNS", message)
+        self.assertIn("PROFILES", message)
+        self.assertIn("reinstall carlos-emr", message)
+
+    def test_the_required_keys_are_what_the_shipped_manifests_carry(self):
+        # the fixtures are the generator's output: every required key is
+        # there, and every data key is required (the two lists move together)
+        for kind, filename in o19manifest.MANIFEST_FILES.items():
+            fixtures = os.path.join(os.path.dirname(__file__), "fixtures",
+                                    "o19-manifest")
+            with open(os.path.join(fixtures, filename), encoding="utf-8") as fh:
+                keys = {k for k in json.load(fh)
+                        if k not in ("format", "kind", "generator")}
+            self.assertEqual(keys, set(o19manifest.REQUIRED_KEYS[kind]), kind)
 
     def test_a_missing_file_names_carlos_emr_as_the_provider(self):
         with self.assertRaises(o19manifest.ManifestError) as caught:
@@ -239,6 +280,26 @@ class TestPreflightManifest(unittest.TestCase):
             self.assertIn(o19manifest.render_preflight_block(data), text)
             self.assertLessEqual(
                 max(len(line) for line in text.splitlines()), 100)
+
+    def test_write_standalone_does_not_follow_a_planted_temporary_name(self):
+        # `dest + ".tmp"` is predictable: a symlink planted there by
+        # another account must not become the file that is truncated
+        with tempfile.TemporaryDirectory() as tmp:
+            canary = os.path.join(tmp, "canary")
+            with open(canary, "w", encoding="utf-8") as fh:
+                fh.write("untouched\n")
+            dest = os.path.join(tmp, "o19_preflight.py")
+            os.symlink(canary, dest + ".tmp")
+            o19manifest.write_standalone_preflight(dest)
+            with open(canary, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "untouched\n")
+            self.assertTrue(os.path.islink(dest + ".tmp"))
+            self.assertFalse(os.path.islink(dest))
+            self.assertIn("SCHEMA_MAP_VERSION", open(dest).read())
+            # and no temporary name is left behind
+            self.assertEqual(sorted(os.listdir(tmp)),
+                             ["canary", "o19_preflight.py",
+                              "o19_preflight.py.tmp"])
 
     def test_write_standalone_reports_a_missing_manifest_not_a_traceback(self):
         with tempfile.TemporaryDirectory() as tmp, \

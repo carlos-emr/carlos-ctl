@@ -246,6 +246,12 @@ def validate_tar_members(entries: List[Tuple[str, str]],
     enforced here so it does not depend on the tar flavour installed."""
     problems: List[str] = []
     names: List[str] = []
+    #: plain-file names already seen, by their normalised path: the
+    #: archive is extracted wholesale later and a repeated path would
+    #: silently keep whichever copy came last, so a bundle that names a
+    #: document twice is ambiguous and refused (a directory entry may
+    #: legitimately repeat)
+    seen_files: set = set()
     allowed = {TAR_TYPE_FILE}
     if allow_dirs:
         allowed.add(TAR_TYPE_DIR)
@@ -276,6 +282,12 @@ def validate_tar_members(entries: List[Tuple[str, str]],
             # dash-prefixed name has no legitimate use in these archives.
             problems.append("member '{0}' starts with '-' (option-like "
                             "names are refused)".format(name))
+        elif type_letter == TAR_TYPE_FILE:
+            if clean in seen_files:
+                problems.append("member '{0}' appears more than once "
+                                "(extraction would keep only the last "
+                                "copy)".format(name))
+            seen_files.add(clean)
         names.append(name)
     if problems:
         raise ValueError("archive rejected:\n  " + "\n  ".join(problems))

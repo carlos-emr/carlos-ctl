@@ -1301,11 +1301,19 @@ instance whose backups are gone is not decommissioned, it is lost.""", file=sys.
         run(["systemctl", "stop", "carlos-emr.service"], capture_output=True)
     o19_sql = "".join(f"DROP DATABASE IF EXISTS `{schema}`;\n"
                       for schema, _n in o19_schemas)
-    if db_root_ok():
-        for schema, tables in o19_schemas:
-            log(f"dropping the OSCAR 19 '{schema}' schema ({tables} table(s))")
-        log("dropping databases")
-        cp = db_root([], input=f"""
+    # The second probe fails CLOSED too: MariaDB answering the first probe
+    # and not this one (it stopped, or was stopped, in between) must not
+    # let the run skip the DROP batch and carry on removing documents and
+    # key material -- that is the partial-destruction-with-"done." this
+    # verb refuses above, reached a few seconds later.
+    if not db_root_ok():
+        die("MariaDB stopped answering after the destruction was confirmed — "
+            "carlos-emr.service was stopped but NOTHING was dropped or "
+            "removed. Start MariaDB (systemctl start mariadb) and re-run.")
+    for schema, tables in o19_schemas:
+        log(f"dropping the OSCAR 19 '{schema}' schema ({tables} table(s))")
+    log("dropping databases")
+    cp = db_root([], input=f"""
 SET SESSION sql_log_bin = 0;
 DROP DATABASE IF EXISTS `{s.db_name}`;
 DROP DATABASE IF EXISTS `drugref2`;
@@ -1316,13 +1324,13 @@ DROP USER IF EXISTS 'drugref'@'127.0.0.1';
 DROP USER IF EXISTS 'backup'@'localhost';
 DROP USER IF EXISTS 'backup'@'127.0.0.1';
 """)
-        if cp.returncode != 0:
-            # Batch mode aborts at the first failing statement, so a failure
-            # here can leave databases AND every later DROP un-executed.
-            # This verb's report must be exact — never claim destruction that
-            # did not happen.
-            die("DROP DATABASE batch FAILED — the clinical databases may "
-                "still exist; nothing was reported destroyed")
+    if cp.returncode != 0:
+        # Batch mode aborts at the first failing statement, so a failure
+        # here can leave databases AND every later DROP un-executed.
+        # This verb's report must be exact — never claim destruction that
+        # did not happen.
+        die("DROP DATABASE batch FAILED — the clinical databases may "
+            "still exist; nothing was reported destroyed")
     import shutil
     log("removing patient documents, heap dumps and logs")
     # Errors are collected and REPORTED, never ignored: this command's whole

@@ -51,6 +51,37 @@ class TestTheDebsOwnAnswers(unittest.TestCase):
             self.host.client_base_argv(["--socket=/tmp/s", "-uroot"]),
             ["mariadb", "--socket=/tmp/s", "-uroot"])
 
+    def test_the_staging_client_keeps_the_deb_argv_shape(self):
+        argv = self.host.staging_client_argv(
+            ["mariadb", "--protocol=socket", "--user=root"], "/run/x.cnf", 30)
+        self.assertEqual(argv[0], "mariadb")
+        self.assertIn("--defaults-extra-file=/run/x.cnf", argv)
+        self.assertIn("--user=" + o19host.STAGING_USER, argv)
+        self.assertNotIn("--user=root", argv)
+        self.assertIn("--protocol=socket", argv)
+        self.assertEqual(argv[-1], o19import.STAGING_SCHEMA)
+
+    def test_the_staging_client_keeps_a_ports_runner_prefix(self):
+        # a deployment that wraps the client (`podman exec -i db mariadb`)
+        # keeps its runner in front; only the connection tail after the
+        # client executable has its identity replaced
+        argv = self.host.staging_client_argv(
+            ["podman", "exec", "-i", "db", "mariadb", "-uroot", "-h", "db"],
+            "/run/x.cnf")
+        self.assertEqual(argv[:5], ["podman", "exec", "-i", "db", "mariadb"])
+        self.assertEqual(argv[5], "--defaults-extra-file=/run/x.cnf")
+        self.assertNotIn("-uroot", argv)
+        self.assertNotIn("exec", argv[5:])
+        self.assertIn("-h", argv[5:])
+        self.assertEqual(argv[-1], o19import.STAGING_SCHEMA)
+
+    def test_a_base_argv_without_a_client_executable_is_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            self.host.staging_client_argv(["podman", "exec", "-i", "db"],
+                                          "/run/x.cnf")
+        self.assertIn("client_base_argv", str(cm.exception))
+        self.assertEqual(o19host.client_index(["/usr/bin/mysql", "-uroot"]), 0)
+
     def test_the_client_needs_no_credential_in_its_environment(self):
         # root over the socket: there is nothing to pass, and passing an
         # empty environment would run every client without PATH

@@ -146,7 +146,7 @@ jobs:
           case "$RELEASE_TAG" in *-*) prerelease=(--prerelease) ;; esac
           if ! gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --repo "$REPO" --draft --verify-tag \
-              --generate-notes "${prerelease[@]}"
+              --generate-notes ${prerelease[@]+"${prerelease[@]}"}
           fi
           gh release upload "$RELEASE_TAG" release-assets/* --repo "$REPO" --clobber
           # what GitHub stores must be what was hashed and attested

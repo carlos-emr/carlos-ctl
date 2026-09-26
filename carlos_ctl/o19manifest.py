@@ -27,6 +27,7 @@ the generator's renderer and must stay byte-for-byte with it.
 
 import json
 import os
+import tempfile
 from typing import Any, Dict, List, Optional
 
 from .util import SHARE
@@ -60,6 +61,29 @@ PREFLIGHT_BLOCK_NAMES = (
     "B3_FLAGGED_COLUMNS", "CHARSET_SCAN", "DROPPED_PROP_PREFIXES",
     "DROPPED_PROP_KEYS", "STOCK_ROLE_NAMES", "LEGACY_PREVENTION_TYPES",
 )
+#: the data keys a format-1 manifest of each kind carries -- the names
+#: the loaders bind at import (o19map_schema, o19map_props) and the
+#: preflight consumers read. A file with the right envelope but a key
+#: missing is a malformed manifest and is refused here, as one
+#: ManifestError the verbs turn into a remedy line, rather than a
+#: KeyError traceback from whichever consumer reaches the hole first.
+REQUIRED_KEYS = {
+    "o19map-schema": (
+        "SCHEMA_MAP_VERSION", "O19_PROFILE", "O19_SOURCE_COMMIT",
+        "SUPPORTED_PROVINCES", "REQUIRED_TABLES", "TABLES",
+        "CARLOS_COLUMNS", "SEED_ROW_COUNTS", "PRISTINE_TOLERATED_TABLES",
+        "CARLOSDOC_SEED_DELETES", "SEED_PROVIDER_NO", "SEED_USER_NAME",
+        "CREDENTIAL_TABLES", "CLAIM_HEADER_TABLE", "STARTUP_CREATED_ROWS",
+        "STOCK_ROLE_NAMES", "ROLE_TEMPLATE_MIN_JACCARD",
+        "PREVENTION_TYPE_MAP", "KNOWN_PREVENTION_TYPES",
+        "PRIMITIVE_COLUMNS", "PROFILES",
+    ),
+    "o19map-props": (
+        "PROPS_MAP_VERSION", "O19_DEFAULTS", "SECRET_DEFAULT_KEYS",
+        "CARLOS_DEFAULTS", "BUNDLE_KEY_RENAMES", "KEYS", "PREFIX_RULES",
+    ),
+    "o19-preflight": PREFLIGHT_BLOCK_NAMES + ("PROFILES",),
+}
 #: the preflight names that are PER-PROVINCE (repeated under PROFILES)
 PREFLIGHT_PROFILE_NAMES = (
     "SCHEMA_MAP_VERSION", "O19_PROFILE", "PATIENT_DATA_TABLES",
@@ -109,12 +133,20 @@ def load(kind: str) -> Dict[str, Any]:
         raise ManifestError("{0}: kind {1!r}, expected {2!r}".format(
             path, data.get("kind"), kind))
     fmt = data.get("format")
-    if fmt != MANIFEST_FORMAT:
+    # `type is int`, not `==`: JSON true would otherwise pass as format 1
+    if type(fmt) is not int or fmt != MANIFEST_FORMAT:
         raise ManifestError(
             "{0}: manifest format {1!r}, but this carlos-ctl reads format "
             "{2}. Install the carlos-ctl release that matches the installed "
             "carlos-emr (dpkg -l carlos-emr carlos-ctl).".format(
                 path, fmt, MANIFEST_FORMAT))
+    missing = [k for k in REQUIRED_KEYS[kind] if k not in data]
+    if missing:
+        raise ManifestError(
+            "{0}: manifest is missing {1} -- not a complete format {2} "
+            "{3} manifest. Reinstall carlos-emr (dpkg -l carlos-emr; apt "
+            "reinstall carlos-emr).".format(
+                path, ", ".join(missing), MANIFEST_FORMAT, kind))
     return {k: v for k, v in data.items()
             if k not in ("format", "kind", "generator")}
 
@@ -214,9 +246,22 @@ def write_standalone_preflight(dest: str) -> str:
     data = load("o19-preflight")
     with open(o19_preflight.__file__, encoding="utf-8") as fh:
         text = inline_preflight(fh.read(), data)
-    tmp = dest + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, dest)
+    # Written through an EXCLUSIVELY created temporary name in the
+    # destination directory, then renamed over `dest`: a predictable
+    # `dest + ".tmp"` could be pre-planted as a symlink by another local
+    # account when the destination is a shared directory such as /tmp,
+    # and open(..., "w") would follow it and truncate whatever it points
+    # at with the caller's authority.
+    directory = os.path.dirname(os.path.abspath(dest)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".o19_preflight.", suffix=".tmp",
+                               dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dest)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
     return str(data["SCHEMA_MAP_VERSION"])

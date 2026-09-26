@@ -46,7 +46,9 @@ class TestDispatcherRefusal(unittest.TestCase):
         handler = mock.Mock(return_value=0)
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.dict(cli._VERBS, {"check": handler, "status": handler,
-                                          "db": handler}), \
+                                          "db": handler, "import-o19": handler,
+                                          "cert": handler,
+                                          "o19-preflight": handler}), \
                 mock.patch.object(util, "carlos_emr_installed",
                                   return_value=installed), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -73,17 +75,34 @@ class TestDispatcherRefusal(unittest.TestCase):
         self.assertEqual(err, "")
 
     def test_help_answers_without_carlos_emr(self):
+        # ...and from the dispatcher's own usage table: a verb's fuller
+        # help lives behind carlos-emr's files (import-o19 loads the
+        # manifests that package ships before it builds its parser, cert
+        # and backup exec the package's helpers), so handing --help to the
+        # handler would fail instead of helping
         for argv in ([], ["--help"], ["help"], ["check", "--help"],
-                     ["db", "-h"]):
+                     ["db", "-h"], ["import-o19", "--help"],
+                     ["cert", "--help"], ["o19-preflight", "-h"]):
             rc, handler, out, _ = self._main(argv, installed=False)
             self.assertEqual(rc, 0, argv)
-            if argv[:1] == ["db"]:
-                # a verb with its own parser answers its own -h
-                handler.assert_called_once_with(["-h"])
-                handler.reset_mock()
-            else:
-                handler.assert_not_called()
-                self.assertIn("carlos-ctl", out)
+            handler.assert_not_called()
+            self.assertIn("carlos-ctl", out)
+            if argv[:1] in (["db"], ["import-o19"], ["cert"],
+                            ["o19-preflight"]):
+                # verbs with their own parsers: answered from the usage
+                # table here, with the reason the fuller help is missing
+                self.assertIn(f"carlos-ctl {argv[0]}", out)
+                self.assertIn("carlos-emr is not installed", out)
+
+    def test_help_reaches_the_verb_when_carlos_emr_is_present(self):
+        # a verb with its own parser answers its own -h on a normal host
+        rc, handler, out, _ = self._main(["db", "-h"], installed=True)
+        self.assertEqual(rc, 0)
+        handler.assert_called_once_with(["-h"])
+        rc, handler, out, _ = self._main(["import-o19", "--help"],
+                                          installed=True)
+        self.assertEqual(rc, 0)
+        handler.assert_called_once_with(["--help"])
 
     def test_argument_mistakes_are_still_answered_as_mistakes(self):
         # a typo must not be reported as "carlos-emr is not installed":

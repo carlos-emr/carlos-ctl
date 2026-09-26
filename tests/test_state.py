@@ -151,6 +151,29 @@ class TestDestroyDataDestroysTheWholeO19Estate(unittest.TestCase):
                     raise
         return code, out.getvalue(), err.getvalue()
 
+    def test_mariadb_stopping_after_the_first_probe_stops_the_run(self):
+        # the second probe fails closed: no DROP batch skipped silently
+        # while documents and key material go on being removed
+        probes = iter([True, False])
+        stack, patches = self._patched({"o19_archive": 3}, True, False, None)
+        patches = [p for p in patches
+                   if getattr(p, "attribute", None) != "db_root_ok"]
+        patches.append(mock.patch.object(dbops, "db_root_ok",
+                                         lambda: next(probes)))
+        err = io.StringIO()
+        with stack:
+            for p in patches:
+                stack.enter_context(p)
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit):
+                    dbops.cmd_destroy_data(["--confirm", "clinic-1"])
+        self.assertIn("NOTHING was dropped", err.getvalue())
+        self.assertEqual(self.dropped, [])
+        self.assertEqual(self.removed, [])
+        self.assertTrue(os.path.isdir(self.workspace))
+        self.assertNotIn(["shred", "-u"], [c[:2] for c in self.commands])
+
     def test_both_o19_schemas_are_dropped_with_the_emr_schema(self):
         code, out, err = self._destroy({"o19_import": 412,
                                         "o19_archive": 184})

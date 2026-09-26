@@ -182,6 +182,24 @@ class TestTarListingAndMemberTypes(unittest.TestCase):
             o19bundle.validate_tar_members([("-", "./ok.sql")], True),
             ["./ok.sql"])
 
+    def test_a_plain_file_named_twice_is_refused(self):
+        # the archive is extracted wholesale and tar keeps the LAST copy
+        # of a repeated path: what the review saw and what lands could
+        # differ, so the ambiguity is refused up front
+        with self.assertRaises(ValueError) as cm:
+            o19bundle.validate_tar_members(
+                [("-", "docs/a.pdf"), ("-", "docs/b.pdf"), ("-", "./docs/a.pdf")],
+                allow_dirs=True)
+        self.assertIn("docs/a.pdf", str(cm.exception))
+        self.assertIn("more than once", str(cm.exception))
+        # a repeated directory entry is how tar records a directory it
+        # descended twice; that is harmless and stays allowed
+        self.assertEqual(
+            o19bundle.validate_tar_members(
+                [("d", "docs/"), ("-", "docs/a.pdf"), ("d", "docs/")],
+                allow_dirs=True),
+            ["docs/", "docs/a.pdf", "docs/"])
+
     def test_option_like_member_names_are_refused(self):
         # GNU tar permutes argv, so a member named like an option would be
         # parsed as one at extraction (root RCE via --to-command=...)
