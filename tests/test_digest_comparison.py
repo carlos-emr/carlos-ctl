@@ -8,8 +8,8 @@ taken? The three outcomes are deliberately distinct -- a table that
 AGREED, one that DISAGREED, and one nobody could measure -- because they
 call for different actions and are cleared by different sign-offs.
 
-Run (from debian/assets):
-    python3 -m unittest carlos_ctl.tests.test_digest_comparison -v
+Run (from the repository root):
+    python3 -m unittest tests.test_digest_comparison -v
 """
 
 import json

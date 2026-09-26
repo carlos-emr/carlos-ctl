@@ -47,7 +47,7 @@ from typing import (Callable, Dict, Iterator, List, Optional,
                     Sequence, Set, Tuple)
 
 from . import (o19_preflight, o19bundle, o19digest, o19docs,
-               o19etl, o19host, o19map_props, o19map_schema,
+               o19etl, o19host, o19manifest, o19map_props, o19map_schema,
                o19report)
 from .util import (die, genpw, genrandom, log, run, warn)
 
@@ -3197,6 +3197,12 @@ def _parser(prog: str, import_mode: bool) -> argparse.ArgumentParser:
                          + ("" if import_mode else
                             " (not recorded: this verb persists no "
                             "sign-off)"))
+    if not import_mode:
+        ap.add_argument("--write-standalone", metavar="FILE",
+                        help="write the standalone assessment script to "
+                             "FILE -- o19_preflight.py with the installed "
+                             "carlos-emr's manifest inlined -- for copying "
+                             "to the OSCAR 19 server, and do nothing else")
     ap.add_argument("--restage", action="store_true",
                     help="drop and re-restore the staging schema (also "
                          "clears the recorded preflight verdict)")
@@ -3715,6 +3721,15 @@ def _make_ctx(args, import_mode: bool,
     # run_p0's assertion, so binding here does not weaken that gate.
     province = _province(args)
     o19map_schema.bind(province)
+    # The preflight's rulings come from the same place: the manifest the
+    # INSTALLED carlos-emr ships, not the copy inlined in o19_preflight.py
+    # when this CLI was released -- the two version independently since
+    # the package split, and the schema the import targets is
+    # carlos-emr's. bind(province) then happens inside run_checks.
+    try:
+        o19_preflight.load_manifest(o19manifest.load("o19-preflight"))
+    except (o19manifest.ManifestError, ValueError) as exc:
+        die(str(exc))
     # Resolved and checked FIRST, before the lock, the bundle or
     # anything recorded: it depends on nothing but the flags and the
     # ledger, every later phase reads ctx["target_db"], and a workspace
@@ -4032,6 +4047,18 @@ def _cmd_o19_preflight(argv) -> int:
     verdict and persists no sign-off; the return value IS the verdict."""
     args = _parser("carlos-ctl o19-preflight", import_mode=False).parse_args(
         list(argv))
+    if args.write_standalone:
+        # a file for the clinic's server, not an assessment of this host:
+        # needs no root and no inputs, and the exit status is the write's
+        try:
+            version = o19manifest.write_standalone_preflight(
+                args.write_standalone)
+        except (o19manifest.ManifestError, OSError) as exc:
+            die(str(exc))
+        log("wrote {0} (manifest {1}) -- copy it to the OSCAR 19 server "
+            "and run it there; see 'man carlos-ctl'".format(
+                args.write_standalone, version))
+        return 0
     if os.geteuid() != 0 and not args.mariadb_arg:
         die("this command needs root (or --mariadb-arg for a dev database)")
     # an assessment: capacity gates, stage, report — never a recorded

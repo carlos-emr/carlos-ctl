@@ -15,8 +15,8 @@ The tar is real (built per test into a temp tree) because the extraction
 path shells out to tar and the merge path moves actual files; faking that
 would test the fake. The database is not.
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 """
 
 import csv

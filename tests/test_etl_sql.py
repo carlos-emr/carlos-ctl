@@ -4,8 +4,8 @@
 shadow/chunk paths, sanitizer wrapping, charset-repair injection, and the
 loud pre-checks (never-truncate, NOT-NULL-needs-curation).
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 """
 
 import ast

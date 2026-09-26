@@ -9,8 +9,8 @@ module builds, not on a live server -- the suite must run without a
 database -- so each one pins the FEATURE of the expression that makes
 the measured case come out right.
 
-Run (from debian/assets):
-    python3 -m unittest carlos_ctl.tests.test_digest -v
+Run (from the repository root):
+    python3 -m unittest tests.test_digest -v
 """
 
 import unittest

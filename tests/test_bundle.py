@@ -4,8 +4,8 @@
 command construction, refusal paths, and real end-to-end extraction of all
 four suffix variants (tar/openssl are available on any dev machine).
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 """
 
 import os

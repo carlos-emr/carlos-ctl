@@ -2,8 +2,8 @@
 # Copyright (C) 2026 CARLOS Contributors
 """The SQL escape has one implementation, and one deliberate copy.
 
-Run (from debian/assets):
-    python3 -m unittest carlos_ctl.tests.test_sql_escape_contract -v
+Run (from the repository root):
+    python3 -m unittest tests.test_sql_escape_contract -v
 """
 
 import ast

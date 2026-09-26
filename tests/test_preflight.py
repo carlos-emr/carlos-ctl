@@ -6,8 +6,8 @@ A fake query callable serves canned information_schema and COUNT results,
 so every blocker/advisory classification and the verdict/exit-code/accept
 contract is pinned without a database.
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 """
 
 import contextlib
@@ -23,7 +23,7 @@ import unittest
 from carlos_ctl import o19_preflight as pf
 from carlos_ctl import o19etl
 
-ROOT = Path(__file__).resolve().parents[4]
+from .carlos_src import carlos_path, requires_carlos_src
 
 
 class FakeDb(object):
@@ -848,15 +848,30 @@ class TestRoleAdvisories(unittest.TestCase):
                     "prevention-legacy-types"):
             self.assertNotIn(fid, ids)
 
+    def test_login_name_rule_is_one_rule_in_both_python_copies(self):
+        # the standalone preflight (imports nothing) and the engine carry
+        # the same rule; the Java authority is pinned separately below
+        self.assertEqual(pf.LOGIN_NAME_PATTERN,
+                         o19etl.LOGIN_NAME_PATTERN)
+        rule = re.compile(pf.LOGIN_NAME_PATTERN)
+        for ok_name in ("carlosdoc", "A", "x" * 30, "Dr2"):
+            self.assertTrue(rule.match(ok_name), ok_name)
+        for bad in ("dr.smith", "j_doe", "it@clinic", "ops-2", "x" * 31,
+                    "", "a b"):
+            self.assertFalse(rule.match(bad), bad)
+
+    @requires_carlos_src
     def test_login_name_rule_matches_the_engine_and_login2action(self):
         # three copies of one rule: the standalone preflight (imports
         # nothing), the engine, and the Java login they both describe.
         # Login2Action is the authority; the Python copies are pinned to
         # it so a change there fails here instead of at a clinic's login.
+        # A contract with carlos-emr/carlos: runs in its CI (CARLOS_SRC).
         self.assertEqual(pf.LOGIN_NAME_PATTERN,
                          o19etl.LOGIN_NAME_PATTERN)
-        java = (ROOT / "src/main/java/io/github/carlos_emr/carlos/login/"
-                "Login2Action.java").read_text()
+        java = Path(carlos_path(
+            "src/main/java/io/github/carlos_emr/carlos/login/"
+            "Login2Action.java")).read_text()
         m = re.search(r'Pattern\.matches\("([^"]+)", userName\)', java)
         self.assertIsNotNone(m, "Login2Action's user-name rule moved")
         self.assertEqual("^" + m.group(1) + "$", pf.LOGIN_NAME_PATTERN)

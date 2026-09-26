@@ -11,8 +11,8 @@ sqlite3 (stdlib) stands in for MariaDB: the statements are translated
 token-for-token where the dialects differ (`<=>` -> IS, INSERT IGNORE ->
 INSERT OR IGNORE, BINARY dropped — sqlite's `=` is already binary).
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 """
 
 import sqlite3

@@ -26,10 +26,12 @@ from unittest import mock
 
 from carlos_ctl import dbadopt
 
+from .carlos_src import carlos_path
 
-# tests/ -> carlos_ctl/ -> assets/ -> debian/ -> the repository root.
-REPO_MIGRATIONS = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), *([os.pardir] * 4 + ["database", "mysql", "migration"])))
+
+# the CARLOS Flyway set, from a carlos checkout (CARLOS_SRC); the tests
+# that read it skip without one
+REPO_MIGRATIONS = carlos_path("database", "mysql", "migration")
 
 # `V1.0.5` seeds `icd10` with two statements and only the first says INSERT
 # IGNORE. It is present unchanged in every published release tag: editing it

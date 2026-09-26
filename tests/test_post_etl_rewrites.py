@@ -18,8 +18,8 @@ So this module does not trust the list. It re-derives it from the
 import's own source on every run — which is how `HRMDocument` was found
 after the list was first written by hand.
 
-Run (from debian/assets):
-    python3 -m unittest carlos_ctl.tests.test_post_etl_rewrites -v
+Run (from the repository root):
+    python3 -m unittest tests.test_post_etl_rewrites -v
 """
 
 import io

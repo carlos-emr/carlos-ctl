@@ -1,0 +1,63 @@
+#!/usr/bin/make -f
+# debian/rules — carlos-ctl, the CARLOS EMR administration command.
+#
+# A pure-Python package with no build step: the package installs the
+# carlos_ctl package under /usr/lib/carlos-ctl (its own tree, beside the
+# carlos-emr payload under /usr/lib/carlos-emr it administers), the shim,
+# the /usr/sbin links and the man page. The build's only work is the test
+# gate: the unit suite and a strict render of the man page.
+
+export DH_VERBOSE = 1
+export LC_ALL = C.UTF-8
+# The unit suite must not leave bytecode in the source tree, and the
+# shipped shim sets the same for the installed package.
+export PYTHONDONTWRITEBYTECODE = 1
+
+PKG      := carlos-ctl
+STAGE    := $(CURDIR)/debian/$(PKG)
+LIBDIR   := usr/lib/carlos-ctl
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# nothing to compile
+
+override_dh_auto_test:
+	# The unit suite runs against the manifest snapshot under tests/fixtures,
+	# so no carlos-emr install and no carlos checkout is needed. Contract
+	# tests that need one (CARLOS_SRC) skip here and run in carlos's CI.
+	python3 -m unittest discover -s tests -t .
+	# The man page is checked separately because Ubuntu 26.04's
+	# lintian/man-db pipeline itself exits non-zero even for known-good
+	# compressed system pages. groff returns zero for warnings, so capture
+	# diagnostics and explicitly make any warning a package failure.
+	set -e; \
+	if ! warnings="$$(groff -ww -z -Tutf8 -man man/carlos-ctl.8 2>&1)"; then \
+		printf '%s\n' "$$warnings" >&2; \
+		exit 1; \
+	fi; \
+	if [ -n "$$warnings" ]; then \
+		printf '%s\n' "$$warnings" >&2; \
+		exit 1; \
+	fi
+
+override_dh_auto_clean:
+	find carlos_ctl tests -name __pycache__ -type d -prune -exec rm -rf {} +
+
+override_dh_auto_install:
+	# The package as a plain directory tree (not dist-packages): the shim
+	# puts /usr/lib/carlos-ctl on PYTHONPATH, exactly as the copy inside
+	# carlos-emr did with /usr/lib/carlos-emr, so nothing else on the host
+	# can import carlos_ctl by accident and no bytecode is compiled at
+	# install (the shim disables it at run time too). `carlosctl` stays as
+	# a compatibility symlink that prints a rename note.
+	install -d $(STAGE)/$(LIBDIR)/carlos_ctl $(STAGE)/usr/sbin
+	install -m 0644 carlos_ctl/*.py $(STAGE)/$(LIBDIR)/carlos_ctl/
+	install -m 0755 bin/carlos-ctl $(STAGE)/$(LIBDIR)/carlos-ctl
+	ln -sf ../lib/carlos-ctl/carlos-ctl $(STAGE)/usr/sbin/carlos-ctl
+	ln -sf ../lib/carlos-ctl/carlos-ctl $(STAGE)/usr/sbin/carlosctl
+	# The man page itself is installed (and compressed) by dh_installman
+	# from debian/carlos-ctl.manpages; only the alias is made here.
+	install -d $(STAGE)/usr/share/man/man8
+	ln -sf carlos-ctl.8.gz $(STAGE)/usr/share/man/man8/carlosctl.8.gz

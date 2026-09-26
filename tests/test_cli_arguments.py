@@ -23,7 +23,11 @@ class TestNoArgumentVerbs(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         # Every no-argument verb is stubbed: a dispatcher bug must surface as
         # an unexpected call, never as a real bootstrap-admin or systemctl.
+        # The carlos-emr presence check runs after the argument gates and
+        # is tested on its own (test_emr_presence); a development host
+        # has no carlos-emr, and that must not be what these assert.
         with mock.patch.dict(cli._VERBS, {v: handler for v in cli._NO_ARGUMENT_VERBS}), \
+                mock.patch.object(cli, "require_carlos_emr"), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             try:
                 rc = cli.main(argv)

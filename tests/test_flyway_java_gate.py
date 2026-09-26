@@ -2,8 +2,8 @@
 # Copyright (C) 2026 CARLOS Contributors
 """The Java runtime gate in front of every packaged Flyway command.
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 
 dbops._find_java() picks the JVM that db-migrate / db-info / db-validate /
 db-baseline / db-repair run on. The engine, the JDBC driver and the migration

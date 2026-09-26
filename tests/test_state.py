@@ -2,8 +2,8 @@
 # Copyright (C) 2026 CARLOS Contributors
 """State-ledger and P0 pristine-gate contracts for the O19 importer.
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 """
 
 import argparse

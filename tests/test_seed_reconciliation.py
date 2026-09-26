@@ -4,8 +4,8 @@
 exists BEFORE any seed deletion, the delete list matches the manifest, and
 the seed-group retry path can never wipe the admin.
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 """
 
 import unittest

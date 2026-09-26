@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# CI for carlos-ctl:
+#   - python: lint + the unit suite on 3.12 (the pyproject floor) and 3.14
+#     (Ubuntu 26.04, the target distribution). The suite runs against the
+#     manifest snapshot under tests/fixtures; the contract tests that need a
+#     carlos-emr/carlos checkout (CARLOS_SRC) run in that repository's CI
+#     against the pinned carlos-ctl release.
+#   - man-page: groff renders carlos-ctl(8) with every warning enabled, as
+#     the package build does.
+#   - deb: the package builds in an ubuntu:26.04 container (unit suite and
+#     man page gate included) and passes lintian --fail-on error. The build
+#     product is uploaded as a workflow artifact for review; releases are
+#     cut by release.yml.
+#
+# Actions are pinned to commit SHAs, not tags: a re-pushed tag must never
+# change what runs against this repository.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "${{ matrix.python-version }}"
+      - name: install toolchain
+        run: pip install ruff==0.15.8 bcrypt==5.0.0
+      - name: ruff
+        run: ruff check carlos_ctl tests
+      - name: unit suite
+        run: python3 -m unittest discover -s tests -t .
+
+  man-page:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: groff renders carlos-ctl(8) without a warning
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq groff-base
+          if ! warnings="$(groff -ww -z -Tutf8 -man man/carlos-ctl.8 2>&1)"; then
+            printf '%s\n' "$warnings" >&2; exit 1
+          fi
+          if [ -n "$warnings" ]; then
+            printf '%s\n' "$warnings" >&2; exit 1
+          fi
+
+  deb:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    container:
+      # Digest-pinned; re-resolve on deliberate base bumps
+      # (skopeo inspect docker://ubuntu:26.04).
+      image: ubuntu:26.04@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential debhelper devscripts lintian fakeroot \
+            python3 python3-bcrypt groff-base git ca-certificates
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Build the package
+        run: dpkg-buildpackage -us -uc -b
+      - name: Lintian gate
+        run: lintian --fail-on error ../carlos-ctl_*.changes
+      - name: Keep the build product
+        run: mkdir -p build-product && cp ../carlos-ctl_*.deb build-product/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: carlos-ctl-deb
+          path: build-product/*.deb
+          retention-days: 14

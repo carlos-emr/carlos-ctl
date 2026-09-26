@@ -4,8 +4,8 @@
 baseline-diff, every disposition family, docpath translation, deploy-owned
 refusal, secret masking, unknown reporting.
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 """
 
 import os
@@ -18,18 +18,19 @@ import unittest
 
 from carlos_ctl import o19map_props, o19props
 
-#: CARLOS's own message bundle, in this repository. The generator
-#: verifies BUNDLE_KEY_RENAMES against it, but only when it runs -- and
-#: it needs an OSCAR 19 source tree, which CI has not got. This is the
-#: copy of that check a PR can run.
-CARLOS_BUNDLE = os.path.join(
-    os.path.dirname(__file__), "..", "..", "..", "..", "src", "main",
-    "resources", "oscarResources_en.properties")
+from .carlos_src import carlos_path, requires_carlos_src
 
-FIXTURE = os.path.join(
-    os.path.dirname(__file__), "..", "..", "..", "..", "scripts",
-    "migration", "o19", "fixtures", "properties",
-    "oscar-clinic-example.properties")
+#: CARLOS's own message bundle, in the carlos checkout (CARLOS_SRC). The
+#: generator verifies BUNDLE_KEY_RENAMES against it, but only when it
+#: runs -- and it needs an OSCAR 19 source tree, which CI has not got.
+#: This is the copy of that check carlos's CI runs against the pinned
+#: carlos-ctl.
+CARLOS_BUNDLE = carlos_path("src", "main", "resources",
+                            "oscarResources_en.properties")
+
+#: the synthetic clinic properties fixture, vendored beside the generator
+FIXTURE = carlos_path("scripts", "migration", "o19", "fixtures",
+                      "properties", "oscar-clinic-example.properties")
 
 ROOT = "/var/lib/carlos-emr/CarlosDocument"
 
@@ -87,9 +88,11 @@ DIVERGENT_CARRY_DEFAULTS = (
 )
 
 
+@requires_carlos_src
 class TestBaselineDiff(unittest.TestCase):
 
     """Clinic values equal to the stock defaults are not clinic values."""
+    @requires_carlos_src
     def test_untouched_defaults_are_ignored(self):
         result = fixture_result()
         fragment = dict(result["fragment"])
@@ -116,6 +119,7 @@ class TestBaselineDiff(unittest.TestCase):
                 self.assertTrue(all(d == "carry" for _, d, _ in result["rows"]))
         self.assertNotIn("label.top", dict(o19props.translate_all([])["fragment"]))
 
+    @requires_carlos_src
     def test_project_home_default_with_spaces_is_ignored(self):
         result = fixture_result()
         self.assertNotIn("project_home",
@@ -196,6 +200,7 @@ class TestEveryStockKeyIsClassified(unittest.TestCase):
             o19props.disposition("WKHTMLTOPDF_COMMAND")["d"], "deploy-owned")
 
 
+@requires_carlos_src
 class TestDispositions(unittest.TestCase):
 
     """What happens to each class of property key.
@@ -392,6 +397,7 @@ class TestSignLineBundleTokens(unittest.TestCase):
         self.assertIn("msgSigned -> encounter.class", note)
         self.assertIn("renamed", o19props.render_report(result))
 
+    @requires_carlos_src
     def test_every_renamed_key_really_exists_in_the_carlos_bundle(self):
         """The manifest is only useful if its TARGETS RESOLVE.
 
@@ -481,12 +487,14 @@ class TestSignLineBundleTokens(unittest.TestCase):
         self.assertNotIn("\n", result["rows"][0][2])
 
 
+@requires_carlos_src
 class TestRendering(unittest.TestCase):
 
     """The fragment an operator reviews, and the report beside it.
 
     The fragment must be valid java.util.Properties text; the report
     masks secrets."""
+    @requires_carlos_src
     def test_fragment_is_reviewable_properties_text(self):
         result = fixture_result()
         text = o19props.render_fragment(result)

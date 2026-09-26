@@ -16,8 +16,8 @@ The expressions are the copy's own -- `source_expr` + `sanitize_expr`,
 the very ones `copy_statement` selects -- so the check cannot model the
 copy differently from the copy.
 
-Run (from debian/assets):
-    python3 -m unittest carlos_ctl.tests.test_copy_content_parity -v
+Run (from the repository root):
+    python3 -m unittest tests.test_copy_content_parity -v
 """
 
 import unittest

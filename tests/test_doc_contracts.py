@@ -13,8 +13,8 @@ when it was written -- an accept class missing from two surfaces that
 both claimed to enumerate them, and two run artifacts the man page's
 FILES section did not mention.
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 """
 
 import ast
@@ -24,9 +24,12 @@ from pathlib import Path
 
 from carlos_ctl import o19_preflight, o19import
 
-ROOT = Path(__file__).resolve().parents[4]
-MAN_PAGE = ROOT / "debian" / "carlos-ctl.8"
-GUIDE = ROOT / "docs" / "o19-import-deb.md"
+from .carlos_src import carlos_path
+
+MAN_PAGE = Path(__file__).resolve().parents[1] / "man" / "carlos-ctl.8"
+# the operator runbook lives with the schema and the generator, in
+# carlos-emr/carlos (CARLOS_SRC); the contracts over it skip without one
+GUIDE = Path(carlos_path("docs", "o19-import-deb.md"))
 
 #: man-page markup a plain-text search has to see through: `.B x`,
 #: `.BR x " y"`, hyphens escaped as `\-`, and line breaks inside a list
@@ -166,6 +169,8 @@ class TestRunArtifactsAreDocumented(unittest.TestCase):
 
     def test_every_run_file_is_named_somewhere_an_operator_reads(self):
         text = man_text()
+        if not GUIDE.is_file():
+            self.skipTest("the runbook is in the carlos checkout (CARLOS_SRC)")
         guide = GUIDE.read_text(encoding="utf-8") if GUIDE.is_file() else ""
         missing = [name for name in o19import.RUN_FILES
                    if name not in text and name not in guide]
@@ -218,8 +223,8 @@ class TestFixtureProvenanceMatchesTheManifest(unittest.TestCase):
     PLACEHOLDER_RE = re.compile(r"`([A-Za-z_][\w.]*)=[^`]*`")
 
     def test_placeholder_account_keys_are_credential_shaped(self):
-        prov = (ROOT / "scripts" / "migration" / "o19" / "fixtures"
-                / "PROVENANCE.md")
+        prov = Path(carlos_path("scripts", "migration", "o19", "fixtures",
+                                "PROVENANCE.md"))
         if not prov.is_file():
             self.skipTest("fixture provenance not in this checkout")
         from carlos_ctl import o19map_props
@@ -254,7 +259,7 @@ class TestNamedJavaGuardsExist(unittest.TestCase):
     def test_every_java_test_the_guide_names_is_on_disk(self):
         if not GUIDE.is_file():
             self.skipTest("guide not present in this checkout")
-        java_root = ROOT / "src" / "test" / "java"
+        java_root = Path(carlos_path("src", "test", "java"))
         if not java_root.is_dir():
             self.skipTest("java sources not present in this checkout")
         named = sorted(set(self.JAVA_TEST_RE.findall(

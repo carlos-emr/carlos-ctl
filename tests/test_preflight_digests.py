@@ -14,8 +14,8 @@ happens when a table cannot be, and what the emitted document says. That
 the SQL itself is the same SQL the import side builds is pinned
 separately, in test_sql_escape_contract.py.
 
-Run (from debian/assets):
-    python3 -m unittest carlos_ctl.tests.test_preflight_digests -v
+Run (from the repository root):
+    python3 -m unittest tests.test_preflight_digests -v
 """
 
 import contextlib
@@ -287,7 +287,7 @@ class TestTheOperatorIsToldWhatCouldNotBeMeasured(unittest.TestCase):
 
     def _run(self, fail=None):
         """main() over a fake client; returns (exit, stdout, stderr)."""
-        from carlos_ctl.tests import test_preflight as tp
+        from tests import test_preflight as tp
 
         class Db(tp.FakeDb):
             """Answers run_checks AND the digest statements."""

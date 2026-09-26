@@ -19,8 +19,8 @@ checkable:
 3. every seed row that beat a clinic row carries that row's values in
    its `import_archived_` columns — requirement B for the merge class.
 
-Run (from debian/assets):
-    python3 -m unittest carlos_ctl.tests.test_merge_content_parity -v
+Run (from the repository root):
+    python3 -m unittest tests.test_merge_content_parity -v
 """
 
 import unittest

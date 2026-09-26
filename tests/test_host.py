@@ -10,8 +10,8 @@ Two contracts, and they matter in opposite directions:
   port that answers differently is ignored and writes into the deb's
   paths on a host that has none of them.
 
-Run (from debian/assets):
-    python3 -m unittest carlos_ctl.tests.test_host -v
+Run (from the repository root):
+    python3 -m unittest tests.test_host -v
 """
 
 import os

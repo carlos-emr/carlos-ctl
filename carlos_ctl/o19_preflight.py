@@ -49,8 +49,14 @@ The JSON report (--json) is the machine contract.
 Migration output should receive a technical review — verification report,
 spot checks, UI smoke — before clinical use.
 
-The data between the GENERATED markers is written by
-scripts/migration/o19/generate_manifests.py — do not edit it by hand.
+The data between the GENERATED markers is a copy of the preflight
+manifest carlos-emr ships (/usr/share/carlos-emr/o19-manifest/
+o19_preflight.json, generated in the carlos-emr repository by
+scripts/migration/o19/generate_manifests.py) — do not edit it by hand. In
+import mode the installed manifest is loaded over it (load_manifest); for
+a standalone assessment, `carlos-ctl o19-preflight --write-standalone
+FILE` writes the copy to carry to the clinic with the installed manifest
+inlined, so the assessment and the import agree on every ruling.
 """
 
 from __future__ import print_function
@@ -911,8 +917,6 @@ LEGACY_PREVENTION_TYPES = [
     'dTap',
     'fIPV',
 ]
-# Every province beyond the module-level default, selected by
-# bind(). Same names as above; only what differs is repeated.
 PROFILE_BC = {
     'SCHEMA_MAP_VERSION': 'o19map-3+f2e0d233',
     'O19_PROFILE': 'bc',
@@ -1646,13 +1650,14 @@ PROFILE_BC = {
         'student',
     ],
 }
-
 PROFILES = {'bc': PROFILE_BC}
+# === END GENERATED DATA ===
 
-
-#: the names above bind() rebinds, and their module-level values captured
-#: BEFORE any bind can run -- so bind() can always return to the default
-#: profile instead of being a one-way switch.
+#: the names above bind() rebinds -- the PER-PROVINCE part of the data --
+#: and their module-level values captured BEFORE any bind can run, so
+#: bind() can always return to the default profile instead of being a
+#: one-way switch. load_manifest() re-takes the snapshot when the data
+#: is replaced.
 _PROFILE_NAMES = [
     'SCHEMA_MAP_VERSION',
     'O19_PROFILE',
@@ -1663,6 +1668,16 @@ _PROFILE_NAMES = [
     'STOCK_ROLE_NAMES',
 ]
 _DEFAULT_PROFILE = dict((n, globals()[n]) for n in _PROFILE_NAMES)
+
+#: every module-level name the generated block defines: what
+#: load_manifest() may replace, and nothing else
+_MANIFEST_NAMES = (
+    'SCHEMA_MAP_VERSION', 'O19_PROFILE', 'SUPPORTED_PROVINCES',
+    'REQUIRED_TABLES', 'PATIENT_DATA_TABLES', 'KNOWN_TABLES',
+    'B3_FLAGGED_COLUMNS', 'CHARSET_SCAN', 'DROPPED_PROP_PREFIXES',
+    'DROPPED_PROP_KEYS', 'STOCK_ROLE_NAMES', 'LEGACY_PREVENTION_TYPES',
+    'PROFILES',
+)
 
 
 def bind(province):
@@ -1681,7 +1696,36 @@ def bind(province):
     return O19_PROFILE
 
 
-# === END GENERATED DATA ===
+def load_manifest(data):
+    """Replace the inlined data above with `data`, the preflight manifest
+    the carlos-emr package ships (carlos_ctl.o19manifest.load(
+    "o19-preflight")), and rebind to its default profile.
+
+    IMPORT MODE calls this before run_checks(): the inlined block is the
+    copy this file was released with, and the installed carlos-emr's
+    manifest is the schema the import will actually target -- the two
+    version independently since the package split. A standalone
+    assessment never calls it; `carlos-ctl o19-preflight
+    --write-standalone` writes a copy with the installed manifest inlined
+    instead, so the clinic-side file needs nothing beside itself.
+
+    Returns the manifest version now loaded. Only the generated names
+    are replaced; an unknown key in `data` is an error rather than a
+    stray global.
+    """
+    global _DEFAULT_PROFILE
+    unknown = sorted(set(data) - set(_MANIFEST_NAMES))
+    if unknown:
+        raise ValueError("preflight manifest carries unknown keys: {0}"
+                         .format(", ".join(unknown)))
+    missing = sorted(set(_MANIFEST_NAMES) - set(data))
+    if missing:
+        raise ValueError("preflight manifest lacks keys: {0}"
+                         .format(", ".join(missing)))
+    globals().update(data)
+    _DEFAULT_PROFILE = dict((n, globals()[n]) for n in _PROFILE_NAMES)
+    return SCHEMA_MAP_VERSION
+
 
 BLOCKER = "blocker"
 ADVISORY = "advisory"

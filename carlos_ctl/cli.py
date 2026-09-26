@@ -16,7 +16,7 @@ import sys
 from typing import List, Optional
 
 from . import config, dbadopt, dbops, provision, util, validate, waf
-from .util import LIB, die, need_root
+from .util import LIB, die, need_root, require_carlos_emr
 
 _USAGE = """carlos-ctl — administration for a CARLOS EMR host
 
@@ -91,7 +91,10 @@ clinical use):
                                   --accept sign-off flags and --dry-run
   carlos-ctl o19-preflight (experimental)
                                   stage a dump and run the go/no-go
-                                  feasibility check only
+                                  feasibility check only;
+                                  --write-standalone FILE writes the
+                                  standalone assessment script to copy to
+                                  the OSCAR 19 server
 
 Decommissioning:
   carlos-ctl destroy-data --confirm <server-name>
@@ -108,7 +111,7 @@ Configuration — the loop is: edit the file, then run the verb beside it:
   /etc/carlos-emr/modsecurity/         WAF policy    -> carlos-ctl waf reload
   /etc/carlos-emr/tomcat/              Tomcat        -> carlos-ctl restart
 
-Full documentation: /usr/share/doc/carlos-emr/README.Debian
+Full documentation: man carlos-ctl, /usr/share/doc/carlos-emr/README.Debian
 """
 
 
@@ -225,17 +228,27 @@ def _cmd_logs(argv) -> int:
     raise AssertionError("unreachable: execvp replaces the process")
 
 
+def _o19import():
+    """The importer, imported lazily: the o19 modules load the schema
+    manifest carlos-emr ships (a megabyte of JSON) — that cost belongs to
+    the two import verbs, not to every `carlos-ctl status`. A manifest
+    that cannot be read (carlos-emr too old to ship one, or a format this
+    CLI does not know) is one clear line here, not an ImportError
+    traceback from inside the package."""
+    from . import o19manifest
+    try:
+        from . import o19import
+    except o19manifest.ManifestError as exc:
+        die(str(exc))
+    return o19import
+
+
 def _cmd_import_o19(argv) -> int:
-    # Lazy import: the o19 modules parse the generated schema manifest
-    # (tens of thousands of data lines) — that cost belongs to the two
-    # import verbs, not to every `carlos-ctl status`.
-    from . import o19import
-    return o19import.cmd_import_o19(argv)
+    return _o19import().cmd_import_o19(argv)
 
 
 def _cmd_o19_preflight(argv) -> int:
-    from . import o19import
-    return o19import.cmd_o19_preflight(argv)
+    return _o19import().cmd_o19_preflight(argv)
 
 
 _VERBS = {
@@ -321,6 +334,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         die(f"'{verb}' takes no arguments (got: {' '.join(rest)})\n"
             f"usage:\n{_verb_usage(verb)}")
+    # Every verb administers the carlos-emr package's files (its config,
+    # helpers, state, webapp): on a host where that package is not
+    # installed -- carlos-ctl is separate and outlives `apt remove
+    # carlos-emr` -- say so in one line instead of failing on whichever
+    # missing file the verb reaches first. After the argument gates, so a
+    # mistyped command is still answered as a mistyped command, and never
+    # for --help.
+    if rest not in (["-h"], ["--help"], ["help"]):
+        require_carlos_emr(verb)
     try:
         return int(handler(rest) or 0)
     except KeyboardInterrupt:

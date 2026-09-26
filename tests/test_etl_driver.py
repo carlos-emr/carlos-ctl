@@ -19,8 +19,8 @@ synthetic on purpose -- 580 real tables would make every assertion a
 needle in a haystack, and the branches under test are per-class, not
 per-table.
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 """
 
 import os

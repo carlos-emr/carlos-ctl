@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+/debian/carlos-ctl/
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/*.substvars
+/debian/*.debhelper.log
+/.mypy_cache/
+/.ruff_cache/
+/.pytest_cache/

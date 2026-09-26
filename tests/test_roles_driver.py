@@ -6,8 +6,8 @@ that completed, --role-template is bound to the ledger like --admin-user,
 the Facility/clinic refusals fire before that step's writes, and the RTL
 outcome is verified against the rows rather than asserted.
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 """
 
 import contextlib
@@ -20,7 +20,7 @@ import unittest
 from carlos_ctl import o19_preflight, o19etl, o19map_schema, o19roles
 # the classifier lives with the statement-shape tests; the sweep
 # belongs here, where a real run can supply the statements
-from carlos_ctl.tests.test_roles import idempotent
+from tests.test_roles import idempotent
 
 SRC, DST, ARCH = "o19_import", "carlos", "o19_archive"
 SNAP = "`{0}`.`carlos_seed_secObjPrivilege`".format(ARCH)

@@ -137,6 +137,20 @@ def _check_render_payload(chromium_dir: str, render_env: str,
     return False
 
 
+def _package_versions():
+    """`<package> <version>` for carlos-emr and carlos-ctl, from dpkg.
+    A package dpkg does not know is reported as such rather than hidden:
+    an operator reading a check transcript needs both numbers."""
+    lines = []
+    for pkg in ("carlos-emr", "carlos-ctl"):
+        cp = run(["dpkg-query", "-W", "-f", "${Version}", pkg],
+                 capture_output=True)
+        version = cp.stdout.strip() if cp.returncode == 0 else ""
+        lines.append(f"{pkg} {version}" if version
+                     else f"{pkg} (not installed according to dpkg)")
+    return lines
+
+
 def cmd_check(argv) -> int:
     global _failures
     _failures = 0
@@ -160,6 +174,13 @@ def cmd_check(argv) -> int:
                  "install with 'sudo carlos-ctl finish-install'")
         raise
     print(f"\nCARLOS EMR deployment check ({s.server_name})\n")
+    # The two packages version independently since the split: the CLI is
+    # a driver over what carlos-emr ships (its migrations, helpers and
+    # manifests), so every report of a check must say which pair ran it.
+    print("packages")
+    for line in _package_versions():
+        print(f"  {line}")
+    print()
 
     # First, because it explains most of what follows: the installer records
     # this marker when a provisioning step did not run, and an install that

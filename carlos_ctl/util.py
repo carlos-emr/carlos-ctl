@@ -23,6 +23,11 @@ DRUGREF_PROPERTIES = os.path.join(CONF_DIR, "drugref2.properties")
 BACKUP_ENV = os.path.join(CONF_DIR, "backup.env")
 SHARE = "/usr/share/carlos-emr"
 LIB = "/usr/lib/carlos-emr"
+# This CLI's own package directory. Everything under LIB and SHARE belongs
+# to carlos-emr (the application package this tool administers); the CLI
+# ships separately, as the carlos-ctl package, since the split of
+# carlos-emr/carlos#4001.
+CTL_LIB = "/usr/lib/carlos-ctl"
 WEBAPP = os.path.join(SHARE, "webapp", "carlos")
 # Vendored eForm render browser, shipped by carlos-emr itself (the separate
 # carlos-emr-eform-renderer package through 2026.08.0~alpha13). Absent only in a
@@ -64,6 +69,37 @@ def package_ships(path: str) -> bool:
 
 
 STATE = "/var/lib/carlos-emr"
+
+
+def carlos_emr_installed() -> bool:
+    """Whether the carlos-emr package's payload is on this host.
+
+    Judged by the FILES, not by dpkg's status: the carlos-emr postinst
+    calls this tool while the package is still `half-configured`, and a
+    removed-but-not-purged carlos-emr (status `config-files`) has no
+    webapp to administer. The exploded webapp is the one thing every
+    carlos-emr build ships, so its WEB-INF is the marker.
+    """
+    return os.path.isdir(os.path.join(WEBAPP, "WEB-INF"))
+
+
+def require_carlos_emr(verb: str) -> None:
+    """Refuse `verb` with one clear line when carlos-emr is not installed.
+
+    carlos-ctl is its own package and survives `apt remove carlos-emr`
+    (apt marks a package installed from a local file as manual), so every
+    verb that reads or writes under /usr/share/carlos-emr, /usr/lib/
+    carlos-emr, /etc/carlos-emr or /var/lib/carlos-emr has to say so
+    rather than fail on the first missing file. Nothing is assumed about
+    the directories after this: it is a presence check, not a health
+    check -- `carlos-ctl check` is the health check.
+    """
+    if not carlos_emr_installed():
+        die("carlos-emr is not installed on this host, so there is nothing "
+            "for 'carlos-ctl {0}' to administer (the CARLOS EMR application "
+            "package is carlos-emr; this tool is its administration "
+            "command). Install it with: sudo apt install ./carlos-emr_"
+            "<version>_amd64.deb ./carlos-ctl_<version>_all.deb".format(verb))
 
 _TTY = sys.stdout.isatty()
 RED, GREEN, YELLOW, RESET = (

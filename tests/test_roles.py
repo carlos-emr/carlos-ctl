@@ -5,14 +5,16 @@ idempotent, the break-glass admin is usable, memberships use the clinic's
 own role ids, custom roles get CARLOS-era grants from a deterministic
 template, and the verify checks fail closed on what the step guarantees.
 
-Run (from debian/assets):
-    python3 -m unittest discover -v -s carlos_ctl/tests -t .
+Run (from the repository root):
+    python3 -m unittest discover -v -s tests -t .
 """
 
 import os
 import unittest
 
 from carlos_ctl import o19etl, o19map_schema, o19roles
+
+from .carlos_src import carlos_path, requires_carlos_src
 
 
 def idempotent(sql):
@@ -1234,11 +1236,14 @@ class TestParityWithAppendedRows(unittest.TestCase):
         self.assertIn("roles ledger recorded 3", bad[0])
 
 
+@requires_carlos_src
 class TestPackagedFixups(unittest.TestCase):
-    """debian/rules must ship exactly the scripts o19roles replays, and
-    they must exist in the tree the package is built from."""
+    """carlos-emr's debian/rules must ship exactly the scripts o19roles
+    replays, and they must exist in the tree that package is built from.
+    A contract with carlos-emr/carlos (CARLOS_SRC): its CI runs this
+    against the pinned carlos-ctl."""
 
-    ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+    ROOT = carlos_path()
 
     def test_rules_installs_every_rtl_script_and_they_exist(self):
         with open(os.path.join(self.ROOT, "debian", "rules"),

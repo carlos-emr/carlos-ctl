@@ -1,4 +1,4 @@
-.TH CARLOS-CTL 8 "2026-09-03" "carlos-emr" "System Administration"
+.TH CARLOS-CTL 8 "2026-09-26" "carlos-ctl" "System Administration"
 .SH NAME
 carlos\-ctl \- administer a CARLOS EMR host installed from the carlos\-emr package
 .SH SYNOPSIS
@@ -18,12 +18,32 @@ provisioning logic exists in exactly one place: what
 .B dpkg\-reconfigure
 runs is what you can re\-run by hand, and it behaves identically.
 .PP
+The command ships in its own package,
+.BR carlos\-ctl ,
+which
+.B carlos\-emr
+depends on; the two version independently. Every command administers what
+.B carlos\-emr
+installs (its configuration under
+.IR /etc/carlos\-emr ,
+its helpers, its Flyway migrations, its OSCAR 19 import manifests), so on a
+host where that package is not installed every command refuses with one
+line saying so;
+.B check
+reports both package versions first. Through carlos\-emr 2026.09.0~snapshot24
+the same command was part of carlos\-emr itself.
+.PP
 Most commands require root.
 .SH COMMANDS
 .SS Diagnosis
 .TP
 .B check
-Run the full deployment check and exit non\-zero if anything fails. It verifies
+Run the full deployment check and exit non\-zero if anything fails. It reports
+the installed
+.B carlos\-emr
+and
+.B carlos\-ctl
+versions, then verifies
 that the services are running, that no component is running as root, that
 Tomcat and MariaDB listen on loopback only, that the certificate is valid, that
 the security response headers are served, that the WAF blocks a probe
@@ -592,9 +612,18 @@ workspace whose import is in progress is refused untouched. Options:
 .B \-\-dev-target
 as for
 .BR import-o19 .
-For an assessment BEFORE backups are shipped, copy
-.I /usr/lib/carlos\-emr/carlos_ctl/o19_preflight.py
-to the OSCAR 19 server and run it there standalone. The standalone form
+For an assessment BEFORE backups are shipped, write the standalone
+assessment script with
+.B \-\-write\-standalone
+.IR FILE ,
+copy that one file to the OSCAR 19 server and run it there. It carries
+the OSCAR 19 import manifest of the
+.B carlos\-emr
+installed here (from
+.IR /usr/share/carlos\-emr/o19\-manifest/ ),
+so the assessment and the import agree on every ruling; write it again
+after upgrading carlos\-emr. The flag needs no root and no other input.
+The standalone form
 takes its own flags \(em
 .BR \-\-db ", " \-\-mysql-cmd ", " \-\-mysql-arg ", "
 .BR \-\-mysql-password-file ", " \-\-properties ", " \-\-province ", "
@@ -614,6 +643,27 @@ server's reason: the import treats such a table as unverified, and most
 of them raise no blocker here, so the warning is the operator's only
 chance to fix it before leaving the clinic.
 .SH FILES
+.TP
+.I /usr/lib/carlos\-ctl/
+This command (the
+.B carlos\-ctl
+package): the Python package and the shim
+.I /usr/sbin/carlos\-ctl
+runs.
+.TP
+.I /usr/lib/carlos\-emr/
+The
+.B carlos\-emr
+package's helpers this command drives (backup, certificates, the OSCAR 19
+import guard).
+.TP
+.I /usr/share/carlos\-emr/o19\-manifest/
+The OSCAR 19 import manifests, shipped by
+.B carlos\-emr
+beside the schema they describe and read by
+.BR import-o19 ", " o19-preflight
+and
+.BR \-\-write\-standalone .
 .TP
 .I /etc/carlos-emr/carlos-emr.env
 Site settings: host name, listen address, province, time zone, heap.
@@ -714,5 +764,10 @@ exits 0 on success and non\-zero on error.
 .BR mariadb (1)
 .PP
 .I /usr/share/doc/carlos-emr/README.Debian
+.PP
+The
+.B carlos\-ctl
+source and issue tracker: https://github.com/carlos\-emr/carlos\-ctl; the
+application: https://github.com/carlos\-emr/carlos.
 .SH AUTHOR
 CARLOS EMR Contributors.

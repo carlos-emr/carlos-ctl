@@ -18,6 +18,8 @@ from pathlib import Path
 from unittest import mock
 
 from carlos_ctl import dbadopt
+
+from .carlos_src import carlos_path
 from carlos_ctl.util import sql_escape
 
 
@@ -132,7 +134,7 @@ class TestSeedMovesMariaDB(unittest.TestCase):
         self.assertFalse(self.stale())
 
     def test_restored_history_reenables_seed_preparation_in_dry_run(self):
-        root = Path(__file__).resolve().parents[4] / "database/mysql/migration"
+        root = Path(carlos_path("database", "mysql", "migration"))
         if not root.is_dir():
             self.skipTest("requires packaged migrations from a source checkout")
         self.billing_history()
@@ -286,7 +288,7 @@ class TestSeedMovesMariaDB(unittest.TestCase):
         self.assertEqual(self.query("SELECT id FROM icd10 WHERE icd10='N/A'"), "14903")
 
     def test_complete_packaged_seed_does_not_duplicate_displaced_code(self):
-        root = Path(__file__).resolve().parents[4] / "database/mysql/migration"
+        root = Path(carlos_path("database", "mysql", "migration"))
         migration = root / "common/V1.0.5__restore_live_legacy_common_tables.sql"
         if not migration.is_file():
             self.skipTest("requires the packaged seed from a source checkout")
