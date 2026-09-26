@@ -4,7 +4,7 @@
 
 Shipped as its own Debian package, ``carlos-ctl`` (this repository,
 github.com/carlos-emr/carlos-ctl), which the ``carlos-emr`` application
-package depends on; through carlos-emr 2026.09.0~snapshot24 the same code
+package depends on; through carlos-emr 2026.08.0~alpha15 the same code
 shipped inside carlos-emr. The two packages version independently: the CLI
 is a driver over what carlos-emr installs (its Flyway migrations, helper
 scripts, configuration skeletons and the OSCAR 19 import manifests under
@@ -33,4 +33,4 @@ two trees in this repository is a separate, later issue.
 
 #: the release version; debian/changelog and the release tag carry the same
 #: number (the release workflow refuses a tag that disagrees)
-__version__ = "1.0.0"
+__version__ = "1.1.0"

@@ -13,7 +13,7 @@ have a server. For the install itself, start at the application's
 [docs/install-deb.md](https://github.com/carlos-emr/carlos/blob/develop/docs/install-deb.md).
 
 The command ships in its own package, `carlos-ctl` (this repository), which
-`carlos-emr` depends on; through carlos-emr 2026.09.0~snapshot24 it was part
+`carlos-emr` depends on; through carlos-emr 2026.08.0-alpha15 it was part
 of `carlos-emr` itself. The two version independently: the CLI is a driver
 over what `carlos-emr` installs (its Flyway migrations, helper scripts,
 configuration skeletons and the OSCAR 19 import manifests under

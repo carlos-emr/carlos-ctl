@@ -97,7 +97,7 @@ def load(kind: str) -> Dict[str, Any]:
     except FileNotFoundError:
         raise ManifestError(
             "OSCAR 19 import manifest not found: {0}. The manifests are "
-            "installed by the carlos-emr package (from 2026.09.0~snapshot25); "
+            "installed by the carlos-emr package (from 2026.08.0~alpha16); "
             "is carlos-emr installed, and is it at least that version? "
             "(dpkg -l carlos-emr)".format(path))
     except (OSError, ValueError) as exc:

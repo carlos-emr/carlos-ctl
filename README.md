@@ -9,7 +9,7 @@ OSCAR 19 clinic import. Every routine job is a `carlos-ctl` verb, run with
 
 It ships as its own package, `carlos-ctl_<version>_all.deb`, which the
 `carlos-emr` application package depends on. Through carlos-emr
-2026.09.0~snapshot24 the same code lived inside `carlos-emr`
+2026.08.0-alpha15 the same code lived inside `carlos-emr`
 (`debian/assets/carlos_ctl` in [carlos-emr/carlos](https://github.com/carlos-emr/carlos));
 the split is [carlos-emr/carlos#4001](https://github.com/carlos-emr/carlos/issues/4001),
 and this repository's history is that directory's history, rewritten to
