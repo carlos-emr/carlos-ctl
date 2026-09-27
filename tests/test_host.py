@@ -63,24 +63,34 @@ class TestTheDebsOwnAnswers(unittest.TestCase):
 
     def test_the_staging_client_keeps_a_ports_runner_prefix(self):
         # a deployment that wraps the client (`podman exec -i db mariadb`)
-        # keeps its runner in front; only the connection tail after the
-        # client executable has its identity replaced
-        argv = self.host.staging_client_argv(
-            ["podman", "exec", "-i", "db", "mariadb", "-uroot", "-h", "db"],
+        # states its runner's length; the runner stays in front and only
+        # the connection tail after the client has its identity replaced.
+        # The container is deliberately named `mysql`: the position comes
+        # from the port, never from a search for a client-looking element.
+        class Port(o19host.Host):
+            def client_runner_prefix(self):
+                return 4
+        argv = Port().staging_client_argv(
+            ["podman", "exec", "-i", "mysql", "mariadb", "-uroot", "-h", "mysql"],
             "/run/x.cnf")
-        self.assertEqual(argv[:5], ["podman", "exec", "-i", "db", "mariadb"])
+        self.assertEqual(argv[:5], ["podman", "exec", "-i", "mysql", "mariadb"])
         self.assertEqual(argv[5], "--defaults-extra-file=/run/x.cnf")
         self.assertNotIn("-uroot", argv)
         self.assertNotIn("exec", argv[5:])
-        self.assertIn("-h", argv[5:])
+        self.assertEqual(argv[5:].count("mysql"), 1)  # the -h operand only
         self.assertEqual(argv[-1], o19import.STAGING_SCHEMA)
 
-    def test_a_base_argv_without_a_client_executable_is_refused(self):
+    def test_a_runner_prefix_that_does_not_land_on_a_client_is_refused(self):
+        # the deb says 0; an argv whose first element is not a client is a
+        # port mistake and is refused rather than rewritten
         with self.assertRaises(ValueError) as cm:
-            self.host.staging_client_argv(["podman", "exec", "-i", "db"],
+            self.host.staging_client_argv(["podman", "exec", "-i", "db", "mariadb"],
                                           "/run/x.cnf")
-        self.assertIn("client_base_argv", str(cm.exception))
-        self.assertEqual(o19host.client_index(["/usr/bin/mysql", "-uroot"]), 0)
+        self.assertIn("client_runner_prefix", str(cm.exception))
+        self.assertEqual(self.host.client_runner_prefix(), 0)
+        self.assertEqual(
+            self.host.staging_client_argv(["/usr/bin/mysql", "-uroot"], "/x")[0],
+            "/usr/bin/mysql")
 
     def test_the_client_needs_no_credential_in_its_environment(self):
         # root over the socket: there is nothing to pass, and passing an
@@ -259,7 +269,7 @@ class TestThePortSurface(unittest.TestCase):
     REQUIRED = (
         "state_dir", "documents_root", "is_packaged_host",
         "configured_province", "configured_db_name", "identity_source",
-        "client_base_argv", "client_env", "stage_credential",
+        "client_base_argv", "client_runner_prefix", "client_env", "stage_credential",
         "clear_stage_credential", "staging_client_argv", "sql_escape",
         "document_ownership",
         "flyway_validate", "backup_configured",

@@ -192,6 +192,11 @@ class TestTarListingAndMemberTypes(unittest.TestCase):
                 allow_dirs=True)
         self.assertIn("docs/a.pdf", str(cm.exception))
         self.assertIn("more than once", str(cm.exception))
+        # spelled differently but extracted to the same path: also a repeat
+        for twin in ("docs/./a.pdf", "docs//a.pdf", "./docs/./a.pdf"):
+            with self.assertRaises(ValueError, msg=twin):
+                o19bundle.validate_tar_members(
+                    [("-", "docs/a.pdf"), ("-", twin)], allow_dirs=False)
         # a repeated directory entry is how tar records a directory it
         # descended twice; that is harmless and stays allowed
         self.assertEqual(

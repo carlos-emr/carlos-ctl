@@ -283,11 +283,14 @@ def validate_tar_members(entries: List[Tuple[str, str]],
             problems.append("member '{0}' starts with '-' (option-like "
                             "names are refused)".format(name))
         elif type_letter == TAR_TYPE_FILE:
-            if clean in seen_files:
+            # compared by the path extraction resolves to: 'docs/./a.pdf'
+            # and 'docs//a.pdf' land on 'docs/a.pdf' ('..' was refused above)
+            key = os.path.normpath(clean)
+            if key in seen_files:
                 problems.append("member '{0}' appears more than once "
                                 "(extraction would keep only the last "
                                 "copy)".format(name))
-            seen_files.add(clean)
+            seen_files.add(key)
         names.append(name)
     if problems:
         raise ValueError("archive rejected:\n  " + "\n  ".join(problems))

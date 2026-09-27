@@ -7,6 +7,7 @@ so the tool owns the mode flips and the triage view."""
 import json
 import os
 import re
+import tempfile
 
 from .util import CONF_DIR, REINSTALL_HINT, die, log, need_root, run, warn
 
@@ -49,14 +50,23 @@ def _set_engine(value: str) -> None:
     if not text.endswith("\n"):
         text += "\n"
     st = os.stat(MAIN)
-    tmp = MAIN + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.chmod(tmp, st.st_mode & 0o7777)
-    os.chown(tmp, st.st_uid, st.st_gid)
-    os.replace(tmp, MAIN)
+    # An exclusively created temporary name in the policy directory, then
+    # renamed over the file: a predictable `main.conf.tmp` could be planted
+    # as a symlink and open(..., "w") would follow it with root's authority.
+    fd, tmp = tempfile.mkstemp(prefix=".main.conf.", suffix=".tmp",
+                               dir=os.path.dirname(MAIN))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, st.st_mode & 0o7777)
+        os.chown(tmp, st.st_uid, st.st_gid)
+        os.replace(tmp, MAIN)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def _reload_or_rollback(previous_engine: str, context: str) -> None:
