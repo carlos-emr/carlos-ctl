@@ -59,14 +59,24 @@ def _set_engine(value: str) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
             fh.flush()
+            # mode and owner are set on the descriptor BEFORE the sync, so
+            # the synced inode is the finished one
+            os.fchmod(fh.fileno(), st.st_mode & 0o7777)
+            os.fchown(fh.fileno(), st.st_uid, st.st_gid)
             os.fsync(fh.fileno())
-        os.chmod(tmp, st.st_mode & 0o7777)
-        os.chown(tmp, st.st_uid, st.st_gid)
         os.replace(tmp, MAIN)
     except BaseException:
         if os.path.lexists(tmp):
             os.unlink(tmp)
         raise
+    # A synced file is not a synced rename: without the directory sync a
+    # power loss after `waf blocking` reported success could bring back the
+    # old DetectionOnly policy on restart.
+    dir_fd = os.open(os.path.dirname(MAIN), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def _reload_or_rollback(previous_engine: str, context: str) -> None:
