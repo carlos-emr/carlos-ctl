@@ -1,0 +1,168 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+#
+# Release publisher: on a version tag, build the carlos-ctl .deb in an
+# ubuntu:26.04 container, attach it with its .sha256 and a build-provenance
+# attestation, and publish the GitHub release. carlos-emr/carlos pins a
+# release tag of this repository in debian/carlos-ctl.pin and re-attaches
+# the same .deb to every carlos release, verified against the .sha256 and
+# the attestation created here.
+#
+# Version contract: the tag IS the Debian version (this is a 3.0 (native)
+# package, so `1.0.0`, never `1.0.0-1`), and it must equal
+# carlos_ctl.__version__ so the tool can never disagree with its release.
+# Pre-releases are `1.0.0~rc1`-shaped in dpkg terms but a git tag cannot
+# carry `~`: tag `1.0.0-rc1` and the workflow maps `-` to `~`, exactly as
+# the carlos release pipeline does.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build and publish assets for
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build, attest and publish
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: ubuntu:26.04@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build and release tooling
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential debhelper devscripts lintian fakeroot \
+            python3 python3-bcrypt groff-base git ca-certificates curl
+          # gh from GitHub's own apt repository: `gh attestation` needs a
+          # newer gh than the Ubuntu archive carries.
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            > /etc/apt/sources.list.d/github-cli.list
+          apt-get update
+          apt-get install -y --no-install-recommends gh
+          gh --version
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Validate the tag against the package version
+        run: |
+          set -euo pipefail
+          deb_version="$(printf '%s' "$RELEASE_TAG" | sed 's/-/~/g')"
+          if ! printf '%s' "$deb_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(~[a-z]+[0-9]+)?$'; then
+            echo "::error::tag $RELEASE_TAG is not MAJOR.MINOR.PATCH[-rcN]"
+            exit 1
+          fi
+          pkg="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' carlos_ctl/__init__.py)"
+          if [ "${deb_version%%~*}" != "$pkg" ]; then
+            echo "::error::tag $RELEASE_TAG does not match carlos_ctl.__version__ ($pkg); bump the version first"
+            exit 1
+          fi
+          echo "DEB_VERSION=$deb_version" >> "$GITHUB_ENV"
+
+      - name: Skip if the release is already published
+        run: |
+          set -eu
+          if info=$(gh release view "$RELEASE_TAG" --repo "$REPO" --json isDraft --jq '.isDraft' 2>/dev/null) \
+              && [ "$info" = false ]; then
+            echo "Release $RELEASE_TAG is already published; nothing to do."
+            echo "SKIP=true" >> "$GITHUB_ENV"
+          else
+            echo "SKIP=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Stamp the package version from the tag
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          # Replace the in-tree dev stanza (1.0.0~dev1-shaped, which sorts
+          # BELOW the release) with the release's own; git is the history.
+          {
+            printf 'carlos-ctl (%s) resolute; urgency=medium\n\n' "$DEB_VERSION"
+            printf '  * Automated package build of the %s release.\n\n' "$RELEASE_TAG"
+            printf ' -- CARLOS Release CI <releases@carlos-emr.invalid>  %s\n' "$(date -R)"
+          } > debian/changelog
+
+      - name: Build the package
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          dpkg-buildpackage -us -uc -b
+          lintian --fail-on error ../carlos-ctl_*.changes
+          mkdir -p release-assets
+          cp ../carlos-ctl_"${DEB_VERSION}"_all.deb release-assets/
+          cd release-assets
+          # The name recorded in the .sha256 is the name GitHub stores the
+          # asset under: it rewrites a '~' to '.', so a pre-release's file
+          # verifies with `sha256sum -c` as downloaded.
+          for f in *.deb; do
+            digest="$(sha256sum -- "$f")"
+            printf '%s  %s\n' "${digest%% *}" "${f//\~/.}" > "$f.sha256"
+          done
+          ls -la
+
+      - name: Attest package provenance
+        if: env.SKIP != 'true'
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: release-assets/*.deb
+
+      - name: Publish the release with its assets
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          prerelease=()
+          case "$RELEASE_TAG" in *-*) prerelease=(--prerelease) ;; esac
+          if ! gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$REPO" --draft --verify-tag \
+              --generate-notes ${prerelease[@]+"${prerelease[@]}"}
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --repo "$REPO" --clobber
+          # what GitHub stores must be what was hashed and attested
+          release_id=$(gh api --paginate "repos/$REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .id" | head -n 1)
+          stored="$(gh api "repos/$REPO/releases/$release_id" --jq '.assets[].digest')"
+          for asset in release-assets/*.deb; do
+            expected="sha256:$(sha256sum "$asset" | awk '{print $1}')"
+            if ! printf '%s\n' "$stored" | grep -qxF "$expected"; then
+              echo "::error::no uploaded asset matches the digest of $(basename "$asset")"
+              exit 1
+            fi
+          done
+          if [ "${#prerelease[@]}" -gt 0 ]; then
+            gh release edit "$RELEASE_TAG" --repo "$REPO" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$RELEASE_TAG" --repo "$REPO" --draft=false --prerelease=false --latest
+          fi
+          echo "Published $RELEASE_TAG: $(cd release-assets && ls)"

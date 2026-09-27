@@ -1,0 +1,22 @@
+#!/bin/sh
+# postrm for carlos-ctl.
+#
+# The shim runs the package with PYTHONDONTWRITEBYTECODE=1, so a normal
+# install never has a __pycache__ under /usr/lib/carlos-ctl; but the modules
+# are importable by hand (python3 -m carlos_ctl.cli with PYTHONPATH set), and
+# bytecode written that way belongs to no package. Remove it so the
+# package's directory really goes away; dpkg has already removed every file
+# it owns. Nothing here touches carlos-emr's files or any clinical data.
+set -e
+
+case "$1" in
+    remove|purge)
+        rm -rf /usr/lib/carlos-ctl/carlos_ctl/__pycache__
+        rmdir /usr/lib/carlos-ctl/carlos_ctl 2>/dev/null || true
+        rmdir /usr/lib/carlos-ctl 2>/dev/null || true
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

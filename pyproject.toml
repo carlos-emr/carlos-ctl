@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# carlos-ctl — administration command for the CARLOS EMR Debian deployment.
+#
+# Packaging note: production hosts install this as the carlos-ctl .deb
+# (debian/), which places the package under /usr/lib/carlos-ctl behind the
+# bin/carlos-ctl shim — no pip, no dist-packages; the runtime dependency
+# (bcrypt) comes from python3-bcrypt. This file exists for the dev toolchain
+# (ruff/mypy/unittest) and for editable installs on a workstation. The
+# carlos-podman deployment ships a DIFFERENT carlos-ctl (project
+# carlos-podman-ctl, same command name) for rootless podman hosts; unifying
+# the two is tracked separately.
+[project]
+name = "carlos-ctl"
+version = "1.1.0"
+description = "CARLOS EMR single-host (Debian package) deployment: administration command"
+readme = "README.md"
+# 3.12: Ubuntu 24.04's interpreter is the floor the suite is run on; the
+# target distribution (Ubuntu 26.04) ships 3.14, which CI runs as well.
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-only" }
+authors = [{ name = "CARLOS Contributors" }]
+dependencies = [
+    "bcrypt>=3.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/carlos-emr/carlos-ctl"
+Issues = "https://github.com/carlos-emr/carlos-ctl/issues"
+Application = "https://github.com/carlos-emr/carlos"
+
+[project.scripts]
+carlos-ctl = "carlos_ctl.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["carlos_ctl"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# o19_preflight.py is copied ALONE to a 2014-era OSCAR 19 server: it is
+# written for Python 3.4 (no f-strings, no annotations) at 79 columns on
+# purpose, and pyupgrade must not modernise it.
+extend-exclude = ["carlos_ctl/o19_preflight.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+# E501: the tree predates the linter; long lines are cleaned as files are
+# touched, not in one sweep that would bury real changes.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# the o19 modules quote SQL and roff at their natural width
+"carlos_ctl/o19*.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+ignore_missing_imports = true
+# The o19 modules are typed loosely (dicts of dicts read from JSON);
+# checking them strictly is a separate cleanup.
+follow_imports = "silent"
+
+[[tool.mypy.overrides]]
+module = ["bcrypt"]
+ignore_missing_imports = true

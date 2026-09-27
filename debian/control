@@ -1,0 +1,74 @@
+Source: carlos-ctl
+Section: admin
+Priority: optional
+Maintainer: CARLOS EMR Maintainers <michael@maplecreekmedical.ca>
+Build-Depends:
+ debhelper-compat (= 13),
+# The package build runs the CLI's own unit suite (override_dh_auto_test):
+# python3-bcrypt for the credential paths it exercises, groff-base to render
+# the carlos-ctl(8) source with every warning enabled before lintian's
+# Ubuntu-specific man-db false positive is overridden.
+ python3 (>= 3.12),
+ python3-bcrypt,
+ groff-base
+Standards-Version: 4.7.0
+Homepage: https://github.com/carlos-emr/carlos-ctl
+Vcs-Git: https://github.com/carlos-emr/carlos-ctl.git
+Vcs-Browser: https://github.com/carlos-emr/carlos-ctl
+Rules-Requires-Root: no
+
+Package: carlos-ctl
+Architecture: all
+Depends:
+ ${misc:Depends},
+ python3 (>= 3.12),
+# python3-bcrypt hashes the replacement for the seeded administrator password
+# (bootstrap-admin) and the break-glass administrator import-o19 creates.
+ python3-bcrypt,
+# mariadb-client (not -core): every database verb drives the mariadb CLI
+# (db, db-dump, db-users, db-migrate's collation probe, the o19 importer).
+ mariadb-client (>= 1:11.4),
+# ss, for the listening-socket assertions in `carlos-ctl check`.
+ iproute2,
+# ps, for the "no component runs as root" assertion in `carlos-ctl check`.
+ procps,
+# curl: the live front-door, WAF and DrugRef probes in `carlos-ctl check`.
+ curl
+Recommends:
+# jq makes `carlos-ctl waf tail` readable; it degrades to raw JSON without it.
+ jq
+# Deliberately NO Depends on carlos-emr: carlos-emr depends on this package,
+# and a dependency back would be a cycle. The CLI checks for the application
+# package at run time and says so when it is absent.
+#
+# Through 2026.08.0~alpha15 the CLI shipped INSIDE carlos-emr (the same
+# /usr/sbin/carlos-ctl, the carlosctl compatibility symlink and both man
+# pages). Every earlier carlos-emr has to hand those files over (Replaces)
+# and must not stay configured beside this package (Breaks): Policy 7.6.1.
+# A FIXED version: the first carlos-emr RELEASE that no longer ships them
+# is 2026.08.0~alpha16 (built from release/2026.08), and `~alpha16~` sorts
+# just below it, so alpha16, an rc or the final all sit above the boundary.
+# Developer snapshots are versioned 2026.09.0~snapshotN and sort ABOVE every
+# 2026.08 version, so a PRE-split snapshot (snapshot24 and earlier, from the
+# develop/main tree) is not covered: dpkg would refuse to overwrite its
+# /usr/sbin/carlos-ctl. That move is a downgrade in dpkg terms and is not a
+# supported upgrade source anyway (see carlos-emr's debian/control); on such
+# a host `apt remove carlos-emr` first, then install the split pair. A range
+# cannot say "below alpha16 OR below snapshot25" -- each Breaks entry is
+# independent, so a second entry would break the split snapshots too.
+Breaks:
+ carlos-emr (<< 2026.08.0~alpha16~)
+Replaces:
+ carlos-emr (<< 2026.08.0~alpha16~)
+Description: administration command for the CARLOS EMR Debian deployment
+ carlos-ctl administers a CARLOS EMR host installed from the carlos-emr
+ package: the deployment check, service lifecycle, schema migration and
+ database accounts, certificates, the ModSecurity front door, backups and
+ restore drills, and the experimental OSCAR 19 clinic import.
+ .
+ The carlos-emr maintainer scripts call the same verbs an administrator does,
+ so provisioning logic exists in exactly one place. carlos-emr depends on
+ this package; the two version independently, and the CLI applies whatever
+ schema the installed carlos-emr ships.
+ .
+ The command is carlos-ctl(8); the older spelling carlosctl still works.

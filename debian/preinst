@@ -1,0 +1,49 @@
+#!/bin/sh
+# preinst for carlos-ctl.
+#
+# Refuse to unpack over a running OSCAR 19 import. The importer
+# (`carlos-ctl import-o19`) imports its o19 modules lazily, phase by phase,
+# so replacing /usr/lib/carlos-ctl/carlos_ctl/*.py under it -- an upgrade of
+# this package, or the FIRST install of it while the copy inside a pre-split
+# carlos-emr is mid-import -- would run the rest of the import on a mix of
+# two releases. The ledger is /var/lib/carlos-emr/o19-import/state.json and
+# the predicate is carlos-emr's own guard, the one its service unit and
+# postinst consult (carlos-emr-o19-guard): ONE predicate, so this cannot
+# disagree with them. Fails CLOSED: a ledger that exists but cannot be
+# judged (no guard on the host, or the guard cannot read it) counts as an
+# import in progress. The remedy is to finish or clean up the import, then
+# retry the install.
+set -e
+
+LEDGER=/var/lib/carlos-emr/o19-import/state.json
+GUARD=/usr/lib/carlos-emr/carlos-emr-o19-guard
+
+refuse() {
+    echo "carlos-ctl: NOT installing: an OSCAR 19 import is in progress on this host" >&2
+    echo "carlos-ctl: (ledger $LEDGER). Replacing the tool under a running import would" >&2
+    echo "carlos-ctl: continue it on a mix of two releases. Finish the import with" >&2
+    echo "carlos-ctl:   sudo carlos-ctl import-o19 ... --resume" >&2
+    echo "carlos-ctl: (or, for a dry run or abandoned assessment: sudo carlos-ctl import-o19 --cleanup)," >&2
+    echo "carlos-ctl: then install this package again. Nothing has been changed." >&2
+    exit 1
+}
+
+case "$1" in
+    install|upgrade)
+        # -s: the importer writes the ledger with os.replace(), so a 0-byte
+        # file is never a written state (the guard treats it the same way).
+        if [ -s "$LEDGER" ]; then
+            if [ -x "$GUARD" ]; then
+                "$GUARD" "$LEDGER" >/dev/null 2>&1 || refuse
+            else
+                # a ledger with nothing on the host able to judge it: closed
+                echo "carlos-ctl: $GUARD is missing, so the import ledger cannot be judged." >&2
+                refuse
+            fi
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
