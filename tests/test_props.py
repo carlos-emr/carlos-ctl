@@ -70,10 +70,10 @@ def fixture_result():
 # O19 one: baseline-diff keeps them out of the fragment, so the clinic's
 # behaviour flips at cutover and the report row is the only warning
 DIVERGENT_CARRY_DEFAULTS = (
+    "ALLOW_UPDATE_DOCUMENT_CONTENT",
     "CONSULTATION_AUTO_INCLUDE_ALLERGIES",
     "CONSULTATION_AUTO_INCLUDE_MEDICATIONS",
     "CONSULTATION_LOCK_REFERRAL_DATE",
-    "DEMOGRAPHIC_PATIENT_HEALTH_CARE_TEAM",
     "ECHART_SIGN_LINE",
     "ECHART_VERSIGN_LINE",
     "FORMS_PROMOTEXT",
@@ -81,10 +81,21 @@ DIVERGENT_CARRY_DEFAULTS = (
     "NEW_CONTACTS_UI",
     "NEW_CONTACTS_UI_EXTERNAL_CONTACT",
     "confidentiality_statement.v1",
+    "consultation_dynamic_labelling_enabled",
     "consultation_fax_enabled",
+    "displayAlertsOnScheduleScreen",
+    "displayNotesOnScheduleScreen",
+    "eform_signature_enabled",
     "faxPollInterval",
+    "lab_req_include_chartno",
+    "new_flowsheet_enabled",
+    "onare_labreqver",
+    "rx_fax_enabled",
     "save_as_xml",
     "label.top",
+    "tickler_edit_enabled",
+    "use_lab_clientreference",
+    "workflow_enhance",
 )
 
 
