@@ -1,3 +1,12 @@
+carlos-ctl (1.1.1~dev1) resolute; urgency=medium
+
+  * Maintenance release: the o19 property-map tests track the CARLOS
+    defaults restored to the OSCAR installer values in carlos-emr 2026.08
+    (refreshed o19map_props fixture snapshot). No change to CLI behaviour.
+  * The dev snapshot version: release builds stamp the tag's version.
+
+ -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Tue, 29 Sep 2026 12:00:00 +0000
+
 carlos-ctl (1.1.0~dev1) resolute; urgency=medium
 
   * First release of carlos-ctl as its own package (1.1.0: the 1.0 line is
