@@ -274,13 +274,16 @@ pending. Fix the reported error, then run the command again. A failed service
 start also restores the marker. If the marker cannot be written, automatic
 retry is not assured; retry manually after fixing the filesystem.
 .IP
-Only one provisioning run at a time: an exclusive lock on
+Only one provisioning or OSCAR 19 import operation at a time: an exclusive lock on
 .I /var/lib/carlos-emr/.finish-install.lock
 is held for the life of the run, so a hand\-typed repair, the boot\-time
 provisioner and the package's own configure \(em which takes the same file
 \(em cannot both provision accounts or both generate an administrator
 credential. A second run by hand is refused and names the first; at boot it
-leaves the work to whoever holds the lock.
+leaves the work to whoever holds the lock. Imports, resumes, cleanup and
+preflight staging take this same lock before setup and release it when the
+operation ends, including a refusal or failure. The import workspace lock
+remains separate; it cannot by itself exclude provisioning.
 .IP
 The credential guard the postinst and this command use \(em
 .I /var/lib/carlos-emr/.seed-credential-live
@@ -447,6 +450,12 @@ for a real run: a running
 unit is refused (its startup writes rows the row-parity gate would reject),
 and while the import is in progress the unit's own guard refuses every
 start \(em a reboot's included \(em until P7 verify completes.
+Import, resume, cleanup, dry runs and preflight staging also acquire
+.I /var/lib/carlos-emr/.finish-install.lock
+before setup, excluding package configure and provisioning through the
+last phase. A busy lock is refused without changing the workspace or database;
+wait for its owner to finish, then retry. The lock is released on return or
+process termination; never delete its file to bypass a running operation.
 .B \-\-dry-run
 stages and reports without writing to the EMR schema (its
 .B \-\-accept
@@ -692,8 +701,9 @@ or reconfigure.
 .I /var/lib/carlos-emr/.finish-install.lock
 The lock that keeps a hand\-typed
 .BR finish-install ,
-the boot\-time provisioner and the package's own configure from provisioning
-at the same time.
+the boot\-time provisioner, package configure and OSCAR 19 import operations
+from changing the database at the same time. Import resume, cleanup and
+preflight staging use the same lock.
 .TP
 .I /var/lib/carlos-emr/o19-import/
 Workspace of an OSCAR 19 import (root\-only, created by

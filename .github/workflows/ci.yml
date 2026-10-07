@@ -87,6 +87,16 @@ jobs:
         run: dpkg-buildpackage -us -uc -b
       - name: Lintian gate
         run: lintian --fail-on error ../carlos-ctl_*.changes
+      - name: Installed import ownership regressions
+        run: |
+          set -euo pipefail
+          apt-get install -y ../carlos-ctl_*.deb
+          cd /
+          export PYTHONDONTWRITEBYTECODE=1
+          export PYTHONPATH="/usr/lib/carlos-ctl:$GITHUB_WORKSPACE"
+          export CARLOS_CTL_O19_MANIFEST_DIR="$GITHUB_WORKSPACE/tests/fixtures/o19-manifest"
+          python3 -c 'from carlos_ctl import o19import; assert o19import.__file__.startswith("/usr/lib/carlos-ctl/")'
+          python3 -m unittest -v tests.test_import_ownership_lock
       - name: Keep the build product
         run: mkdir -p build-product && cp ../carlos-ctl_*.deb build-product/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
