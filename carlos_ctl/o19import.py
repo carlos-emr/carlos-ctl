@@ -2070,8 +2070,7 @@ def make_etl_query(base_argv: List[str],
         cp = run_sql_client(argv, sql)
         if cp.returncode != 0:
             error = cp.stderr
-            code = o19etl.ERROR_CODE_RE.search(error)
-            if code and code.group(1) == "1062":
+            if re.search(r"^ERROR\s+1062\b", error, re.MULTILINE):
                 # Duplicate-key diagnostics echo the conflicting value, which
                 # may identify a patient. Keep the error code for classification
                 # and the statement's table context without exposing that value.

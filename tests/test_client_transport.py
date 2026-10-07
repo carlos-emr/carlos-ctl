@@ -61,6 +61,14 @@ class TestBufferedClientTransport(unittest.TestCase):
                     self.assertNotIn("PATIENT", text)
                 self.assertFalse(o19etl.absent_object_error(raised.exception))
 
+    def test_should_preserve_other_errors_when_echoed_sql_mentions_error_1062(self):
+        error = (b"--------------\nSELECT 'ERROR 1062' FROM missing_table\n--------------\n"
+                 b"ERROR 1146 (42S02) at line 1: Table 'missing_table' doesn't exist\n")
+        with self.assertRaises(o19etl.QueryError) as raised:
+            o19import.make_etl_query(self._base(b"", 1, error))("SELECT 1")
+        self.assertEqual(raised.exception.stderr, error.decode())
+        self.assertIn("1146", str(raised.exception))
+
     def test_should_disable_restore_commands_and_inherited_force(self):
         argv = o19host.Host().staging_client_argv(
             ["mariadb", "--force", "--binary-mode=0"], "/private/client.cnf")
