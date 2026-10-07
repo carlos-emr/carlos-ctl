@@ -95,6 +95,7 @@ jobs:
           cd /
           export PYTHONDONTWRITEBYTECODE=1
           export PYTHONPATH="/usr/lib/carlos-ctl:$GITHUB_WORKSPACE"
+          export CARLOS_CTL_O19_MANIFEST_DIR="$GITHUB_WORKSPACE/tests/fixtures/o19-manifest"
           export CARLOS_TEST_MARIADB_SOCKET=/run/mysqld/mysqld.sock
           python3 -c 'from carlos_ctl import o19import; assert o19import.__file__.startswith("/usr/lib/carlos-ctl/")'
           python3 -m unittest -v tests.test_etl_mariadb
