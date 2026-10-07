@@ -28,7 +28,7 @@ import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import dbops
-from .util import BACKUP_ENV, ENV_FILE, STATE, log, run
+from .util import BACKUP_ENV, DB_OWNERSHIP_LOCK, ENV_FILE, STATE, log, run
 
 #: the deb's workspace: ledger, reports, staged bundle, archive export
 STATE_DIR = os.path.join(STATE, "o19-import")
@@ -83,6 +83,21 @@ class Host(object):
     def documents_root(self) -> str:
         """The patient document tree the documents phase restores into."""
         return DOCUMENTS_ROOT
+
+    def db_ownership_lock_path(self) -> Optional[str]:
+        """The lock every provisioning path on this host takes before it
+        mutates the database, or None when there is none to share.
+
+        The import holds it for its whole run, from before it publishes
+        its ledger, so that a configure, `finish-install` or boot repair
+        cannot slip in between its own o19-guard check and the moment the
+        import becomes visible to that guard (carlos#3678). A development
+        database reached through `--mariadb-arg` has no postinst and no
+        boot provisioner to exclude, so it answers None; a deployment
+        whose provisioning takes another file overrides this."""
+        if not self.is_packaged_host():
+            return None
+        return DB_OWNERSHIP_LOCK
 
     # -- who this host is --------------------------------------------------
 

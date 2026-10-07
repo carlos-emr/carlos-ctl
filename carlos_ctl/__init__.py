@@ -33,4 +33,4 @@ two trees in this repository is a separate, later issue.
 
 #: the release version; debian/changelog and the release tag carry the same
 #: number (the release workflow refuses a tag that disagrees)
-__version__ = "1.1.1"
+__version__ = "1.1.2"
