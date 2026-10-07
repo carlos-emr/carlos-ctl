@@ -12,11 +12,12 @@ from carlos_ctl import o19etl, o19host, o19import
 
 class TestBufferedClientTransport(unittest.TestCase):
 
-    def _base(self, output, rc=0):
+    def _base(self, output, rc=0, error=b""):
         # A real child emits MariaDB batch bytes, including literal CR.
         script = ("import sys; sys.stdin.buffer.read(); "
                   "sys.stdout.buffer.write({0!r}); "
-                  "sys.exit({1})").format(output, rc)
+                  "sys.stderr.buffer.write({2!r}); "
+                  "sys.exit({1})").format(output, rc, error)
         return [sys.executable, "-c", script]
 
     def test_should_preserve_rows_and_values_in_both_buffered_readers(self):
@@ -44,6 +45,21 @@ class TestBufferedClientTransport(unittest.TestCase):
     def test_should_propagate_client_failure(self):
         with self.assertRaises(o19etl.QueryError):
             o19import.make_etl_query(self._base(b"", 1))("SELECT 1;")
+
+    def test_should_report_duplicate_keys_without_exposing_conflicting_values(self):
+        for value in ("FAKE-PATIENT", "FAKE'PATIENT", "FAKE\nPATIENT"):
+            with self.subTest(value=value):
+                error = ("ERROR 1062 (23000) at line 1: Duplicate entry '{0}' "
+                         "for key 'uq_name'\n".format(value)).encode()
+                query = o19import.make_etl_query(self._base(b"", 1, error))
+                with self.assertRaises(o19etl.QueryError) as raised:
+                    query("INSERT INTO target SELECT * FROM source")
+                for text in (str(raised.exception), raised.exception.stderr):
+                    self.assertIn("1062", text)
+                    self.assertIn("duplicate unique key", text)
+                    self.assertNotIn("FAKE", text)
+                    self.assertNotIn("PATIENT", text)
+                self.assertFalse(o19etl.absent_object_error(raised.exception))
 
     def test_should_disable_restore_commands_and_inherited_force(self):
         argv = o19host.Host().staging_client_argv(

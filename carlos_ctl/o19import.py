@@ -2069,11 +2069,18 @@ def make_etl_query(base_argv: List[str],
             argv.append(db)
         cp = run_sql_client(argv, sql)
         if cp.returncode != 0:
+            error = cp.stderr
+            code = o19etl.ERROR_CODE_RE.search(error)
+            if code and code.group(1) == "1062":
+                # Duplicate-key diagnostics echo the conflicting value, which
+                # may identify a patient. Keep the error code for classification
+                # and the statement's table context without exposing that value.
+                error = "ERROR 1062: duplicate unique key during ETL copy"
             raise o19etl.QueryError(
                 "ETL statement failed ({0} ...): {1}".format(
                     redact_statement(sql, 120),
                     CREDENTIAL_SQL_RE.sub(r"\1'<redacted>'",
-                                          cp.stderr.strip())), cp.stderr)
+                                          error.strip())), error)
         return batch_rows(cp.stdout)
 
     return query
