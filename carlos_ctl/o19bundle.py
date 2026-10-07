@@ -419,6 +419,10 @@ def _decrypt_to(bundle: str, dest_tar: str, cipher: str,
         try:
             os.unlink(dest_tar)
         except OSError:
+            # Best-effort: the run is already failing and die() below is the
+            # outcome the operator sees. A leftover is 0600 in the 0700
+            # workdir, and open_bundle clears stale copies before its next
+            # attempt.
             pass
         die(WRONG_KEY_GUIDANCE)
 
