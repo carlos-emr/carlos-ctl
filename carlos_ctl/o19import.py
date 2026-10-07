@@ -4061,17 +4061,18 @@ def _cmd_o19_preflight(argv) -> int:
         return 0
     if os.geteuid() != 0 and not args.mariadb_arg:
         die("this command needs root (or --mariadb-arg for a dev database)")
-    # an assessment: capacity gates, stage, report — never a recorded
-    # verdict or a persisted sign-off; the exit code IS the verdict
-    # (_make_ctx refuses a mid-import workspace before touching it)
-    ctx = _make_ctx(args, import_mode=False)
-    ctx["dry_run"] = True
-    run_p0_capacity(ctx)
-    run_p1(ctx)
-    report = run_p2(ctx)
-    log("preflight verdict: {0} — report in {1}/preflight.txt".format(
-        report["verdict"], ctx["state_dir"]))
-    return int(report["exit_code"])
+    with HOST.database_ownership_lock():
+        # an assessment: capacity gates, stage, report — never a recorded
+        # verdict or a persisted sign-off; the exit code IS the verdict
+        # (_make_ctx refuses a mid-import workspace before touching it)
+        ctx = _make_ctx(args, import_mode=False)
+        ctx["dry_run"] = True
+        run_p0_capacity(ctx)
+        run_p1(ctx)
+        report = run_p2(ctx)
+        log("preflight verdict: {0} — report in {1}/preflight.txt".format(
+            report["verdict"], ctx["state_dir"]))
+        return int(report["exit_code"])
 
 
 def _cmd_import_o19(argv) -> int:
@@ -4082,79 +4083,80 @@ def _cmd_import_o19(argv) -> int:
     if os.geteuid() != 0 and not args.mariadb_arg:
         die("this command needs root (or --mariadb-arg for a dev database)")
 
-    # before any other gate, including --cleanup's: a workspace rewound
-    # by a restored snapshot makes every one of them refuse, and two of
-    # them point back at the snapshot the operator just restored
-    workspace = HOST.state_dir
-    refusal = rewound_workspace_refusal(load_state(workspace),
-                                        workspace)
-    if refusal:
-        die(refusal)
+    with HOST.database_ownership_lock():
+        # before any other gate, including --cleanup's: a workspace rewound
+        # by a restored snapshot makes every one of them refuse, and two of
+        # them point back at the snapshot the operator just restored
+        workspace = HOST.state_dir
+        refusal = rewound_workspace_refusal(load_state(workspace),
+                                            workspace)
+        if refusal:
+            die(refusal)
 
-    if args.cleanup:
+        if args.cleanup:
+            if args.dry_run:
+                die("--cleanup has no dry-run mode: it drops the staging "
+                    "schema and retires this run's ledgers and reports. Run "
+                    "it without --dry-run when the import is verified.")
+            ctx = _make_ctx_for_cleanup(args)
+            run_cleanup(ctx)
+            return 0
+
+        if not args.dry_run and not args.admin_user:
+            die("--admin-user is required for a real import (the break-glass "
+                "administrator created before the seeded clinician is removed)")
+        if args.admin_user:
+            try:
+                o19etl.validate_admin_user(args.admin_user)
+            except ValueError as exc:
+                die(str(exc))
+        state = load_state(HOST.state_dir)
+        refusal = require_resume_for_existing_state(
+            state, args.resume, args.dry_run)
+        if refusal:
+            die(refusal)
+        refusal = nothing_to_resume_refusal(
+            state, args.resume, etl_started(HOST.state_dir))
+        if refusal:
+            die(refusal)
+        if not args.dry_run:
+            refusal = webapp_running_refusal()
+            if refusal:
+                die(refusal)
+
+        ctx = _make_ctx(args, import_mode=True)
+        if not args.dry_run:
+            # Bundle extraction may take minutes. A start could pass the
+            # first service check before _make_ctx publishes the run ledger.
+            # The ledger now blocks subsequent starts; check again before
+            # any phase so a start during intake cannot overlap the import.
+            refusal = webapp_running_refusal()
+            if refusal:
+                die(refusal)
+        log("import-o19 (experimental) — manifest {0}, province {1}{2}".format(
+            o19map_schema.SCHEMA_MAP_VERSION, ctx["province"],
+            ", DEV TARGET" if ctx["dev_target"] else ""))
+
+        run_p0(ctx)
+        if not args.dry_run:
+            run_p3(ctx)  # the rollback point exists before any clinic SQL runs
+        run_p1(ctx)
+        run_p2(ctx)
         if args.dry_run:
-            die("--cleanup has no dry-run mode: it drops the staging "
-                "schema and retires this run's ledgers and reports. Run "
-                "it without --dry-run when the import is verified.")
-        ctx = _make_ctx_for_cleanup(args)
-        run_cleanup(ctx)
+            from . import o19props
+            o19props.run_props(ctx)  # report-only in dry-run (fragment flagged)
+            log("dry run complete — reports in {0}; nothing was written beyond "
+                "the throwaway staging schema".format(ctx["state_dir"]))
+            return 0
+        run_p4(ctx)
+        run_p5(ctx)
+        run_p6(ctx)
+        run_p7(ctx)
+        log("import complete (experimental). Remaining operator steps:\n  "
+            + "\n  ".join("{0}. {1}".format(i, step)
+                          for i, step in enumerate(NEXT_STEPS, 1))
+            + "\n  (the reports are in {0})".format(ctx["state_dir"]))
         return 0
-
-    if not args.dry_run and not args.admin_user:
-        die("--admin-user is required for a real import (the break-glass "
-            "administrator created before the seeded clinician is removed)")
-    if args.admin_user:
-        try:
-            o19etl.validate_admin_user(args.admin_user)
-        except ValueError as exc:
-            die(str(exc))
-    state = load_state(HOST.state_dir)
-    refusal = require_resume_for_existing_state(
-        state, args.resume, args.dry_run)
-    if refusal:
-        die(refusal)
-    refusal = nothing_to_resume_refusal(
-        state, args.resume, etl_started(HOST.state_dir))
-    if refusal:
-        die(refusal)
-    if not args.dry_run:
-        refusal = webapp_running_refusal()
-        if refusal:
-            die(refusal)
-
-    ctx = _make_ctx(args, import_mode=True)
-    if not args.dry_run:
-        # Bundle extraction may take minutes. A start could pass the
-        # first service check before _make_ctx publishes the run ledger.
-        # The ledger now blocks subsequent starts; check again before
-        # any phase so a start during intake cannot overlap the import.
-        refusal = webapp_running_refusal()
-        if refusal:
-            die(refusal)
-    log("import-o19 (experimental) — manifest {0}, province {1}{2}".format(
-        o19map_schema.SCHEMA_MAP_VERSION, ctx["province"],
-        ", DEV TARGET" if ctx["dev_target"] else ""))
-
-    run_p0(ctx)
-    if not args.dry_run:
-        run_p3(ctx)  # the rollback point exists before any clinic SQL runs
-    run_p1(ctx)
-    run_p2(ctx)
-    if args.dry_run:
-        from . import o19props
-        o19props.run_props(ctx)  # report-only in dry-run (fragment flagged)
-        log("dry run complete — reports in {0}; nothing was written beyond "
-            "the throwaway staging schema".format(ctx["state_dir"]))
-        return 0
-    run_p4(ctx)
-    run_p5(ctx)
-    run_p6(ctx)
-    run_p7(ctx)
-    log("import complete (experimental). Remaining operator steps:\n  "
-        + "\n  ".join("{0}. {1}".format(i, step)
-                      for i, step in enumerate(NEXT_STEPS, 1))
-        + "\n  (the reports are in {0})".format(ctx["state_dir"]))
-    return 0
 
 
 def _make_ctx_for_cleanup(args) -> Dict:

@@ -916,8 +916,10 @@ class TestARewoundWorkspace(unittest.TestCase):
     """
 
     def setUp(self):
-        self.state_dir = tempfile.mkdtemp(prefix="o19rewound-")
-        self.addCleanup(shutil.rmtree, self.state_dir)
+        work = tempfile.mkdtemp(prefix="o19rewound-")
+        self.addCleanup(shutil.rmtree, work)
+        self.state_dir = os.path.join(work, "o19-import")
+        os.mkdir(self.state_dir)
 
     def rewind(self, **phases):
         """A workspace as `restic restore` leaves it: state.json from
@@ -3827,6 +3829,9 @@ class TestTheRunningWebappGuard(unittest.TestCase):
     def setUp(self):
         work = tempfile.mkdtemp(prefix="o19webapp-")
         self.addCleanup(shutil.rmtree, work)
+        state = mock.patch.object(o19host, "STATE_DIR", os.path.join(work, "o19-import"))
+        state.start()
+        self.addCleanup(state.stop)
         self.env_file = os.path.join(work, "carlos-emr.env")
         with open(self.env_file, "w", encoding="utf-8") as fh:
             fh.write("CARLOS_DB_NAME=carlos\n")

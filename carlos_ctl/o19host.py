@@ -24,11 +24,14 @@ snapshot comes from restic through `carlos-ctl backup`, the app-running
 question is asked of the pod). Nothing here knows that.
 """
 
+from contextlib import contextmanager
+import fcntl
 import os
+import stat
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import dbops
-from .util import BACKUP_ENV, ENV_FILE, STATE, log, run
+from .util import BACKUP_ENV, ENV_FILE, STATE, die, log, run
 
 #: the deb's workspace: ledger, reports, staged bundle, archive export
 STATE_DIR = os.path.join(STATE, "o19-import")
@@ -83,6 +86,45 @@ class Host(object):
     def documents_root(self) -> str:
         """The patient document tree the documents phase restores into."""
         return DOCUMENTS_ROOT
+
+    @property
+    def database_lock_path(self) -> str:
+        """The lock shared with provisioning, outside the import workspace.
+
+        The Debian state directory also contains finish-install's lock, which
+        both package postinsts acquire. Ports with a different provisioning
+        lock must override this path; the workspace's own lock is not enough.
+        """
+        return os.path.join(os.path.dirname(self.state_dir), ".finish-install.lock")
+
+    @contextmanager
+    def database_ownership_lock(self):
+        """Exclude provisioning before intake and until every phase has ended.
+
+        Do not unlink or truncate the shared file: another process may already
+        have it open. Closing our descriptor releases ownership on success,
+        refusal or an exception; process termination releases it in the kernel.
+        """
+        path = self.database_lock_path
+        descriptor = None
+        try:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC
+                                     | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    die("database ownership lock must be a regular file: " + path)
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                die("another CARLOS database operation holds " + path
+                    + " (package configure, finish-install or an OSCAR 19 import); "
+                    "wait for it to finish before retrying")
+            except OSError as exc:
+                die("could not acquire database ownership lock " + path + ": " + str(exc))
+            yield
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     # -- who this host is --------------------------------------------------
 
