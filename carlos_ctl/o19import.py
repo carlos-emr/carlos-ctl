@@ -3702,6 +3702,96 @@ def take_workspace_lock(state_dir: str) -> None:
     _WORKSPACE_LOCK["fd"] = fd
 
 
+#: the held database-ownership lock's descriptor; same reasoning as
+#: `_WORKSPACE_LOCK`, but released explicitly when the verb ends
+_DB_OWNERSHIP_LOCK: Dict[str, int] = {}
+
+
+def workspace_lock_busy(state_dir: str) -> bool:
+    """Whether another process holds the workspace lock right now. Only
+    used to word a refusal, so it probes and lets go: a free lock is
+    released at once, and an unreadable workspace reads as not busy."""
+    import fcntl
+    path = os.path.join(state_dir, ".lock")
+    try:
+        fd = os.open(path, os.O_WRONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)  # closing drops a probe lock this call did take
+    return False
+
+
+def db_ownership_refusal(path: str, another_import: bool) -> str:
+    """The operator-facing reason an import may not start while the
+    database-ownership lock is held. Pure, for the state tests."""
+    if another_import:
+        return ("another carlos-ctl import-o19 is running on this host "
+                "(it holds {0} and its workspace lock) — wait for it to "
+                "finish, or check it with `ps` / `systemctl status`. Two "
+                "runs over one database can leave the clinic with no "
+                "working login.".format(path))
+    return ("another CARLOS run owns the database right now (it holds "
+            "{0}): an apt transaction configuring carlos-emr or "
+            "carlos-emr-drugref, the boot-time carlos-emr-provision.service, "
+            "or `carlos-ctl finish-install`. Those restart MariaDB, rewrite "
+            "grants and migrate the schema, none of which may happen during "
+            "an import. Nothing has been written; wait for it to finish "
+            "(`carlos-ctl check`), then re-run this command.".format(path))
+
+
+def take_db_ownership_lock(path: Optional[str], state_dir: str) -> None:
+    """Hold the host's database-ownership lock until the verb ends.
+
+    The o19 guard that `finish-install`, both postinsts and the boot
+    provisioner consult cannot see an import until its ledger is
+    published, so a guard check alone leaves a window in which a
+    provisioning run and an import both proceed: MariaDB restarted under
+    the copy, grants rewritten, Flyway migrating a half-copied schema
+    (carlos#3678). Those paths take this lock BEFORE their guard check;
+    taking it here before the ledger is written, and keeping it through
+    every phase, is what makes the two mutually exclusive.
+
+    Non-blocking: a provisioning run is the operator's own action and
+    seconds-to-minutes long, and an import that sat waiting behind an
+    apt transaction would start long after the operator stopped
+    watching. `--resume` and `--cleanup` are new processes and take it
+    afresh. None (a development database) means there is nothing to
+    share; the workspace lock still serializes the importer itself."""
+    if path is None or _DB_OWNERSHIP_LOCK:
+        return
+    import fcntl
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # no O_TRUNC and nothing written: flock(1) in the postinsts opens
+        # this with `>`, and the file's contents mean nothing to anyone
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+    except OSError as exc:
+        die("could not open {0} ({1}); the import cannot exclude a "
+            "concurrent configure or boot repair, so it will not start. "
+            "Nothing has been written.".format(path, exc))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        die(db_ownership_refusal(path, workspace_lock_busy(state_dir)))
+    _DB_OWNERSHIP_LOCK["fd"] = fd
+
+
+def release_db_ownership_lock() -> None:
+    """Let a waiting provisioning run in. Called when the verb ends,
+    however it ends (a refusal and an aborted phase included); the
+    kernel would release it at exit anyway, but a caller that keeps the
+    process alive must not keep the database with it."""
+    fd = _DB_OWNERSHIP_LOCK.pop("fd", None)
+    if fd is not None:
+        os.close(fd)
+
+
 def _make_ctx(args, import_mode: bool,
               state_dir: Optional[str] = None) -> Dict:
     """Build the phase context and take the workspace lock.
@@ -4038,8 +4128,13 @@ def cmd_o19_preflight(argv) -> int:
 
 
 def cmd_import_o19(argv) -> int:
-    """`carlos-ctl import-o19` entrypoint: run the phases, or `--cleanup`."""
-    return _guarded(lambda: _cmd_import_o19(argv))
+    """`carlos-ctl import-o19` entrypoint: run the phases, or `--cleanup`.
+    The database-ownership lock `_cmd_import_o19` takes is released here,
+    on every way out: success, a refusal, an aborted phase."""
+    try:
+        return _guarded(lambda: _cmd_import_o19(argv))
+    finally:
+        release_db_ownership_lock()
 
 
 def _cmd_o19_preflight(argv) -> int:
@@ -4081,6 +4176,14 @@ def _cmd_import_o19(argv) -> int:
         list(argv))
     if os.geteuid() != 0 and not args.mariadb_arg:
         die("this command needs root (or --mariadb-arg for a dev database)")
+
+    # FIRST, before any gate reads the workspace and long before _make_ctx
+    # publishes the ledger the o19 guard reads: every mode of this verb --
+    # a real run, --resume, --cleanup, and a --dry-run whose ledger the
+    # guard also reports -- owns the database until it ends, and the
+    # provisioning paths only check the guard after taking this lock.
+    # Lock first, then check, on both sides (carlos#3678).
+    take_db_ownership_lock(HOST.db_ownership_lock_path(), HOST.state_dir)
 
     # before any other gate, including --cleanup's: a workspace rewound
     # by a restored snapshot makes every one of them refuse, and two of

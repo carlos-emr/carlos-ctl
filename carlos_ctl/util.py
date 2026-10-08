@@ -70,6 +70,20 @@ def package_ships(path: str) -> bool:
 
 STATE = "/var/lib/carlos-emr"
 
+# The database-ownership lock: ONE file that every run which mutates the
+# clinical database's server, grants or schema takes before touching it --
+# carlos-emr.postinst and carlos-emr-drugref.postinst (flock(1) on fd 9),
+# `finish-install` (by hand, and carlos-emr-provision.service at boot), and
+# `import-o19` for the whole of a run, from before it writes its ledger to
+# exit. The o19 guard those provisioning paths also consult is the friendly
+# pre-check that says WHY; this lock is what actually excludes, because the
+# guard cannot see an import until its ledger is published (carlos#3678).
+#
+# The name predates the importer joining it and is kept on purpose: the
+# postinsts of every carlos-emr release already in the field open this exact
+# path, and a renamed file would be a second lock that excludes nothing.
+DB_OWNERSHIP_LOCK = os.path.join(STATE, ".finish-install.lock")
+
 
 def carlos_emr_installed() -> bool:
     """Whether the carlos-emr package's payload is on this host.
