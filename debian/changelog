@@ -1,3 +1,24 @@
+carlos-ctl (1.1.2~dev1) resolute; urgency=medium
+
+  * import-o19 now takes the database-ownership lock
+    (/var/lib/carlos-emr/.finish-install.lock) that carlos-emr's and
+    carlos-emr-drugref's configure, carlos-emr-provision.service and
+    finish-install already share, before it writes its ledger, and holds
+    it until it exits (carlos-emr/carlos#3678). Previously the importer
+    only became visible to those paths' o19 guard once its ledger was
+    published, leaving a window in which a configure or boot repair could
+    restart MariaDB, rewrite grants or run Flyway under the copy. Every
+    mode takes it (a real run, --resume, --cleanup, --dry-run); an
+    import started while a provisioning run holds it is refused with
+    nothing written.
+  * o19-preflight takes the same lock for its staging restore, which runs
+    in the clinic's MariaDB like a real run's (--write-standalone takes
+    none). The lock file is opened without following a symlink and must
+    be a regular file; anything else is refused with nothing written.
+  * The dev snapshot version: release builds stamp the tag's version.
+
+ -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Wed, 07 Oct 2026 12:00:00 +0000
+
 carlos-ctl (1.1.1~dev1) resolute; urgency=medium
 
   * Maintenance release: the o19 property-map tests track the CARLOS

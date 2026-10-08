@@ -274,16 +274,19 @@ pending. Fix the reported error, then run the command again. A failed service
 start also restores the marker. If the marker cannot be written, automatic
 retry is not assured; retry manually after fixing the filesystem.
 .IP
-Only one provisioning or OSCAR 19 import operation at a time: an exclusive lock on
+Only one run owns the database at a time: an exclusive lock on
 .I /var/lib/carlos-emr/.finish-install.lock
 is held for the life of the run, so a hand\-typed repair, the boot\-time
 provisioner and the package's own configure \(em which takes the same file
 \(em cannot both provision accounts or both generate an administrator
-credential. A second run by hand is refused and names the first; at boot it
-leaves the work to whoever holds the lock. Imports, resumes, cleanup and
-preflight staging take this same lock before setup and release it when the
-operation ends, including a refusal or failure. The import workspace lock
-remains separate; it cannot by itself exclude provisioning.
+credential.
+.B import-o19
+holds the same lock for the whole of an import, and
+.B o19-preflight
+for the whole of its staging restore, so none of them can restart
+MariaDB, rewrite grants or migrate the schema under one. A second run by hand
+is refused; at boot it leaves the work to whoever holds the lock. The import
+workspace lock is separate and cannot by itself exclude provisioning.
 .IP
 The credential guard the postinst and this command use \(em
 .I /var/lib/carlos-emr/.seed-credential-live
@@ -552,6 +555,23 @@ max_statement_time; 0 = no bound, the default);
 .BR \-\-mariadb-arg " ARG,"
 .BR \-\-fixups-dir " DIR."
 .PP
+On a packaged host every mode \(em a real run,
+.BR \-\-resume ,
+.BR \-\-cleanup ,
+.B \-\-dry-run
+\(em first takes the database-ownership lock
+.IR /var/lib/carlos-emr/.finish-install.lock ,
+before it reads or writes its workspace, and holds it until it exits,
+however it exits. The package's configure, the boot\-time provisioner and
+.B finish-install
+take the same lock before they touch the database, so they defer to a
+running import, and an import started while one of them holds it is refused
+with nothing written; re-run it once that run has finished
+.RB ( "carlos-ctl check" ).
+A
+.B \-\-resume
+takes it afresh and is refused while another import holds it.
+.PP
 Sign-off classes for
 .BR \-\-accept :
 .B archived-forms
@@ -605,7 +625,17 @@ check; the exit status is the verdict (0 go, 1 acknowledgements required,
 2 no-go) and 3 for any failure of the tool itself (unreachable server, bad
 flags, refused dump, insufficient disk); nothing is recorded as a sign-off
 and a
-workspace whose import is in progress is refused untouched. Options:
+workspace whose import is in progress is refused untouched. On a packaged
+host it takes the database-ownership lock
+.I /var/lib/carlos-emr/.finish-install.lock
+before it reads the workspace and holds it until it exits, as
+.B import-o19
+does, because its staging restore runs in the clinic's MariaDB; it is refused
+while a configure, the boot\-time provisioner,
+.B finish-install
+or an import holds it.
+.B \-\-write\-standalone
+takes no lock. Options:
 .BR \-\-bundle ,
 .BR \-\-bundle-pass ,
 .BR \-\-bundle-sha256 ,
@@ -699,11 +729,14 @@ and what the install asked for; removed by a successful
 or reconfigure.
 .TP
 .I /var/lib/carlos-emr/.finish-install.lock
-The lock that keeps a hand\-typed
+The database-ownership lock: it keeps a hand\-typed
 .BR finish-install ,
-the boot\-time provisioner, package configure and OSCAR 19 import operations
-from changing the database at the same time. Import resume, cleanup and
-preflight staging use the same lock.
+the boot\-time provisioner, the package's own configure, an
+.B import-o19
+run and an
+.B o19-preflight
+staging restore from working on the database at the same time. The name
+predates the importer sharing it.
 .TP
 .I /var/lib/carlos-emr/o19-import/
 Workspace of an OSCAR 19 import (root\-only, created by

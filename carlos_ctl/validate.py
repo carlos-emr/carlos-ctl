@@ -300,6 +300,8 @@ def cmd_check(argv) -> int:
                       encoding="ascii") as fh:
                 restricted = fh.read().strip()
         except OSError:
+            # The knob only exists on kernels that carry the AppArmor userns
+            # restriction; without it "0" (not restricted) is the right answer.
             pass
         if re.search(r"^carlos-emr-chromium ", entries, re.M):
             _ok("AppArmor profile carlos-emr-chromium is loaded (userns grant for the sandbox)")
@@ -321,6 +323,8 @@ def cmd_check(argv) -> int:
                 m = re.search(r"^eform_pdf_browser_service_url\s*=\s*(\S+)", fh.read(), re.M)
                 prop_url = m.group(1) if m else None
         except OSError:
+            # Not swallowed in effect: prop_url stays None, which the
+            # `prop_url is None` branch below reports as a failed check.
             pass
         # Mirror config.py's composition exactly, including the empty-url-base shape it
         # deliberately writes mid-install: a base-less URL is then EXPECTED, and the broken

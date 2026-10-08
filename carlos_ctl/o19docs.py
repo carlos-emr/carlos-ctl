@@ -810,6 +810,9 @@ def _relocate_hrm_through(src_dir: str, doc_fd: int,
             try:
                 os.rmdir(dirpath)
             except OSError:
+                # Cosmetic tidy-up after the files are already placed: a
+                # directory that turned out not to be empty, or cannot be
+                # removed, is harmless to leave behind.
                 pass
     if not moved and not deduped:
         return []  # nothing left under hrm/ (a resume after the move)

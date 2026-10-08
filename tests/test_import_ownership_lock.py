@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 CARLOS Contributors
-"""Real process locks around the import dispatcher, without clinical SQL."""
+"""Real process locks around the import dispatcher, without clinical SQL.
+
+Runs against whichever carlos_ctl is importable, so CI also runs it against
+the installed package. The dispatcher tests point the host's
+db_ownership_lock_path() at a temporary file; tests/test_db_ownership_lock.py
+covers the packaged-host path and the postinsts' flock(1) side.
+"""
 import contextlib
 import io
 import errno
@@ -33,6 +39,16 @@ with open(path, 'a') as handle:
 '''
 
 
+class _LockedHost(o19host.Host):
+    """A host whose provisioning lock is a temporary file."""
+
+    def __init__(self, lock_path):
+        self._lock_path = lock_path
+
+    def db_ownership_lock_path(self):
+        return self._lock_path
+
+
 class TestImportOwnershipLock(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='carlos-ownership-')
@@ -42,6 +58,7 @@ class TestImportOwnershipLock(unittest.TestCase):
         self.lock = self.root / '.finish-install.lock'
         self.events = []
         self.observe = lambda stage: None
+        self.addCleanup(o19import.release_db_ownership_lock)
 
     def peer(self, mode='probe'):
         return subprocess.run([sys.executable, '-c', PEER, str(self.lock), mode],
@@ -80,6 +97,9 @@ class TestImportOwnershipLock(unittest.TestCase):
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(o19host, 'STATE_DIR', self.workspace))
+            if not isinstance(o19import.HOST, _LockedHost):
+                stack.enter_context(mock.patch.object(
+                    o19import, 'HOST', _LockedHost(str(self.lock))))
             stack.enter_context(mock.patch.object(o19import.os, 'geteuid', return_value=0))
             stack.enter_context(mock.patch.object(o19import, 'load_state', return_value=state))
             stack.enter_context(mock.patch.object(o19import, 'etl_started', return_value=False))
@@ -159,10 +179,9 @@ class TestImportOwnershipLock(unittest.TestCase):
         self.lock = self.root / 'port-provisioning.lock'
         lock_path = str(self.lock)
 
-        class Port(o19host.Host):
-            @property
-            def database_lock_path(self):
-                return lock_path
+        class Port(_LockedHost):
+            def __init__(self):
+                super().__init__(lock_path)
 
         self.observe = self.assert_provisioning_excluded
         with mock.patch.object(o19import, 'HOST', Port()), self.dispatcher() as run:
@@ -192,9 +211,11 @@ class TestImportOwnershipLock(unittest.TestCase):
 
     @contextlib.contextmanager
     def ownership(self):
-        with mock.patch.object(o19host, 'STATE_DIR', self.workspace):
-            with o19host.Host().database_ownership_lock():
-                yield
+        o19import.take_db_ownership_lock(str(self.lock), self.workspace)
+        try:
+            yield
+        finally:
+            o19import.release_db_ownership_lock()
 
     def test_lock_inode_and_contents_survive_success_and_failure(self):
         self.lock.write_text('another process may already have this inode open')
@@ -207,11 +228,12 @@ class TestImportOwnershipLock(unittest.TestCase):
         self.assertEqual(self.lock.stat().st_ino, original)
         self.assertEqual(self.lock.read_text(), 'another process may already have this inode open')
 
-    def test_nested_refusal_does_not_release_the_outer_owner(self):
-        with contextlib.redirect_stderr(io.StringIO()), self.ownership():
-            with self.assertRaises(SystemExit):
-                with self.ownership():
-                    self.fail('another descriptor must not acquire the same lock')
+    def test_a_second_take_in_one_process_keeps_the_single_owner(self):
+        # The importer holds one descriptor per process; taking it again (an
+        # import entry point reached twice) must neither self-deadlock nor
+        # open a second descriptor that could drop the first one's lock.
+        with self.ownership():
+            o19import.take_db_ownership_lock(str(self.lock), self.workspace)
             self.assertEqual(self.peer().returncode, 3)
         self.assertEqual(self.peer().returncode, 0)
 
@@ -244,8 +266,8 @@ class TestImportOwnershipLock(unittest.TestCase):
                 return descriptor
             with self.subTest(error=type(error).__name__), \
                     contextlib.redirect_stderr(io.StringIO()), \
-                    mock.patch.object(o19host.os, 'open', side_effect=capture), \
-                    mock.patch.object(o19host.fcntl, 'flock', side_effect=error):
+                    mock.patch.object(o19import.os, 'open', side_effect=capture), \
+                    mock.patch('fcntl.flock', side_effect=error):
                 with self.assertRaises(SystemExit):
                     with self.ownership():
                         self.fail('acquisition failed but the operation ran')
@@ -257,13 +279,13 @@ class TestImportOwnershipLock(unittest.TestCase):
     def test_process_termination_releases_database_ownership(self):
         script = """
 import sys
-from carlos_ctl import o19host
-o19host.STATE_DIR = sys.argv[1]
-with o19host.Host().database_ownership_lock():
-    print('ready', flush=True)
-    sys.stdin.readline()
+from carlos_ctl import o19import
+o19import.take_db_ownership_lock(sys.argv[1], sys.argv[2])
+print('ready', flush=True)
+sys.stdin.readline()
 """
-        process = subprocess.Popen([sys.executable, '-u', '-c', script, self.workspace],
+        process = subprocess.Popen([sys.executable, '-u', '-c', script,
+                                    str(self.lock), self.workspace],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True)
         try:
@@ -280,7 +302,8 @@ with o19host.Host().database_ownership_lock():
 
     def test_debian_host_and_provisioner_name_the_same_lock(self):
         # Parent state storage is shared even though import owns a child workspace.
-        self.assertEqual(o19host.Host().database_lock_path, provision.LOCK)
+        with mock.patch.object(o19host.Host, 'is_packaged_host', return_value=True):
+            self.assertEqual(o19host.Host().db_ownership_lock_path(), provision.LOCK)
 
 
 if __name__ == '__main__':

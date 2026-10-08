@@ -1096,14 +1096,25 @@ def _demo_seed_document_files() -> None:
                 os.link(partial, target)
                 copied += 1
             except FileExistsError:
+                # The race link() exists to lose: the running application stored
+                # a document under this name after the exists() check. Its file
+                # stands, ours is dropped by the cleanup below, and nothing
+                # went wrong, so there is nothing to report.
                 pass
         except OSError as e:
             warn(f"could not seed demo document {name}: {e}")
         finally:
+            # Drop the temporary name. After a successful link() `target` is a
+            # second name for the same inode, so the document survives this.
             try:
                 os.unlink(partial)
-            except OSError:
+            except FileNotFoundError:
+                # The copy died before creating it: nothing to clean up.
                 pass
+            except OSError as e:
+                # Anything else strands a dot-file in the clinical document
+                # store, which the operator should hear about.
+                warn(f"could not remove temporary demo document file {partial}: {e}")
     log(f"demo document files seeded into {dest} ({copied} copied)")
 
 

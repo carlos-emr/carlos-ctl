@@ -40,6 +40,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -659,6 +660,8 @@ def server_datadir(query=None) -> str:
             if rows and rows[0] and rows[0][0]:
                 return rows[0][0]
         except (RuntimeError, IndexError):
+            # The server would not say (or answered with no usable row): fall
+            # through to the filesystem defaults below, as the docstring says.
             pass
     for path in DATADIR_FALLBACKS:
         if os.path.isdir(path):
@@ -3690,6 +3693,7 @@ def take_workspace_lock(state_dir: str) -> None:
             with open(path, encoding="utf-8") as fh:
                 holder = fh.read().strip()
         except OSError:
+            # The pid only decorates the refusal below; die() fires either way.
             pass
         os.close(fd)
         die("another carlos-ctl import is working in {0}{1} — wait for it "
@@ -3700,6 +3704,110 @@ def take_workspace_lock(state_dir: str) -> None:
     os.ftruncate(fd, 0)
     os.write(fd, "{0}\n".format(os.getpid()).encode("utf-8"))
     _WORKSPACE_LOCK["fd"] = fd
+
+
+#: the held database-ownership lock's descriptor; same reasoning as
+#: `_WORKSPACE_LOCK`, but released explicitly when the verb ends
+_DB_OWNERSHIP_LOCK: Dict[str, int] = {}
+
+
+def workspace_lock_busy(state_dir: str) -> bool:
+    """Whether another process holds the workspace lock right now. Only
+    used to word a refusal, so it probes and lets go: a free lock is
+    released at once, and an unreadable workspace reads as not busy."""
+    import fcntl
+    path = os.path.join(state_dir, ".lock")
+    try:
+        fd = os.open(path, os.O_WRONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)  # closing drops a probe lock this call did take
+    return False
+
+
+def db_ownership_refusal(path: str, another_import: bool) -> str:
+    """The operator-facing reason an import may not start while the
+    database-ownership lock is held. Pure, for the state tests."""
+    if another_import:
+        return ("another carlos-ctl import-o19 is running on this host "
+                "(it holds {0} and its workspace lock) — wait for it to "
+                "finish, or check it with `ps` / `systemctl status`. Two "
+                "runs over one database can leave the clinic with no "
+                "working login.".format(path))
+    return ("another CARLOS run owns the database right now (it holds "
+            "{0}): an apt transaction configuring carlos-emr or "
+            "carlos-emr-drugref, the boot-time carlos-emr-provision.service, "
+            "or `carlos-ctl finish-install`. Those restart MariaDB, rewrite "
+            "grants and migrate the schema, none of which may happen during "
+            "an import. Nothing has been written; wait for it to finish "
+            "(`carlos-ctl check`), then re-run this command.".format(path))
+
+
+def take_db_ownership_lock(path: Optional[str], state_dir: str) -> None:
+    """Hold the host's database-ownership lock until the verb ends.
+
+    The o19 guard that `finish-install`, both postinsts and the boot
+    provisioner consult cannot see an import until its ledger is
+    published, so a guard check alone leaves a window in which a
+    provisioning run and an import both proceed: MariaDB restarted under
+    the copy, grants rewritten, Flyway migrating a half-copied schema
+    (carlos#3678). Those paths take this lock BEFORE their guard check;
+    taking it here before the ledger is written, and keeping it through
+    every phase, is what makes the two mutually exclusive.
+
+    Non-blocking: a provisioning run is the operator's own action and
+    seconds-to-minutes long, and an import that sat waiting behind an
+    apt transaction would start long after the operator stopped
+    watching. `--resume` and `--cleanup` are new processes and take it
+    afresh. None (a development database) means there is nothing to
+    share; the workspace lock still serializes the importer itself."""
+    if path is None or _DB_OWNERSHIP_LOCK:
+        return
+    import fcntl
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # no O_TRUNC and nothing written: flock(1) in the postinsts opens
+        # this with `>`, and the file's contents mean nothing to anyone.
+        # O_NOFOLLOW / O_NONBLOCK: a symlink planted at this path is not
+        # followed (nothing is created or locked at its target), and a FIFO
+        # cannot hang the open; the regular-file check below refuses both.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+                     | os.O_NONBLOCK, 0o644)
+    except OSError as exc:
+        die("could not open {0} ({1}); the import cannot exclude a "
+            "concurrent configure or boot repair, so it will not start. "
+            "Nothing has been written.".format(path, exc))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            die("{0} is not a regular file, so it cannot be the lock the "
+                "provisioning runs share; the import will not start. Nothing "
+                "has been written.".format(path))
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        die(db_ownership_refusal(path, workspace_lock_busy(state_dir)))
+    except OSError as exc:
+        os.close(fd)
+        die("could not lock {0} ({1}); the import cannot exclude a "
+            "concurrent configure or boot repair, so it will not start. "
+            "Nothing has been written.".format(path, exc))
+    _DB_OWNERSHIP_LOCK["fd"] = fd
+
+
+def release_db_ownership_lock() -> None:
+    """Let a waiting provisioning run in. Called when the verb ends,
+    however it ends (a refusal and an aborted phase included); the
+    kernel would release it at exit anyway, but a caller that keeps the
+    process alive must not keep the database with it."""
+    fd = _DB_OWNERSHIP_LOCK.pop("fd", None)
+    if fd is not None:
+        os.close(fd)
 
 
 def _make_ctx(args, import_mode: bool,
@@ -4027,7 +4135,8 @@ def cmd_o19_preflight(argv) -> int:
     Exit 0/1/2 are this verb's VERDICT (go, go with acknowledgements,
     no-go), so any other failure -- bad flags, an unreachable server, a
     refused dump -- is remapped to the tool-error code rather than being
-    read as a migration verdict."""
+    read as a migration verdict. The database-ownership lock the staging
+    restore takes is released here, however the assessment ends."""
     try:
         return _guarded(lambda: _cmd_o19_preflight(argv),
                         o19_preflight.EXIT_TOOL_ERROR)
@@ -4035,11 +4144,18 @@ def cmd_o19_preflight(argv) -> int:
         if exc.code in (0, None):
             raise
         raise SystemExit(o19_preflight.EXIT_TOOL_ERROR) from exc
+    finally:
+        release_db_ownership_lock()
 
 
 def cmd_import_o19(argv) -> int:
-    """`carlos-ctl import-o19` entrypoint: run the phases, or `--cleanup`."""
-    return _guarded(lambda: _cmd_import_o19(argv))
+    """`carlos-ctl import-o19` entrypoint: run the phases, or `--cleanup`.
+    The database-ownership lock `_cmd_import_o19` takes is released here,
+    on every way out: success, a refusal, an aborted phase."""
+    try:
+        return _guarded(lambda: _cmd_import_o19(argv))
+    finally:
+        release_db_ownership_lock()
 
 
 def _cmd_o19_preflight(argv) -> int:
@@ -4061,18 +4177,23 @@ def _cmd_o19_preflight(argv) -> int:
         return 0
     if os.geteuid() != 0 and not args.mariadb_arg:
         die("this command needs root (or --mariadb-arg for a dev database)")
-    with HOST.database_ownership_lock():
-        # an assessment: capacity gates, stage, report — never a recorded
-        # verdict or a persisted sign-off; the exit code IS the verdict
-        # (_make_ctx refuses a mid-import workspace before touching it)
-        ctx = _make_ctx(args, import_mode=False)
-        ctx["dry_run"] = True
-        run_p0_capacity(ctx)
-        run_p1(ctx)
-        report = run_p2(ctx)
-        log("preflight verdict: {0} — report in {1}/preflight.txt".format(
-            report["verdict"], ctx["state_dir"]))
-        return int(report["exit_code"])
+    # The staging restore below runs in the clinic's MariaDB for as long as
+    # a real run's does, so a configure or boot repair must not restart the
+    # server or rewrite grants under it either. Taken before _make_ctx reads
+    # the workspace, as the import does; the standalone export above writes
+    # a file only and needs none (carlos#3678).
+    take_db_ownership_lock(HOST.db_ownership_lock_path(), HOST.state_dir)
+    # an assessment: capacity gates, stage, report — never a recorded
+    # verdict or a persisted sign-off; the exit code IS the verdict
+    # (_make_ctx refuses a mid-import workspace before touching it)
+    ctx = _make_ctx(args, import_mode=False)
+    ctx["dry_run"] = True
+    run_p0_capacity(ctx)
+    run_p1(ctx)
+    report = run_p2(ctx)
+    log("preflight verdict: {0} — report in {1}/preflight.txt".format(
+        report["verdict"], ctx["state_dir"]))
+    return int(report["exit_code"])
 
 
 def _cmd_import_o19(argv) -> int:
@@ -4083,80 +4204,87 @@ def _cmd_import_o19(argv) -> int:
     if os.geteuid() != 0 and not args.mariadb_arg:
         die("this command needs root (or --mariadb-arg for a dev database)")
 
-    with HOST.database_ownership_lock():
-        # before any other gate, including --cleanup's: a workspace rewound
-        # by a restored snapshot makes every one of them refuse, and two of
-        # them point back at the snapshot the operator just restored
-        workspace = HOST.state_dir
-        refusal = rewound_workspace_refusal(load_state(workspace),
-                                            workspace)
-        if refusal:
-            die(refusal)
+    # FIRST, before any gate reads the workspace and long before _make_ctx
+    # publishes the ledger the o19 guard reads: every mode of this verb --
+    # a real run, --resume, --cleanup, and a --dry-run whose ledger the
+    # guard also reports -- owns the database until it ends, and the
+    # provisioning paths only check the guard after taking this lock.
+    # Lock first, then check, on both sides (carlos#3678).
+    take_db_ownership_lock(HOST.db_ownership_lock_path(), HOST.state_dir)
 
-        if args.cleanup:
-            if args.dry_run:
-                die("--cleanup has no dry-run mode: it drops the staging "
-                    "schema and retires this run's ledgers and reports. Run "
-                    "it without --dry-run when the import is verified.")
-            ctx = _make_ctx_for_cleanup(args)
-            run_cleanup(ctx)
-            return 0
+    # before any other gate, including --cleanup's: a workspace rewound
+    # by a restored snapshot makes every one of them refuse, and two of
+    # them point back at the snapshot the operator just restored
+    workspace = HOST.state_dir
+    refusal = rewound_workspace_refusal(load_state(workspace),
+                                        workspace)
+    if refusal:
+        die(refusal)
 
-        if not args.dry_run and not args.admin_user:
-            die("--admin-user is required for a real import (the break-glass "
-                "administrator created before the seeded clinician is removed)")
-        if args.admin_user:
-            try:
-                o19etl.validate_admin_user(args.admin_user)
-            except ValueError as exc:
-                die(str(exc))
-        state = load_state(HOST.state_dir)
-        refusal = require_resume_for_existing_state(
-            state, args.resume, args.dry_run)
-        if refusal:
-            die(refusal)
-        refusal = nothing_to_resume_refusal(
-            state, args.resume, etl_started(HOST.state_dir))
-        if refusal:
-            die(refusal)
-        if not args.dry_run:
-            refusal = webapp_running_refusal()
-            if refusal:
-                die(refusal)
-
-        ctx = _make_ctx(args, import_mode=True)
-        if not args.dry_run:
-            # Bundle extraction may take minutes. A start could pass the
-            # first service check before _make_ctx publishes the run ledger.
-            # The ledger now blocks subsequent starts; check again before
-            # any phase so a start during intake cannot overlap the import.
-            refusal = webapp_running_refusal()
-            if refusal:
-                die(refusal)
-        log("import-o19 (experimental) — manifest {0}, province {1}{2}".format(
-            o19map_schema.SCHEMA_MAP_VERSION, ctx["province"],
-            ", DEV TARGET" if ctx["dev_target"] else ""))
-
-        run_p0(ctx)
-        if not args.dry_run:
-            run_p3(ctx)  # the rollback point exists before any clinic SQL runs
-        run_p1(ctx)
-        run_p2(ctx)
+    if args.cleanup:
         if args.dry_run:
-            from . import o19props
-            o19props.run_props(ctx)  # report-only in dry-run (fragment flagged)
-            log("dry run complete — reports in {0}; nothing was written beyond "
-                "the throwaway staging schema".format(ctx["state_dir"]))
-            return 0
-        run_p4(ctx)
-        run_p5(ctx)
-        run_p6(ctx)
-        run_p7(ctx)
-        log("import complete (experimental). Remaining operator steps:\n  "
-            + "\n  ".join("{0}. {1}".format(i, step)
-                          for i, step in enumerate(NEXT_STEPS, 1))
-            + "\n  (the reports are in {0})".format(ctx["state_dir"]))
+            die("--cleanup has no dry-run mode: it drops the staging "
+                "schema and retires this run's ledgers and reports. Run "
+                "it without --dry-run when the import is verified.")
+        ctx = _make_ctx_for_cleanup(args)
+        run_cleanup(ctx)
         return 0
+
+    if not args.dry_run and not args.admin_user:
+        die("--admin-user is required for a real import (the break-glass "
+            "administrator created before the seeded clinician is removed)")
+    if args.admin_user:
+        try:
+            o19etl.validate_admin_user(args.admin_user)
+        except ValueError as exc:
+            die(str(exc))
+    state = load_state(HOST.state_dir)
+    refusal = require_resume_for_existing_state(
+        state, args.resume, args.dry_run)
+    if refusal:
+        die(refusal)
+    refusal = nothing_to_resume_refusal(
+        state, args.resume, etl_started(HOST.state_dir))
+    if refusal:
+        die(refusal)
+    if not args.dry_run:
+        refusal = webapp_running_refusal()
+        if refusal:
+            die(refusal)
+
+    ctx = _make_ctx(args, import_mode=True)
+    if not args.dry_run:
+        # Bundle extraction may take minutes. A start could pass the
+        # first service check before _make_ctx publishes the run ledger.
+        # The ledger now blocks subsequent starts; check again before
+        # any phase so a start during intake cannot overlap the import.
+        refusal = webapp_running_refusal()
+        if refusal:
+            die(refusal)
+    log("import-o19 (experimental) — manifest {0}, province {1}{2}".format(
+        o19map_schema.SCHEMA_MAP_VERSION, ctx["province"],
+        ", DEV TARGET" if ctx["dev_target"] else ""))
+
+    run_p0(ctx)
+    if not args.dry_run:
+        run_p3(ctx)  # the rollback point exists before any clinic SQL runs
+    run_p1(ctx)
+    run_p2(ctx)
+    if args.dry_run:
+        from . import o19props
+        o19props.run_props(ctx)  # report-only in dry-run (fragment flagged)
+        log("dry run complete — reports in {0}; nothing was written beyond "
+            "the throwaway staging schema".format(ctx["state_dir"]))
+        return 0
+    run_p4(ctx)
+    run_p5(ctx)
+    run_p6(ctx)
+    run_p7(ctx)
+    log("import complete (experimental). Remaining operator steps:\n  "
+        + "\n  ".join("{0}. {1}".format(i, step)
+                      for i, step in enumerate(NEXT_STEPS, 1))
+        + "\n  (the reports are in {0})".format(ctx["state_dir"]))
+    return 0
 
 
 def _make_ctx_for_cleanup(args) -> Dict:

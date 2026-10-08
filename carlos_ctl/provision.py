@@ -57,6 +57,7 @@ def _clear_start_veto() -> None:
     try:
         START_VETO.unlink()
     except FileNotFoundError:
+        # Already gone: nothing stale to clear.
         pass
     except OSError as exc:
         warn(f"could not remove {START_VETO}: {exc}")
@@ -80,8 +81,10 @@ _DEBCONF_KEY = {
 # initial-admin.txt before updating `security`, so the surviving file could name
 # the other run's password — and they would race the marker clearing and the
 # service start. Same discipline, and the same non-blocking lock, that the
-# demonstration-data loader already applies to itself.
-LOCK = os.path.join(STATE, ".finish-install.lock")
+# demonstration-data loader already applies to itself. It is the shared
+# database-ownership lock (util.DB_OWNERSHIP_LOCK), so an OSCAR 19 import holds
+# it too, for the whole of its run.
+LOCK = util.DB_OWNERSHIP_LOCK
 
 # The SHIPPED guard, and the same file carlos-emr.service runs as its
 # ExecCondition= and cli._refuse_start_during_o19_import() consults before a
@@ -189,6 +192,13 @@ def _acquire_lock(boot: bool = False) -> bool:
     `security` — so the file left on disk could name the other run's password —
     and they would race the marker and the service state too.
 
+    `carlos-ctl import-o19` holds the same lock for its whole run, taken
+    before it publishes the ledger the o19 guard reads. That is what closes
+    the window in which this verb's guard check could pass a moment before an
+    import became visible to it (carlos#3678): with the lock held here, an
+    import cannot start; with an import holding it, this does not get past
+    this call. The guard check after it stays, for its actionable message.
+
     Returns False when the lock is held and this is a boot run: another
     provisioning run owns the work, so the boot has nothing to do and nothing
     to complain about. A hand-run repair is told instead. The lock is held for
@@ -208,13 +218,14 @@ def _acquire_lock(boot: bool = False) -> bool:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         if boot:
-            log("another CARLOS provisioning run holds the provisioning lock (an apt "
-                "transaction, or a repair run by hand); leaving the work to it")
+            log("another CARLOS run holds the database-ownership lock (an apt "
+                "transaction, a repair run by hand, or an OSCAR 19 import); "
+                "leaving the database to it")
             return False
-        die("another CARLOS provisioning run is already in progress — the boot-time "
-            "carlos-emr-provision.service, or an apt transaction configuring the "
-            "package. Wait for it to finish, then check the result with "
-            "'carlos-ctl check'")
+        die("another CARLOS run owns the database right now — the boot-time "
+            "carlos-emr-provision.service, an apt transaction configuring the "
+            "package, or an OSCAR 19 import ('carlos-ctl import-o19'). Wait for "
+            "it to finish, then check the result with 'carlos-ctl check'")
     _LOCK_HANDLE = handle
     return True
 
