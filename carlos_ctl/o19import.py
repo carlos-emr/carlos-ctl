@@ -659,6 +659,8 @@ def server_datadir(query=None) -> str:
             if rows and rows[0] and rows[0][0]:
                 return rows[0][0]
         except (RuntimeError, IndexError):
+            # The server would not say (or answered with no usable row): fall
+            # through to the filesystem defaults below, as the docstring says.
             pass
     for path in DATADIR_FALLBACKS:
         if os.path.isdir(path):
@@ -3690,6 +3692,7 @@ def take_workspace_lock(state_dir: str) -> None:
             with open(path, encoding="utf-8") as fh:
                 holder = fh.read().strip()
         except OSError:
+            # The pid only decorates the refusal below; die() fires either way.
             pass
         os.close(fd)
         die("another carlos-ctl import is working in {0}{1} — wait for it "

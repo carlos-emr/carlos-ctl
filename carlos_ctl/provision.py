@@ -57,6 +57,7 @@ def _clear_start_veto() -> None:
     try:
         START_VETO.unlink()
     except FileNotFoundError:
+        # Already gone: nothing stale to clear.
         pass
     except OSError as exc:
         warn(f"could not remove {START_VETO}: {exc}")

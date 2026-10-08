@@ -540,6 +540,10 @@ def _render_browser_endpoint() -> tuple:
                 elif line.startswith("CARLOS_RENDER_URL_BASE="):
                     url_base = line.split("=", 1)[1].strip()
     except OSError:
+        # Absent (a partially-installed system) or unreadable: keep the
+        # defaults set above, as the docstring promises. validate.py compares
+        # what this returns with carlos.properties, so a real mismatch still
+        # surfaces there.
         pass
     return port, url_base
 def _write(path: str, content: str) -> None:
