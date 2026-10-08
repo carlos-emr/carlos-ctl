@@ -1249,6 +1249,11 @@ class TestCleanupEndToEnd(unittest.TestCase):
     """
 
     def setUp(self):
+        # Development fixtures must not read an installed clinic configuration.
+        config_dir = tempfile.TemporaryDirectory(prefix="o19test-config-")
+        self.addCleanup(config_dir.cleanup)
+        self.enterContext(mock.patch.object(
+            o19host, "ENV_FILE", os.path.join(config_dir.name, "absent.env")))
         self.state_dir = tempfile.mkdtemp(prefix="o19cleanupe2e-")
         self.addCleanup(shutil.rmtree, self.state_dir)
         self.queries = []
@@ -1594,6 +1599,11 @@ class TestTheHostsProvinceIsBoundBeforeTheManifestIsRead(unittest.TestCase):
         pass
 
     def setUp(self):
+        # Development fixtures must not read an installed clinic configuration.
+        config_dir = tempfile.TemporaryDirectory(prefix="o19test-config-")
+        self.addCleanup(config_dir.cleanup)
+        self.enterContext(mock.patch.object(
+            o19host, "ENV_FILE", os.path.join(config_dir.name, "absent.env")))
         self.default = o19map_schema._DEFAULT_PROFILE["O19_PROFILE"]
         self.addCleanup(o19map_schema.bind, self.default)
         self.other = next((p for p in sorted(o19map_schema.PROFILES)
@@ -3992,6 +4002,13 @@ class TestTheDevelopmentTargetSchema(unittest.TestCase):
     every phase writes, so it is refused wherever the target is not the
     operator's to choose."""
 
+    def setUp(self):
+        # Development fixtures must not read an installed clinic configuration.
+        config_dir = tempfile.TemporaryDirectory(prefix="o19test-config-")
+        self.addCleanup(config_dir.cleanup)
+        self.enterContext(mock.patch.object(
+            o19host, "ENV_FILE", os.path.join(config_dir.name, "absent.env")))
+
     def test_the_deployment_default_stands_when_none_is_given(self):
         self.assertEqual(o19import._target_db(True), "oscar")
         self.assertEqual(o19import._target_db(True, None), "oscar")
@@ -4091,6 +4108,13 @@ class TestTheTargetSchemaCannotChangeMidImport(unittest.TestCase):
     It is reachable on either deployment: `--dev-target-db` left off a
     resume falls back to the deployment default, and CARLOS_DB_NAME
     edited between runs moves a packaged host's target the same way."""
+
+    def setUp(self):
+        # Development fixtures must not read an installed clinic configuration.
+        config_dir = tempfile.TemporaryDirectory(prefix="o19test-config-")
+        self.addCleanup(config_dir.cleanup)
+        self.enterContext(mock.patch.object(
+            o19host, "ENV_FILE", os.path.join(config_dir.name, "absent.env")))
 
     def test_a_fresh_workspace_records_nothing_to_disagree_with(self):
         self.assertIsNone(o19import.target_change_refusal({}, "oscar"))

@@ -2051,9 +2051,15 @@ def _make_password_hash():
 
 def make_etl_query(base_argv: List[str],
                    statement_timeout: int = 0) -> Callable:
-    """Statement executor with the bulk-copy session prelude."""
+    """Execute bulk copies with target unique constraints enforced.
+
+    MariaDB can silently insert zero rows into an empty InnoDB table when
+    INSERT ... SELECT encounters duplicate unique keys with both unique
+    and foreign-key checks disabled. Keep unique checks on so the client
+    reports the collision before the driver checkpoints the copy.
+    """
     prelude = ("SET SESSION sql_log_bin=0, FOREIGN_KEY_CHECKS=0, "
-               "UNIQUE_CHECKS=0, sql_mode=''")
+               "UNIQUE_CHECKS=1, sql_mode=''")
     if statement_timeout:
         prelude += ", " + statement_timeout_prelude(
             statement_timeout).replace("SET SESSION ", "")
@@ -2065,11 +2071,17 @@ def make_etl_query(base_argv: List[str],
             argv.append(db)
         cp = run_sql_client(argv, sql)
         if cp.returncode != 0:
+            error = cp.stderr
+            if re.search(r"^ERROR\s+1062\b", error, re.MULTILINE):
+                # Duplicate-key diagnostics echo the conflicting value, which
+                # may identify a patient. Keep the error code for classification
+                # and the statement's table context without exposing that value.
+                error = "ERROR 1062: duplicate unique key during ETL copy"
             raise o19etl.QueryError(
                 "ETL statement failed ({0} ...): {1}".format(
                     redact_statement(sql, 120),
                     CREDENTIAL_SQL_RE.sub(r"\1'<redacted>'",
-                                          cp.stderr.strip())), cp.stderr)
+                                          error.strip())), error)
         return batch_rows(cp.stdout)
 
     return query
