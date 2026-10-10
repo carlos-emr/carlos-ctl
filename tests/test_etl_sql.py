@@ -1589,6 +1589,28 @@ class TestArchivedColumns(unittest.TestCase):
             {}, ["t" * o19etl.MAX_PRESERVED_TABLE],
             {"t": ["c" * o19etl.MAX_PRESERVED_COLUMN]}), [])
 
+    def test_a_forks_table_named_like_a_helper_is_refused(self):
+        """`Consent__live` is the helper the consent copy reads its
+        `deleted` flag from. A fork table of that name would be preserved
+        over it (or under it) in o19_archive, so it is refused before the
+        first write, like every other reserved ending."""
+        for suffix in o19etl.RESERVED_HELPER_SUFFIXES:
+            with self.subTest(suffix=suffix):
+                problems = o19etl.reserved_helper_names(
+                    ["Consent" + suffix])
+                self.assertEqual(len(problems), 1)
+                self.assertIn("reserves names ending in " + suffix,
+                              problems[0])
+                self.assertIn("rename it in the source and re-export",
+                              problems[0])
+        self.assertIn(o19etl.consent_live_table(),
+                      [p.split(":")[0] for p in o19etl.reserved_helper_names(
+                          [o19etl.consent_live_table()])])
+
+    def test_no_manifest_table_is_refused_as_a_helper_name(self):
+        self.assertEqual(
+            o19etl.reserved_helper_names(list(o19map_schema.TABLES)), [])
+
 
 class TestAViewIsNotATable(unittest.TestCase):
 

@@ -1834,6 +1834,36 @@ def oversized_preserved_names(src_info: Dict[str, Dict[str, dict]],
     return out
 
 
+#: Endings this tool gives the archive-schema working tables it builds next
+#: to a table (the shadow suffixes, then the rebuild ones). A staged table
+#: whose own name ends in one could be the exact name of such a helper, say
+#: a vendor `Consent__live`: preserving it would replace the helper, or the
+#: helper would replace it, and the verification would read the wrong rows.
+RESERVED_HELPER_SUFFIXES = tuple(
+    s for s in SHADOW_SUFFIXES if s) + (REBUILD_NEW, REBUILD_OLD)
+
+
+def reserved_helper_names(source_tables: Sequence[str]) -> List[str]:
+    """Staged tables named like one of this tool's working tables.
+
+    No OSCAR 19 table has a double underscore in its name, so only a
+    fork's own table can be refused here. Checked before the first write,
+    with the same remedy as `oversized_preserved_names`.
+
+    Returns one problem string per offending table, empty when none."""
+    out = []
+    for table in sorted(source_tables):
+        suffix = next((s for s in RESERVED_HELPER_SUFFIXES
+                       if table.endswith(s)), None)
+        if suffix:
+            out.append(
+                "{0}: import-o19 reserves names ending in {1} for the "
+                "working tables it builds, so preserving this table could "
+                "overwrite one — rename it in the source and re-export"
+                .format(table, suffix))
+    return out
+
+
 #: MySQL's hard ceiling on the sum of a row's declared column widths.
 #: BLOB/TEXT contribute only their pointer, which is why a table can
 #: declare far more than this in text and still be legal. InnoDB's
@@ -2870,6 +2900,9 @@ def etl_precheck_problems(ctx, plain, query, src_schema: str,
     problems.extend(oversized_preserved_names(
         src_info, preserved,
         {t: [c for c, _target, _type in p] for t, p in plans.items()}))
+    # ... and a fork table carrying one of the helper suffixes would be
+    # preserved under a helper's own name
+    problems.extend(reserved_helper_names(src_info))
     # ... and the OTHER ceiling: an identifier that fits can still be a
     # column the row has no room for
     for table in sorted(plans):
