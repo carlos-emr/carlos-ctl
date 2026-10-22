@@ -44,13 +44,20 @@ def db_root_ok() -> bool:
 
 
 def schema_has_tables(name: str) -> bool:
-    """Whether the schema holds at least one table. False also when MariaDB
-    could not answer: the one caller only decides whether a grant refresh has
-    anything to grant yet, and the next migration refreshes it anyway."""
+    """Whether the schema holds at least one table. When MariaDB cannot say,
+    True after a warning: the one caller only decides whether to refresh the
+    Query by Example grants now, and a refresh that finds nothing to grant is
+    harmless, while a skipped one leaves an upgraded schema ungranted until a
+    migration that may never come."""
     cp = db_root(["-N", "-B", "-e",
                   "SELECT COUNT(*) FROM information_schema.TABLES "
                   f"WHERE TABLE_SCHEMA = '{name}'"], capture_output=True)
-    return cp.returncode == 0 and cp.stdout.strip() not in ("", "0")
+    if cp.returncode != 0:
+        reason = " ".join((cp.stderr or "").split())[:400] or f"exit {cp.returncode}"
+        warn(f"could not count the tables of {name} ({reason}); "
+             "refreshing the Query by Example grants anyway")
+        return True
+    return cp.stdout.strip() not in ("", "0")
 
 
 def require_db_root() -> None:
@@ -327,6 +334,7 @@ def cmd_db_users(argv) -> int:
 
     prev_app_pw = prop_unescape(prop_get(PROPERTIES, "db_password") or "")
     prev_report_pw = prop_unescape(prop_get(PROPERTIES, reporting.PASSWORD_KEY) or "")
+    prev_report_user = (prop_get(PROPERTIES, reporting.USERNAME_KEY) or "").strip()
 
     log("provisioning databases and least-privilege accounts")
     sql = f"""
@@ -403,7 +411,8 @@ FLUSH PRIVILEGES;
     prop_set(PROPERTIES, "db_username", "carlos")
     prop_set(PROPERTIES, reporting.PASSWORD_KEY, prop_escape(report_pw))
     prop_set(PROPERTIES, reporting.USERNAME_KEY, reporting.REPORT_USER)
-    if (app_pw != prev_app_pw or report_pw != prev_report_pw) and \
+    if (app_pw != prev_app_pw or report_pw != prev_report_pw
+            or prev_report_user != reporting.REPORT_USER) and \
             run(["systemctl", "is-active", "--quiet", "carlos-emr.service"]).returncode == 0:
         # The running JVM read its properties at deploy time: the account
         # password just changed underneath it (e.g. a placeholder was

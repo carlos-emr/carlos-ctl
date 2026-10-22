@@ -10,11 +10,18 @@ carlos-ctl (1.2.0~dev1) resolute; urgency=medium
     a reportable table a migration adds is granted once it exists; a list
     that does not apply is reported and never fails the migration. rotate
     rotates the new password with the others.
-  * check reports the account: present on both hosts, named in
-    carlos.properties, granted exactly the reportable tables of the
-    deployed list (no restricted table, hidden column, table-wide grant on
-    a table with hidden columns, write privilege, role, or PUBLIC grant
-    reaching the schema) and none still missing.
+  * check reports the account: present on exactly its two hosts, named in
+    carlos.properties, able to log in with the recorded password, and
+    granted on each host exactly what the deployed list allows (every
+    reportable table, every permitted column of a table with hidden
+    columns; no restricted or unclassified table, hidden column,
+    table-wide grant on a table with hidden columns, write privilege,
+    role, PROXY grant, or PUBLIC grant reaching the schema, routines
+    included).
+  * db-users refreshes the grants when it cannot count the schema's tables
+    (with a warning) rather than skipping them, asks for a restart when it
+    corrects the recorded reporting username, and an unreadable or
+    non-UTF-8 grant list is reported instead of raising.
   * destroy-data drops carlos_report with the other accounts.
 
  -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Thu, 22 Oct 2026 12:00:00 +0000

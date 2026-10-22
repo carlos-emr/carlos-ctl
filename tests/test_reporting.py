@@ -94,6 +94,12 @@ class TestReadingTheGrantList(unittest.TestCase):
         ])
         self.assertIsNone(reporting.read_grant_list(path))
 
+    def test_an_undecodable_file_is_not_a_list(self):
+        path = _write_list(self.dir, ["('demographic', 'reportable', NULL, NULL);"])
+        with open(path, "ab") as fh:
+            fh.write(b"-- \xff\xfe is not UTF-8\n")
+        self.assertIsNone(reporting.read_grant_list(path))
+
     def test_rows_that_never_end_are_not_a_list(self):
         path = os.path.join(self.dir, "open.sql")
         with open(path, "w", encoding="utf-8") as fh:
@@ -178,6 +184,14 @@ class TestSyncingTheGrants(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertIn("WARNING", err)
 
+    def test_an_undecodable_list_is_reported_and_never_raised(self):
+        with open(self.path, "ab") as fh:
+            fh.write(b"-- \xff\n")
+        applied, _out, err = self._sync()
+        self.assertFalse(applied)
+        self.assertIn("not valid UTF-8", err)
+        self.assertEqual([args for args, _script in self.calls if "-e" not in args], [])
+
     def test_a_list_that_fails_is_reported_and_never_raised(self):
         refused = _Cp(1, "", "ERROR 1644 (45000) at line 545: carlos_report_grants.sql: PUBLIC "
                              "holds privileges that reach the CARLOS schema")
@@ -195,17 +209,21 @@ class _DbUsersHarness(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="reporting-users-")
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.properties = os.path.join(self.dir, "carlos.properties")
+        # Generated per run: fixtures carry no credential literal for secret scanners.
+        self.app_password = util.genpw()
         with open(self.properties, "w", encoding="latin-1") as fh:
-            fh.write("db_username = carlos\ndb_password = existingAppPw1\n"
+            fh.write(f"db_username = carlos\ndb_password = {self.app_password}\n"
                      "db_reporting_username =\ndb_reporting_password =\n")
         self.batches = []
         self.synced = []
-        self.tables = "412\n"
+        self.count_answer = _Cp(0, "412\n")
+        self.service_active = False
+        self.err = ""
 
     def _db_users(self, argv=()):
         def fake_db_root(args, **kw):
             if "-e" in args:
-                return _Cp(0, self.tables)
+                return self.count_answer
             self.batches.append(kw.get("input", ""))
             return _Cp(0)
 
@@ -215,7 +233,7 @@ class _DbUsersHarness(unittest.TestCase):
             mock.patch.object(dbops, "require_db_root", lambda: None),
             mock.patch.object(dbops.config, "load", lambda: settings),
             mock.patch.object(dbops, "db_root", fake_db_root),
-            mock.patch.object(dbops, "run", lambda *a, **k: _Cp(3)),
+            mock.patch.object(dbops, "run", lambda *a, **k: _Cp(0 if self.service_active else 3)),
             mock.patch.object(dbops, "PROPERTIES", self.properties),
             mock.patch.object(dbops, "DRUGREF_PROPERTIES", os.path.join(self.dir, "absent-drugref")),
             mock.patch.object(dbops, "BACKUP_ENV", os.path.join(self.dir, "absent-backup.env")),
@@ -225,8 +243,11 @@ class _DbUsersHarness(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                return dbops.cmd_db_users(list(argv))
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = dbops.cmd_db_users(list(argv))
+            self.err = err.getvalue()
+            return rc
 
     def prop(self, key):
         return util.prop_unescape(util.prop_get(self.properties, key) or "")
@@ -242,23 +263,46 @@ class TestDbUsersProvisionsTheReportingAccount(_DbUsersHarness):
         self.assertEqual(len(password), 32)
         self.assertIn(reporting.account_sql(password), batch)
         # the application keeps its own, different credential
-        self.assertEqual(self.prop("db_password"), "existingAppPw1")
-        self.assertNotEqual(password, "existingAppPw1")
+        self.assertEqual(self.prop("db_password"), self.app_password)
+        self.assertNotEqual(password, self.app_password)
 
     def test_the_grants_are_refreshed_when_the_schema_already_has_tables(self):
         self._db_users()
         self.assertEqual(self.synced, ["carlos"])
 
     def test_an_empty_schema_waits_for_the_migration_to_grant_anything(self):
-        self.tables = "0\n"
+        self.count_answer = _Cp(0, "0\n")
         self._db_users()
         self.assertEqual(self.synced, [])
 
+    def test_an_unanswered_table_count_still_refreshes_the_grants(self):
+        self.count_answer = _Cp(1, "", "ERROR 2013 (HY000): Lost connection")
+        self.assertEqual(self._db_users(), 0)
+        self.assertEqual(self.synced, ["carlos"])
+        self.assertIn("could not count the tables of carlos", self.err)
+
     def test_an_existing_reporting_password_is_kept(self):
-        util.prop_set(self.properties, "db_reporting_password", "existingReportPw2")
+        kept = util.genpw()
+        util.prop_set(self.properties, "db_reporting_password", kept)
         self._db_users()
-        self.assertEqual(self.prop("db_reporting_password"), "existingReportPw2")
-        self.assertIn("IDENTIFIED BY 'existingReportPw2'", self.batches[0])
+        self.assertEqual(self.prop("db_reporting_password"), kept)
+        self.assertIn(f"IDENTIFIED BY '{kept}'", self.batches[0])
+
+    def test_a_corrected_reporting_username_asks_for_a_restart(self):
+        util.prop_set(self.properties, "db_password", self.app_password)
+        util.prop_set(self.properties, "db_reporting_username", "carlos")
+        util.prop_set(self.properties, "db_reporting_password", util.genpw())
+        self.service_active = True
+        self._db_users()
+        self.assertEqual(self.prop("db_reporting_username"), "carlos_report")
+        self.assertIn("carlos-ctl restart", self.err)
+
+    def test_unchanged_credentials_ask_for_no_restart(self):
+        util.prop_set(self.properties, "db_reporting_username", "carlos_report")
+        util.prop_set(self.properties, "db_reporting_password", util.genpw())
+        self.service_active = True
+        self._db_users()
+        self.assertNotIn("carlos-ctl restart", self.err)
 
     def test_a_published_placeholder_is_never_adopted(self):
         util.prop_set(self.properties, "db_reporting_password", "password")
@@ -266,9 +310,10 @@ class TestDbUsersProvisionsTheReportingAccount(_DbUsersHarness):
         self.assertNotEqual(self.prop("db_reporting_password"), "password")
 
     def test_rotation_issues_a_new_reporting_password(self):
-        util.prop_set(self.properties, "db_reporting_password", "existingReportPw2")
+        old = util.genpw()
+        util.prop_set(self.properties, "db_reporting_password", old)
         self._db_users(["--new-passwords"])
-        self.assertNotEqual(self.prop("db_reporting_password"), "existingReportPw2")
+        self.assertNotEqual(self.prop("db_reporting_password"), old)
 
 
 class TestMigrationRefreshesTheGrants(unittest.TestCase):
@@ -282,7 +327,7 @@ class TestMigrationRefreshesTheGrants(unittest.TestCase):
         os.makedirs(os.path.join(webapp, "WEB-INF", "lib"))
         properties = os.path.join(webapp, "carlos.properties")
         with open(properties, "w", encoding="latin-1") as fh:
-            fh.write("db_username = carlos\ndb_password = pw\n")
+            fh.write(f"db_username = carlos\ndb_password = {util.genpw()}\n")
         with mock.patch.object(dbops.config, "load", lambda: settings), \
                 mock.patch.object(dbops, "WEBAPP", webapp), \
                 mock.patch.object(dbops, "PROPERTIES", properties), \
@@ -316,20 +361,32 @@ class TestCheckReportsTheAccount(unittest.TestCase):
             "('security', 'restricted', NULL, 'Password hashes');",
         ])
         self.properties = os.path.join(self.dir, "carlos.properties")
+        self.password = util.genpw()
         with open(self.properties, "w", encoding="latin-1") as fh:
-            fh.write("db_reporting_username = carlos_report\ndb_reporting_password = pw\n")
+            fh.write(f"db_reporting_username = carlos_report\ndb_reporting_password = {self.password}\n")
+        # What the shipped list leaves behind: the same grants on both hosts,
+        # casemgmt_note column by column without its hidden password.
         self.answers = {
-            "hosts": "2", "extra": "0", "public": "0",
-            "tables_priv": "carlos\tdemographic\tSelect|\ncarlos\tcasemgmt_note\t|Select\n"
-                           "carlos\tappointment\tSelect|\n",
-            "columns_priv": "casemgmt_note\tnote\ncasemgmt_note\tnote_id\n",
+            "hosts": "localhost\n127.0.0.1\n", "extra": "0", "public": "0",
+            "tables_priv": self._both("carlos\tdemographic\tSelect|", "carlos\tcasemgmt_note\t|Select",
+                                      "carlos\tappointment\tSelect|"),
+            "columns_priv": self._both("carlos\tcasemgmt_note\tnote", "carlos\tcasemgmt_note\tnote_id"),
+            "schema_columns": "casemgmt_note\tnote_id\ncasemgmt_note\tnote\ncasemgmt_note\tpassword\n",
             "existing": "demographic\ncasemgmt_note\nappointment\nsecurity\n",
         }
+        self.queries = []
+        self.logins = []
+        self.login_answer = None
+
+    @staticmethod
+    def _both(*rows):
+        return "".join(f"{host}\t{row}\n" for host in reporting.REPORT_HOSTS for row in rows)
 
     def _check(self):
         def fake_db_root(args, **kw):
             sql = args[-1]
-            if "Host IN" in sql:
+            self.queries.append(sql)
+            if "SELECT Host FROM mysql.global_priv" in sql:
                 return _Cp(0, self.answers["hosts"])
             if "User = 'PUBLIC'" in sql:
                 return _Cp(0, self.answers["public"])
@@ -339,47 +396,89 @@ class TestCheckReportsTheAccount(unittest.TestCase):
                 return _Cp(0, self.answers["tables_priv"])
             if "FROM mysql.columns_priv" in sql:
                 return _Cp(0, self.answers["columns_priv"])
+            if "information_schema.COLUMNS" in sql:
+                return _Cp(0, self.answers["schema_columns"])
             if "information_schema.TABLES" in sql:
                 return _Cp(0, self.answers["existing"])
             raise AssertionError(sql)
+
+        def fake_login(password):
+            self.logins.append(password)
+            return self.login_answer
         with mock.patch.object(reporting, "GRANTS_SQL", self.path), \
                 mock.patch.object(reporting, "PROPERTIES", self.properties):
-            return reporting.check_lines("carlos", fake_db_root)
+            return reporting.check_lines("carlos", fake_db_root, login=fake_login)
 
     def verdicts(self):
         return [verdict for verdict, _message in self._check()]
+
+    def bad(self):
+        return " | ".join(m for v, m in self._check() if v == "bad")
 
     def test_an_account_in_step_with_the_list_is_ok(self):
         lines = self._check()
         self.assertEqual([v for v, _m in lines], ["ok"])
         self.assertIn("3 reportable table(s)", lines[0][1])
+        self.assertEqual(self.logins, [self.password])
 
     def test_a_restricted_table_grant_is_bad(self):
-        self.answers["tables_priv"] += "carlos\tsecurity\tSelect|\n"
-        lines = self._check()
-        self.assertIn("bad", [v for v, _m in lines])
-        self.assertTrue(any("security" in m for _v, m in lines))
+        self.answers["tables_priv"] += "localhost\tcarlos\tsecurity\tSelect|\n"
+        self.assertIn("security (restricted)", self.bad())
+
+    def test_an_unclassified_table_grant_is_bad(self):
+        self.answers["tables_priv"] += "127.0.0.1\tcarlos\tqbe_unclassified\tSelect|\n"
+        self.assertIn("qbe_unclassified (not in the grant list)", self.bad())
 
     def test_a_hidden_column_grant_is_bad(self):
-        self.answers["columns_priv"] += "casemgmt_note\tpassword\n"
-        self.assertTrue(any("casemgmt_note.password" in m for _v, m in self._check()))
+        self.answers["columns_priv"] += "localhost\tcarlos\tcasemgmt_note\tpassword\n"
+        self.assertIn("casemgmt_note.password", self.bad())
 
     def test_a_table_wide_grant_on_a_table_with_hidden_columns_is_bad(self):
         self.answers["tables_priv"] = self.answers["tables_priv"].replace(
             "casemgmt_note\t|Select", "casemgmt_note\tSelect|")
-        lines = self._check()
-        self.assertIn("bad", [v for v, _m in lines])
-        self.assertTrue(any("casemgmt_note (every column)" in m for v, m in lines if v == "bad"))
+        self.assertIn("casemgmt_note (every column", self.bad())
 
     def test_a_write_privilege_is_bad(self):
         self.answers["tables_priv"] = self.answers["tables_priv"].replace(
             "demographic\tSelect|", "demographic\tSelect,Insert|")
-        self.assertIn("bad", self.verdicts())
+        self.assertIn("demographic (Select,Insert)", self.bad())
+
+    def test_a_write_privilege_on_a_column_is_bad(self):
+        # MariaDB records a column privilege in tables_priv.Column_priv too.
+        self.answers["tables_priv"] = self.answers["tables_priv"].replace(
+            "casemgmt_note\t|Select", "casemgmt_note\t|Select,Update")
+        self.assertIn("casemgmt_note (Select,Update)", self.bad())
+
+    def test_a_column_only_grant_on_a_table_without_hidden_columns_is_incomplete(self):
+        self.answers["tables_priv"] = self.answers["tables_priv"].replace(
+            "demographic\tSelect|", "demographic\t|Select")
+        bad = self.bad()
+        self.assertIn("demographic (only some columns)", bad)
+        self.assertNotIn("must not read", bad)
+
+    def test_a_permitted_column_missing_on_one_host_is_bad(self):
+        self.answers["columns_priv"] = self.answers["columns_priv"].replace(
+            "127.0.0.1\tcarlos\tcasemgmt_note\tnote\n", "")
+        bad = self.bad()
+        self.assertIn("casemgmt_note.note for 127.0.0.1", bad)
+        self.assertNotIn("for localhost", bad)
 
     def test_a_missing_grant_after_a_migration_is_bad(self):
-        self.answers["tables_priv"] = "carlos\tdemographic\tSelect|\ncarlos\tcasemgmt_note\t|Select\n"
-        lines = self._check()
-        self.assertTrue(any("appointment" in m for v, m in lines if v == "bad"))
+        self.answers["tables_priv"] = self._both("carlos\tdemographic\tSelect|",
+                                                 "carlos\tcasemgmt_note\t|Select")
+        self.assertIn("appointment", self.bad())
+
+    def test_grants_on_one_host_do_not_cover_the_other(self):
+        self.answers["tables_priv"] = self.answers["tables_priv"].replace(
+            "127.0.0.1\tcarlos\tappointment\tSelect|\n", "")
+        bad = self.bad()
+        self.assertIn("carlos_report@127.0.0.1", bad)
+        self.assertIn("appointment", bad)
+        self.assertNotIn("carlos_report@localhost", bad)
+
+    def test_a_stray_host_is_bad(self):
+        self.answers["hosts"] += "%\n"
+        self.assertIn("also exists for host(s) %", self.bad())
 
     def test_public_grants_and_extra_privileges_are_bad(self):
         self.answers["public"] = "1"
@@ -387,18 +486,84 @@ class TestCheckReportsTheAccount(unittest.TestCase):
         lines = self._check()
         self.assertEqual(sum(1 for v, _m in lines if v == "bad"), 2)
 
+    def test_routine_and_proxy_grants_are_counted(self):
+        self._check()
+        public = next(q for q in self.queries if "User = 'PUBLIC'" in q)
+        extra = next(q for q in self.queries if "roles_mapping" in q)
+        self.assertIn("mysql.procs_priv WHERE User = 'PUBLIC'", public)
+        self.assertIn("mysql.proxies_priv WHERE User = 'carlos_report'", extra)
+
+    def test_a_password_that_does_not_log_in_is_bad(self):
+        self.login_answer = ("bad", "the carlos_report password does not log in")
+        self.assertEqual(self.verdicts(), ["bad"])
+
+    def test_a_busy_account_is_only_a_note(self):
+        self.login_answer = ("note", "carlos_report is at its connection limit")
+        self.assertEqual(self.verdicts(), ["note", "ok"])
+
+    def test_the_recorded_password_is_unescaped_before_logging_in(self):
+        util.prop_set(self.properties, "db_reporting_password", util.prop_escape("a=b:c"))
+        self._check()
+        self.assertEqual(self.logins, ["a=b:c"])
+
     def test_a_missing_account_is_bad(self):
-        self.answers["hosts"] = "0"
+        self.answers["hosts"] = ""
         self.assertEqual(self.verdicts(), ["bad"])
 
     def test_unrecorded_credentials_are_bad(self):
         with open(self.properties, "w", encoding="latin-1") as fh:
             fh.write("db_reporting_username =\n")
         self.assertIn("bad", self.verdicts())
+        self.assertEqual(self.logins, [])
+
+    def test_a_recorded_username_without_a_password_is_bad(self):
+        with open(self.properties, "w", encoding="latin-1") as fh:
+            fh.write("db_reporting_username = carlos_report\ndb_reporting_password =\n")
+        self.assertIn(reporting.PASSWORD_KEY, self.bad())
+        self.assertNotIn("ok", self.verdicts())
+        self.assertEqual(self.logins, [])
 
     def test_an_older_war_is_only_a_note(self):
         os.unlink(self.path)
         self.assertEqual(self.verdicts(), ["note"])
+
+
+class TestTheLoginProbe(unittest.TestCase):
+
+    def _probe(self, *answers):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append((cmd, kw))
+            answer = answers[min(len(calls), len(answers)) - 1]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        with mock.patch.object(reporting.util, "run", fake_run):
+            return reporting._login_problem("s-" + uuid.uuid4().hex), calls
+
+    def test_both_hosts_logging_in_is_no_problem(self):
+        problem, calls = self._probe(_Cp(0, "1\n"))
+        self.assertIsNone(problem)
+        self.assertEqual(len(calls), 2)
+        for cmd, kw in calls:
+            self.assertIn("--user=carlos_report", cmd)
+            self.assertTrue(kw["env"]["MYSQL_PWD"].startswith("s-"))
+            self.assertFalse(any(kw["env"]["MYSQL_PWD"] in part for part in cmd))
+
+    def test_a_refused_login_names_the_host(self):
+        problem, _calls = self._probe(_Cp(0, "1\n"), _Cp(1, "", "ERROR 1045 (28000): Access denied"))
+        self.assertEqual(problem[0], "bad")
+        self.assertIn("carlos_report@127.0.0.1", problem[1])
+
+    def test_a_busy_account_proves_nothing(self):
+        problem, _calls = self._probe(_Cp(1, "", "ERROR 1203 (42000): User carlos_report already has more "
+                                               "than 'max_user_connections' active connections"))
+        self.assertEqual(problem[0], "note")
+
+    def test_no_client_is_a_note(self):
+        problem, _calls = self._probe(FileNotFoundError("mariadb"))
+        self.assertEqual(problem[0], "note")
 
 
 @unittest.skipUnless(os.environ.get("CARLOS_TEST_MARIADB_SOCKET") and shutil.which("mariadb"),
@@ -467,8 +632,19 @@ class TestTheShippedListAgainstMariaDB(unittest.TestCase):
         self.assertNotIn("INSERT", grants)
         self.assertIn("MAX_USER_CONNECTIONS 6", grants)
 
+    def test_running_it_again_revokes_a_proxy_grant(self):
+        self.root(f"GRANT PROXY ON ''@'%' TO '{self.user}'@'localhost';")
+        self.root(self.script, database=self.schema)
+        left = self.root(f"SELECT COUNT(*) FROM mysql.proxies_priv WHERE User = '{self.user}'")
+        self.assertEqual(left.stdout.strip(), "0")
+
     def test_a_public_grant_on_the_schema_stops_it(self):
+        self.root(f"GRANT SELECT, INSERT ON `{self.schema}`.security TO '{self.user}'@'localhost';")
         self.root(f"GRANT SELECT ON `{self.schema}`.* TO PUBLIC;")
         cp = self.root(self.script, database=self.schema, check=False)
         self.assertNotEqual(cp.returncode, 0)
         self.assertIn("PUBLIC holds privileges", cp.stderr)
+        # It revoked before it refused, so the stale grant is gone all the same.
+        grants = self.root(f"SHOW GRANTS FOR '{self.user}'@'localhost'").stdout
+        self.assertNotIn("`security`", grants)
+        self.assertNotIn("INSERT", grants)

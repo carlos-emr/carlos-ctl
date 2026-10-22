@@ -84,7 +84,8 @@ def read_grant_list(path: Optional[str] = None) -> Optional[GrantList]:
     try:
         with open(path or GRANTS_SQL, encoding="utf-8") as fh:
             lines = fh.read().splitlines()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # Unreadable and undecodable alike: there is no list to trust.
         return None
     try:
         start = lines.index(_ROWS_HEADER)
@@ -136,9 +137,10 @@ def sync_grants(db_name: str, db_root) -> bool:
     try:
         with open(GRANTS_SQL, encoding="utf-8") as fh:
             script = fh.read()
-    except OSError as e:
-        warn(f"cannot read {GRANTS_SQL} ({e.strerror}); the Query by Example "
-             "grants were not refreshed")
+    except (OSError, UnicodeDecodeError) as e:
+        reason = e.strerror if isinstance(e, OSError) else "not valid UTF-8"
+        warn(f"cannot read {GRANTS_SQL} ({reason}); the Query by Example "
+             "grants were not refreshed (reinstall carlos-emr)")
         return False
     # The script selects nothing itself: the schema is the default database.
     cp = db_root([db_name], input=script, capture_output=True)
@@ -163,24 +165,114 @@ def _count(db_root, sql: str) -> Optional[int]:
         return None
 
 
-def _granted_tables(db_root, db_name: str) -> Optional[List[Tuple[str, str, str]]]:
+def _account_hosts(db_root) -> Optional[set]:
     cp = db_root(["-N", "-B", "-e",
-                  "SELECT Db, Table_name, CONCAT(Table_priv, '|', Column_priv) "
+                  f"SELECT Host FROM mysql.global_priv WHERE User = '{REPORT_USER}'"],
+                 capture_output=True)
+    if cp.returncode != 0:
+        return None
+    return {line.strip() for line in cp.stdout.splitlines() if line.strip()}
+
+
+def _granted_tables(db_root) -> Optional[List[Tuple[str, str, str, str]]]:
+    """(host, db, table, "Table_priv|Column_priv") for each table grant."""
+    cp = db_root(["-N", "-B", "-e",
+                  "SELECT Host, Db, Table_name, CONCAT(Table_priv, '|', Column_priv) "
                   "FROM mysql.tables_priv "
                   f"WHERE User = '{REPORT_USER}'"], capture_output=True)
     if cp.returncode != 0:
         return None
-    rows = []
+    return [tuple(parts) for parts in (line.split("\t") for line in cp.stdout.splitlines())
+            if len(parts) == 4]
+
+
+def _granted_columns(db_root) -> Optional[List[Tuple[str, str, str, str]]]:
+    """(host, db, table, column) for each column grant."""
+    cp = db_root(["-N", "-B", "-e",
+                  "SELECT Host, Db, Table_name, Column_name FROM mysql.columns_priv "
+                  f"WHERE User = '{REPORT_USER}'"], capture_output=True)
+    if cp.returncode != 0:
+        return None
+    return [tuple(parts) for parts in (line.split("\t") for line in cp.stdout.splitlines())
+            if len(parts) == 4]
+
+
+def _existing_tables(db_root, db_name: str) -> Optional[set]:
+    cp = db_root(["-N", "-B", "-e",
+                  "SELECT TABLE_NAME FROM information_schema.TABLES "
+                  f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_TYPE = 'BASE TABLE'"],
+                 capture_output=True)
+    if cp.returncode != 0:
+        return None
+    return {line.strip() for line in cp.stdout.splitlines() if line.strip()}
+
+
+def _existing_columns(db_root, db_name: str, tables) -> Optional[Dict[str, set]]:
+    """Lower-cased table -> its lower-cased column names, for the given tables
+    (names from the grant list, so plain identifiers)."""
+    if not tables:
+        return {}
+    names = ", ".join(f"'{t}'" for t in sorted(tables))
+    cp = db_root(["-N", "-B", "-e",
+                  "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS "
+                  f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME IN ({names})"],
+                 capture_output=True)
+    if cp.returncode != 0:
+        return None
+    columns: Dict[str, set] = {}
     for line in cp.stdout.splitlines():
-        parts = line.split("\t")
-        if len(parts) == 3:
-            rows.append((parts[0], parts[1], parts[2]))
-    return rows
+        if line.count("\t") == 1:
+            table, column = line.split("\t")
+            columns.setdefault(table.lower(), set()).add(column.lower())
+    return columns
 
 
-def check_lines(db_name: str, db_root) -> List[Tuple[str, str]]:
+def _grant_shape(table: str, privs: str, has_hidden: bool) -> Tuple[Optional[str], Optional[str]]:
+    """(over-grant, under-grant) description of one tables_priv row, either
+    None. The list grants a table without hidden columns as a whole
+    ("Select|") and a table with hidden columns column by column ("|Select");
+    nothing else."""
+    table_priv, _sep, column_priv = privs.partition("|")
+    if table_priv not in ("", "Select") or column_priv not in ("", "Select"):
+        return f"{table} ({' '.join(privs.replace('|', ' ').split())})", None
+    if has_hidden and table_priv:
+        return f"{table} (every column, hidden ones included)", None
+    if not has_hidden and not table_priv:
+        return None, f"{table} (only some columns)"
+    return None, None
+
+
+def _login_problem(password: str) -> Optional[Tuple[str, str]]:
+    """(verdict, message) when the recorded password does not log in as the
+    reporting account, over the socket (localhost) and TCP (127.0.0.1), the
+    two ways the application can reach MariaDB; None when both work. The
+    password travels in MYSQL_PWD, never argv."""
+    env = dict(os.environ, MYSQL_PWD=password)
+    for host, how in (("localhost", ["--protocol=socket"]),
+                      ("127.0.0.1", ["--protocol=tcp", "--host=127.0.0.1"])):
+        try:
+            cp = util.run(["mariadb", "--no-defaults", *how, f"--user={REPORT_USER}",
+                           "-N", "-B", "-e", "SELECT 1"], env=env, capture_output=True)
+        except OSError:
+            return ("note", "the mariadb client is not installed; the recorded "
+                            f"{REPORT_USER} password was not tried")
+        if cp.returncode == 0:
+            continue
+        error = " ".join((cp.stderr or "").split())
+        if "ERROR 1203" in error:
+            # MAX_USER_CONNECTIONS: Query by Example is busy, which proves nothing.
+            return ("note", f"{REPORT_USER} is at its connection limit (Query by Example "
+                            "is busy); the recorded password was not tried")
+        return ("bad", f"the {REPORT_USER} password recorded in {PROPERTIES} does not log in "
+                       f"as {REPORT_USER}@{host}, so Query by Example cannot connect "
+                       "(run 'carlos-ctl db-users')")
+    return None
+
+
+def check_lines(db_name: str, db_root, login=_login_problem) -> List[Tuple[str, str]]:
     """(verdict, message) pairs for carlos-ctl check, verdict one of ok, note,
-    bad. Read-only."""
+    bad. Read-only: the one thing it does besides reading is log in once with
+    the recorded password, the way the application will."""
     out: List[Tuple[str, str]] = []
     grant_list = read_grant_list()
     if grant_list is None:
@@ -193,22 +285,28 @@ def check_lines(db_name: str, db_root) -> List[Tuple[str, str]]:
         return out
 
     user = (prop_get(PROPERTIES, USERNAME_KEY) or "").strip()
-    password = (prop_get(PROPERTIES, PASSWORD_KEY) or "").strip()
-    if user != REPORT_USER or not password:
+    password = util.prop_unescape(prop_get(PROPERTIES, PASSWORD_KEY) or "").strip()
+    recorded = user == REPORT_USER and bool(password)
+    if not recorded:
         out.append(("bad", f"{PROPERTIES} does not name the {REPORT_USER} account "
                            f"({USERNAME_KEY}/{PASSWORD_KEY}); Query by Example is closed "
                            "until 'carlos-ctl db-users' sets them"))
 
-    hosts = _count(db_root, "SELECT COUNT(*) FROM mysql.global_priv "
-                            f"WHERE User = '{REPORT_USER}' AND Host IN "
-                            + "(" + ", ".join(f"'{h}'" for h in REPORT_HOSTS) + ")")
+    hosts = _account_hosts(db_root)
     if hosts is None:
         out.append(("bad", f"could not read the {REPORT_USER} account from mysql.global_priv"))
         return out
-    if hosts < len(REPORT_HOSTS):
+    if any(h not in hosts for h in REPORT_HOSTS):
         out.append(("bad", f"the {REPORT_USER} account is missing (Query by Example is closed); "
                            "run 'carlos-ctl db-users'"))
         return out
+    # Each extra host is one more login (with '%', from anywhere on the
+    # network) that the grant list then grants like the others.
+    stray = sorted(hosts - set(REPORT_HOSTS))
+    if stray:
+        out.append(("bad", f"the {REPORT_USER} account also exists for host(s) "
+                           + ", ".join(stray) + ", which carlos-ctl never creates; drop them "
+                           f"(DROP USER '{REPORT_USER}'@'<host>')"))
 
     extra = _count(db_root,
                    "SELECT (SELECT COUNT(*) FROM mysql.global_priv "
@@ -216,16 +314,21 @@ def check_lines(db_name: str, db_root) -> List[Tuple[str, str]]:
                    "AND COALESCE(JSON_VALUE(Priv, '$.access'), 0) <> 0)"
                    f" + (SELECT COUNT(*) FROM mysql.db WHERE User = '{REPORT_USER}')"
                    f" + (SELECT COUNT(*) FROM mysql.procs_priv WHERE User = '{REPORT_USER}')"
+                   f" + (SELECT COUNT(*) FROM mysql.proxies_priv WHERE User = '{REPORT_USER}')"
                    f" + (SELECT COUNT(*) FROM mysql.roles_mapping WHERE User = '{REPORT_USER}')")
+    # Mirrors the refusal in the grant list itself: whatever PUBLIC holds,
+    # every account inherits, and no revoke on carlos_report takes it back.
     public = _count(db_root,
                     "SELECT (SELECT COUNT(*) FROM mysql.global_priv WHERE User = 'PUBLIC' "
                     "AND COALESCE(JSON_VALUE(Priv, '$.access'), 0) <> 0)"
                     f" + (SELECT COUNT(*) FROM mysql.db WHERE User = 'PUBLIC' AND '{db_name}' LIKE Db)"
                     f" + (SELECT COUNT(*) FROM mysql.tables_priv WHERE User = 'PUBLIC' AND Db = '{db_name}')"
-                    f" + (SELECT COUNT(*) FROM mysql.columns_priv WHERE User = 'PUBLIC' AND Db = '{db_name}')")
-    granted = _granted_tables(db_root, db_name)
+                    f" + (SELECT COUNT(*) FROM mysql.columns_priv WHERE User = 'PUBLIC' AND Db = '{db_name}')"
+                    f" + (SELECT COUNT(*) FROM mysql.procs_priv WHERE User = 'PUBLIC' AND Db = '{db_name}')")
+    granted = _granted_tables(db_root)
+    columns = _granted_columns(db_root)
     existing = _existing_tables(db_root, db_name)
-    if extra is None or public is None or granted is None or existing is None:
+    if extra is None or public is None or granted is None or columns is None or existing is None:
         out.append(("bad", f"could not read the {REPORT_USER} account's privileges"))
         return out
     if public:
@@ -234,61 +337,82 @@ def check_lines(db_name: str, db_root) -> List[Tuple[str, str]]:
                            "(SHOW GRANTS FOR PUBLIC; revoke them, then 'carlos-ctl db-users')"))
     if extra:
         out.append(("bad", f"the {REPORT_USER} account holds privileges beyond SELECT on "
-                           "reportable tables (a global, schema, routine or role grant); "
+                           "reportable tables (a global, schema, routine, proxy or role grant); "
                            "Query by Example refuses it until 'carlos-ctl db-users' rebuilds them"))
 
-    reportable_lower = {t.lower() for t in grant_list.reportable}
-    restricted_lower = {t.lower() for t in grant_list.restricted}
-    # Table_priv|Column_priv: "Select|" for a table grant, "|Select" for a
-    # column-list grant; anything else is a privilege the list never grants.
-    wrong = sorted(t for db, t, privs in granted
-                   if db != db_name or t.lower() in restricted_lower
-                   or t.lower() not in reportable_lower
-                   or privs.strip("|") != "Select")
+    # Folded names throughout: a server with lower_case_table_names stores
+    # them that way, and the list spells some tables in mixed case.
+    spelled = {t.lower(): t for t in grant_list.reportable}
+    restricted = {t.lower() for t in grant_list.restricted}
     hidden = {t.lower(): cols for t, cols in grant_list.reportable.items() if cols}
-    # A table-wide SELECT ("Select|") on a table with hidden columns reads those
-    # columns too; the list grants such tables column by column ("|Select").
-    wrong += sorted(f"{t} (every column)" for db, t, privs in granted
-                    if db == db_name and t.lower() in hidden
-                    and privs.split("|", 1)[0] != "")
-    columns = _granted_columns(db_root)
-    if columns is None:
-        out.append(("bad", f"could not read the {REPORT_USER} account's column privileges"))
+    present = {t.lower() for t in existing}
+    schema_columns = _existing_columns(db_root, db_name,
+                                       [spelled[t] for t in hidden if t in present])
+    if schema_columns is None:
+        out.append(("bad", f"could not read the columns of the {REPORT_USER} account's tables"))
         return out
-    wrong += sorted(f"{t}.{c}" for t, c in columns
-                    if c.lower() in hidden.get(t.lower(), frozenset()))
+    # Tables the list grants: every reportable one that exists here, except one
+    # whose every column is hidden.
+    expected = {t for t in spelled if t in present
+                and not (t in hidden and not schema_columns.get(t, set()) - hidden[t])}
+
+    wrong, short = [], []
+    have = {h: set() for h in REPORT_HOSTS}
+    for host, db, table, privs in granted:
+        folded = table.lower()
+        if db != db_name:
+            wrong.append(f"{db}.{table}")
+        elif folded in restricted:
+            wrong.append(f"{table} (restricted)")
+        elif folded not in spelled:
+            wrong.append(f"{table} (not in the grant list)")
+        else:
+            over, under = _grant_shape(table, privs, folded in hidden)
+            wrong += [over] if over else []
+            short += [f"{under} for {host}"] if under else []
+            if host in have:
+                have[host].add(folded)
+    granted_columns = {h: set() for h in REPORT_HOSTS}
+    for host, db, table, column in columns:
+        if db != db_name:
+            continue
+        if column.lower() in hidden.get(table.lower(), frozenset()):
+            wrong.append(f"{table}.{column}")
+        if host in granted_columns:
+            granted_columns[host].add((table.lower(), column.lower()))
+    for table, cols in hidden.items():
+        permitted = schema_columns.get(table, set()) - cols
+        for host in REPORT_HOSTS:
+            if table not in have[host]:
+                continue    # reported below as a table not granted at all
+            gaps = sorted(c for c in permitted if (table, c) not in granted_columns[host])
+            if gaps:
+                short.append(f"{spelled[table]}.{gaps[0]}"
+                             + (f" and {len(gaps) - 1} more column(s)" if len(gaps) > 1 else "")
+                             + f" for {host}")
     if wrong:
+        wrong = sorted(set(wrong))
         out.append(("bad", f"the {REPORT_USER} account is granted tables it must not read: "
                            + ", ".join(wrong[:10]) + (" ..." if len(wrong) > 10 else "")
                            + " (run 'carlos-ctl db-users')"))
-    expected = {t for t in grant_list.reportable if t in existing}
-    have = {t for db, t, _p in granted if db == db_name}
-    missing = sorted(expected - have)
-    if missing:
-        out.append(("bad", f"{len(missing)} reportable table(s) are not granted to "
-                           f"{REPORT_USER} yet (for example {missing[0]}); "
-                           "run 'carlos-ctl db-users' to refresh the Query by Example grants"))
-    if not public and not extra and not wrong and not missing:
+    missing = []
+    for host in REPORT_HOSTS:
+        gaps = sorted(spelled[t] for t in expected - have[host])
+        if gaps:
+            missing.append(gaps)
+            out.append(("bad", f"{len(gaps)} reportable table(s) are not granted to "
+                               f"{REPORT_USER}@{host} yet (for example {gaps[0]}); "
+                               "run 'carlos-ctl db-users' to refresh the Query by Example grants"))
+    if short:
+        short = sorted(set(short))
+        out.append(("bad", f"the {REPORT_USER} account is missing columns the grant list "
+                           "gives it: " + ", ".join(short[:10]) + (" ..." if len(short) > 10 else "")
+                           + " (run 'carlos-ctl db-users')"))
+    problem = login(password) if recorded else None
+    if problem:
+        out.append(problem)
+    if not (stray or public or extra or wrong or missing or short) and recorded \
+            and (problem is None or problem[0] != "bad"):
         out.append(("ok", f"Query by Example runs as {REPORT_USER}: SELECT on "
-                          f"{len(have)} reportable table(s), nothing else"))
+                          f"{len(have[REPORT_HOSTS[0]])} reportable table(s), nothing else"))
     return out
-
-
-def _granted_columns(db_root) -> Optional[List[Tuple[str, str]]]:
-    cp = db_root(["-N", "-B", "-e",
-                  "SELECT Table_name, Column_name FROM mysql.columns_priv "
-                  f"WHERE User = '{REPORT_USER}'"], capture_output=True)
-    if cp.returncode != 0:
-        return None
-    return [tuple(line.split("\t", 1)) for line in cp.stdout.splitlines()
-            if line.count("\t") == 1]
-
-
-def _existing_tables(db_root, db_name: str) -> Optional[set]:
-    cp = db_root(["-N", "-B", "-e",
-                  "SELECT TABLE_NAME FROM information_schema.TABLES "
-                  f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_TYPE = 'BASE TABLE'"],
-                 capture_output=True)
-    if cp.returncode != 0:
-        return None
-    return {line.strip() for line in cp.stdout.splitlines() if line.strip()}
