@@ -246,6 +246,11 @@ def check_lines(db_name: str, db_root) -> List[Tuple[str, str]]:
                    or t.lower() not in reportable_lower
                    or privs.strip("|") != "Select")
     hidden = {t.lower(): cols for t, cols in grant_list.reportable.items() if cols}
+    # A table-wide SELECT ("Select|") on a table with hidden columns reads those
+    # columns too; the list grants such tables column by column ("|Select").
+    wrong += sorted(f"{t} (every column)" for db, t, privs in granted
+                    if db == db_name and t.lower() in hidden
+                    and privs.split("|", 1)[0] != "")
     columns = _granted_columns(db_root)
     if columns is None:
         out.append(("bad", f"could not read the {REPORT_USER} account's column privileges"))

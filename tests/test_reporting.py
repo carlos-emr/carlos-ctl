@@ -364,6 +364,13 @@ class TestCheckReportsTheAccount(unittest.TestCase):
         self.answers["columns_priv"] += "casemgmt_note\tpassword\n"
         self.assertTrue(any("casemgmt_note.password" in m for _v, m in self._check()))
 
+    def test_a_table_wide_grant_on_a_table_with_hidden_columns_is_bad(self):
+        self.answers["tables_priv"] = self.answers["tables_priv"].replace(
+            "casemgmt_note\t|Select", "casemgmt_note\tSelect|")
+        lines = self._check()
+        self.assertIn("bad", [v for v, _m in lines])
+        self.assertTrue(any("casemgmt_note (every column)" in m for v, m in lines if v == "bad"))
+
     def test_a_write_privilege_is_bad(self):
         self.answers["tables_priv"] = self.answers["tables_priv"].replace(
             "demographic\tSelect|", "demographic\tSelect,Insert|")

@@ -12,8 +12,9 @@ carlos-ctl (1.2.0~dev1) resolute; urgency=medium
     rotates the new password with the others.
   * check reports the account: present on both hosts, named in
     carlos.properties, granted exactly the reportable tables of the
-    deployed list (no restricted table, hidden column, write privilege,
-    role, or PUBLIC grant reaching the schema) and none still missing.
+    deployed list (no restricted table, hidden column, table-wide grant on
+    a table with hidden columns, write privilege, role, or PUBLIC grant
+    reaching the schema) and none still missing.
   * destroy-data drops carlos_report with the other accounts.
 
  -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Thu, 22 Oct 2026 12:00:00 +0000
