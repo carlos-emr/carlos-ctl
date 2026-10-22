@@ -241,14 +241,16 @@ def _grant_shape(table: str, privs: str, has_hidden: bool) -> Tuple[Optional[str
     return None, None
 
 
-def _login_problem(password: str) -> Optional[Tuple[str, str]]:
+def _login_problem(password: str, port: str = "3306") -> Optional[Tuple[str, str]]:
     """(verdict, message) when the recorded password does not log in as the
-    reporting account, over the socket (localhost) and TCP (127.0.0.1), the
-    two ways the application can reach MariaDB; None when both work. The
-    password travels in MYSQL_PWD, never argv."""
+    reporting account, over the socket (localhost) and over TCP to 127.0.0.1
+    on the configured CARLOS_DB_PORT, the two ways the application can reach
+    MariaDB; None when both work. Only MariaDB refusing the password (1045)
+    is bad: a connection that fails for another reason proves nothing about
+    the password. The password travels in MYSQL_PWD, never argv."""
     env = dict(os.environ, MYSQL_PWD=password)
     for host, how in (("localhost", ["--protocol=socket"]),
-                      ("127.0.0.1", ["--protocol=tcp", "--host=127.0.0.1"])):
+                      ("127.0.0.1", ["--protocol=tcp", "--host=127.0.0.1", f"--port={port}"])):
         try:
             cp = util.run(["mariadb", "--no-defaults", *how, f"--user={REPORT_USER}",
                            "-N", "-B", "-e", "SELECT 1"], env=env, capture_output=True)
@@ -257,21 +259,26 @@ def _login_problem(password: str) -> Optional[Tuple[str, str]]:
                             f"{REPORT_USER} password was not tried")
         if cp.returncode == 0:
             continue
-        error = " ".join((cp.stderr or "").split())
+        error = util.mariadb_error(cp)
+        if "ERROR 1045" in error:
+            return ("bad", f"the {REPORT_USER} password recorded in {PROPERTIES} does not log in "
+                           f"as {REPORT_USER}@{host}, so Query by Example cannot connect "
+                           "(run 'carlos-ctl db-users')")
         if "ERROR 1203" in error:
             # MAX_USER_CONNECTIONS: Query by Example is busy, which proves nothing.
             return ("note", f"{REPORT_USER} is at its connection limit (Query by Example "
                             "is busy); the recorded password was not tried")
-        return ("bad", f"the {REPORT_USER} password recorded in {PROPERTIES} does not log in "
-                       f"as {REPORT_USER}@{host}, so Query by Example cannot connect "
-                       "(run 'carlos-ctl db-users')")
+        return ("note", f"could not try the recorded {REPORT_USER} password as "
+                        f"{REPORT_USER}@{host}: {error}")
     return None
 
 
-def check_lines(db_name: str, db_root, login=_login_problem) -> List[Tuple[str, str]]:
+def check_lines(db_name: str, db_root, login=None, *,
+                db_port: str = "3306") -> List[Tuple[str, str]]:
     """(verdict, message) pairs for carlos-ctl check, verdict one of ok, note,
     bad. Read-only: the one thing it does besides reading is log in once with
-    the recorded password, the way the application will."""
+    the recorded password, the way the application will (on db_port; login
+    replaces that probe in tests)."""
     out: List[Tuple[str, str]] = []
     grant_list = read_grant_list()
     if grant_list is None:
@@ -407,7 +414,12 @@ def check_lines(db_name: str, db_root, login=_login_problem) -> List[Tuple[str, 
         out.append(("bad", f"the {REPORT_USER} account is missing columns the grant list "
                            "gives it: " + ", ".join(short[:10]) + (" ..." if len(short) > 10 else "")
                            + " (run 'carlos-ctl db-users')"))
-    problem = login(password) if recorded else None
+    if not recorded:
+        problem = None
+    elif login is not None:
+        problem = login(password)
+    else:
+        problem = _login_problem(password, db_port)
     if problem:
         out.append(problem)
     if not (stray or public or extra or wrong or missing or short) and recorded \

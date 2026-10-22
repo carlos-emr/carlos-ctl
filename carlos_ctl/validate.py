@@ -563,7 +563,7 @@ def cmd_check(argv) -> int:
         # The Query by Example reporting account (carlos-emr/carlos#3372): it
         # must exist, be named in carlos.properties, and hold SELECT on exactly
         # the reportable tables of the deployed WAR's grant list.
-        for verdict, message in reporting.check_lines(s.db_name, dbops.db_root):
+        for verdict, message in reporting.check_lines(s.db_name, dbops.db_root, db_port=s.db_port):
             {"ok": _ok, "note": _note}.get(verdict, _bad)(message)
     else:
         _bad("cannot reach MariaDB as root over the unix socket")

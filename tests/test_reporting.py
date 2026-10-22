@@ -393,25 +393,28 @@ class TestCheckReportsTheAccount(unittest.TestCase):
     def _both(*rows):
         return "".join(f"{host}\t{row}\n" for host in reporting.REPORT_HOSTS for row in rows)
 
+    def _answer(self, args):
+        sql = args[-1]
+        self.queries.append(sql)
+        if "SELECT Host FROM mysql.global_priv" in sql:
+            return _Cp(0, self.answers["hosts"])
+        if "User = 'PUBLIC'" in sql:
+            return _Cp(0, self.answers["public"])
+        if "roles_mapping" in sql:
+            return _Cp(0, self.answers["extra"])
+        if "FROM mysql.tables_priv" in sql:
+            return _Cp(0, self.answers["tables_priv"])
+        if "FROM mysql.columns_priv" in sql:
+            return _Cp(0, self.answers["columns_priv"])
+        if "information_schema.COLUMNS" in sql:
+            return _Cp(0, self.answers["schema_columns"])
+        if "information_schema.TABLES" in sql:
+            return _Cp(0, self.answers["existing"])
+        raise AssertionError(sql)
+
     def _check(self):
         def fake_db_root(args, **kw):
-            sql = args[-1]
-            self.queries.append(sql)
-            if "SELECT Host FROM mysql.global_priv" in sql:
-                return _Cp(0, self.answers["hosts"])
-            if "User = 'PUBLIC'" in sql:
-                return _Cp(0, self.answers["public"])
-            if "roles_mapping" in sql:
-                return _Cp(0, self.answers["extra"])
-            if "FROM mysql.tables_priv" in sql:
-                return _Cp(0, self.answers["tables_priv"])
-            if "FROM mysql.columns_priv" in sql:
-                return _Cp(0, self.answers["columns_priv"])
-            if "information_schema.COLUMNS" in sql:
-                return _Cp(0, self.answers["schema_columns"])
-            if "information_schema.TABLES" in sql:
-                return _Cp(0, self.answers["existing"])
-            raise AssertionError(sql)
+            return self._answer(args)
 
         def fake_login(password):
             self.logins.append(password)
@@ -504,6 +507,15 @@ class TestCheckReportsTheAccount(unittest.TestCase):
         self.assertIn("mysql.procs_priv WHERE User = 'PUBLIC'", public)
         self.assertIn("mysql.proxies_priv WHERE User = 'carlos_report'", extra)
 
+    def test_the_configured_port_reaches_the_login_probe(self):
+        seen = []
+        with mock.patch.object(reporting, "GRANTS_SQL", self.path), \
+                mock.patch.object(reporting, "PROPERTIES", self.properties), \
+                mock.patch.object(reporting, "_login_problem",
+                                  lambda password, port: seen.append((password, port))):
+            reporting.check_lines("carlos", lambda args, **kw: self._answer(args), db_port="3307")
+        self.assertEqual(seen, [(self.password, "3307")])
+
     def test_a_password_that_does_not_log_in_is_bad(self):
         self.login_answer = ("bad", "the carlos_report password does not log in")
         self.assertEqual(self.verdicts(), ["bad"])
@@ -541,7 +553,7 @@ class TestCheckReportsTheAccount(unittest.TestCase):
 
 class TestTheLoginProbe(unittest.TestCase):
 
-    def _probe(self, *answers):
+    def _probe(self, *answers, port="3306"):
         calls = []
 
         def fake_run(cmd, **kw):
@@ -551,7 +563,7 @@ class TestTheLoginProbe(unittest.TestCase):
                 raise answer
             return answer
         with mock.patch.object(reporting.util, "run", fake_run):
-            return reporting._login_problem("s-" + uuid.uuid4().hex), calls
+            return reporting._login_problem("s-" + uuid.uuid4().hex, port), calls
 
     def test_both_hosts_logging_in_is_no_problem(self):
         problem, calls = self._probe(_Cp(0, "1\n"))
@@ -566,6 +578,20 @@ class TestTheLoginProbe(unittest.TestCase):
         problem, _calls = self._probe(_Cp(0, "1\n"), _Cp(1, "", "ERROR 1045 (28000): Access denied"))
         self.assertEqual(problem[0], "bad")
         self.assertIn("carlos_report@127.0.0.1", problem[1])
+
+    def test_the_tcp_probe_uses_the_configured_port(self):
+        _problem, calls = self._probe(_Cp(0, "1\n"), port="3307")
+        socket_cmd, tcp_cmd = calls[0][0], calls[1][0]
+        self.assertIn("--protocol=socket", socket_cmd)
+        self.assertNotIn("--port=3307", socket_cmd)
+        self.assertIn("--port=3307", tcp_cmd)
+        self.assertIn("--host=127.0.0.1", tcp_cmd)
+
+    def test_a_connection_failure_is_a_note_not_a_bad_password(self):
+        problem, _calls = self._probe(_Cp(0, "1\n"), _Cp(1, "", "ERROR 2003 (HY000): Can't connect to "
+                                                               "server on '127.0.0.1' (111)"))
+        self.assertEqual(problem[0], "note")
+        self.assertIn("ERROR 2003", problem[1])
 
     def test_a_busy_account_proves_nothing(self):
         problem, _calls = self._probe(_Cp(1, "", "ERROR 1203 (42000): User carlos_report already has more "
