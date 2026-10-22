@@ -51,7 +51,9 @@ SQL\-injection request, that DrugRef is not reachable through the front door,
 that the web\-service surface is gated (the CXF service catalog is hidden and an
 unauthenticated SOAP call is refused), that a dot\-segment path\-normalisation
 bypass is rejected, that the application unit is enabled as well as running,
-that the schema has a Flyway history, and that backups are fresh. Start here.
+that the schema has a Flyway history, that the Query by Example reporting
+account holds SELECT on exactly the reportable tables of the deployed grant
+list and nothing else, and that backups are fresh. Start here.
 .IP
 A web\-service line reported as
 .B NOTE
@@ -94,6 +96,11 @@ Apply pending migrations.
 .B Take a verified backup first:
 DDL is not transactional in MariaDB and a failed migration can leave a
 partially\-changed schema.
+After a successful migration the Query by Example grant list of the deployed
+WAR is applied again, so a reportable table the migration created becomes
+readable to
+.BR carlos_report ;
+a grant list that does not apply is reported but does not fail the migration.
 .TP
 .BR db-baseline " [" \-\-dry\-run "] [" \-\-stamp\-only "]"
 Adopt an existing pre\-Flyway (OSCAR 19 / OpenO) database, then stamp the
@@ -358,9 +365,33 @@ to complete recovery and restore service startup.
 Create the databases and the least\-privilege accounts (the verb name
 matches carlos\-podman). Idempotent, and it preserves any password already
 configured.
+The accounts are
+.B carlos
+(the application),
+.B drugref
+(the drug reference schema only),
+.B backup
+(read\-only) and
+.B carlos_report
+(Query by Example). The last is created with no privileges and recorded as
+.B db_reporting_username
+and
+.B db_reporting_password
+in
+.IR carlos.properties ;
+what it may read is the grant list the deployed WAR ships
+.RI ( WEB\-INF/classes/db/reporting/carlos_report_grants.sql ),
+applied here when the schema has tables and again after every migration:
+SELECT on each reportable table that exists, minus hidden columns, at most 6
+connections and 30 seconds per statement, and nothing else. A
+.B PUBLIC
+grant that reaches the clinical schema stops the grant list, because every
+account would inherit it.
 .TP
 .B rotate
-Rotate every generated database password and restart the application.
+Rotate every generated database password, the
+.B carlos_report
+one included, and restart the application.
 .SS Decommissioning
 .TP
 .BI "destroy-data --confirm " server-name

@@ -9,7 +9,7 @@ from typing import Optional
 import re
 import time
 
-from . import config, dbops, provision, util
+from . import config, dbops, provision, reporting, util
 from .util import (
     BACKUP_ENV, CHROMIUM_DIR, CONF_DIR, GREEN, LIB, PROPERTIES, RED, RENDER_BROWSER_ENV, RESET,
     REINSTALL_HINT, YELLOW, need_root, out, package_ships, render_payload_installed, run,
@@ -560,6 +560,11 @@ def cmd_check(argv) -> int:
             _bad("flyway_schema_history is empty or missing — the application's boot-time "
                  "schema gate will fail ('carlos-ctl finish-install' on an install that "
                  "never provisioned, 'carlos-ctl db-info' otherwise)")
+        # The Query by Example reporting account (carlos-emr/carlos#3372): it
+        # must exist, be named in carlos.properties, and hold SELECT on exactly
+        # the reportable tables of the deployed WAR's grant list.
+        for verdict, message in reporting.check_lines(s.db_name, dbops.db_root):
+            {"ok": _ok, "note": _note}.get(verdict, _bad)(message)
     else:
         _bad("cannot reach MariaDB as root over the unix socket")
 
