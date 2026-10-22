@@ -422,8 +422,11 @@ def check_lines(db_name: str, db_root, login=None, *,
         problem = _login_problem(password, db_port)
     if problem:
         out.append(problem)
-    if not (stray or public or extra or wrong or missing or short) and recorded \
-            and (problem is None or problem[0] != "bad"):
+    # Only a login that worked earns the ok line. A probe that could not try
+    # the password (the account at its connection limit, MariaDB not answering
+    # on db_port, no client) leaves its note, and no claim that Query by
+    # Example runs.
+    if not (stray or public or extra or wrong or missing or short) and recorded and problem is None:
         out.append(("ok", f"Query by Example runs as {REPORT_USER}: SELECT on "
                           f"{len(have[REPORT_HOSTS[0]])} reportable table(s), nothing else"))
     return out

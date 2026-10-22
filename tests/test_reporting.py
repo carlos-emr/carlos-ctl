@@ -522,7 +522,19 @@ class TestCheckReportsTheAccount(unittest.TestCase):
 
     def test_a_busy_account_is_only_a_note(self):
         self.login_answer = ("note", "carlos_report is at its connection limit")
-        self.assertEqual(self.verdicts(), ["note", "ok"])
+        self.assertEqual(self.verdicts(), ["note"])
+
+    def test_a_login_that_cannot_be_tried_is_a_note_and_never_ok(self):
+        # MariaDB not answering on CARLOS_DB_PORT says nothing about the
+        # password, nor that Query by Example can connect.
+        answers = iter([_Cp(0, "1\n"), _Cp(1, "", "ERROR 2003 (HY000): Can't connect to server "
+                                                  "on '127.0.0.1' (111)")])
+        with mock.patch.object(reporting, "GRANTS_SQL", self.path), \
+                mock.patch.object(reporting, "PROPERTIES", self.properties), \
+                mock.patch.object(reporting.util, "run", lambda cmd, **kw: next(answers)):
+            lines = reporting.check_lines("carlos", lambda args, **kw: self._answer(args), db_port="3307")
+        self.assertEqual([verdict for verdict, _message in lines], ["note"])
+        self.assertIn("ERROR 2003", lines[0][1])
 
     def test_the_recorded_password_is_unescaped_before_logging_in(self):
         util.prop_set(self.properties, "db_reporting_password", util.prop_escape("a=b:c"))

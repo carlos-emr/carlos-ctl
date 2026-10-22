@@ -62,6 +62,13 @@ rather than
 .B OK
 means the probe could not reach the application to prove the invariant (a WAF
 block, a redirect, or a restart in progress), not that a check failed.
+Likewise, a Query by Example
+.B NOTE
+in place of its
+.B OK
+line means the recorded password could not be tried (the account at its
+connection limit, or MariaDB not answering on 127.0.0.1 at CARLOS_DB_PORT),
+not that it is wrong.
 .TP
 .B status
 Systemd status of the EMR, nginx, MariaDB and the package's timers.
