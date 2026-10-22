@@ -41,7 +41,7 @@ GRANTS_SQL = os.path.join(WEBAPP, "WEB-INF", "classes", "db", "reporting",
                           "carlos_report_grants.sql")
 
 # One classification row of the grant list. The file's header documents the
-# format; carlos's QueryByExampleReportingClassificationTest enforces it.
+# format; carlos's QueryByExampleReportingClassificationUnitTest enforces it.
 _ROW = re.compile(
     r"^\('(?P<table>[A-Za-z0-9_]+)', '(?P<access>reportable|restricted)', "
     r"(?:NULL|'(?P<columns>[A-Za-z0-9_]+(?:,[A-Za-z0-9_]+)*)'), "
