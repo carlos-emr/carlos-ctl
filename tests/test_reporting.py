@@ -192,6 +192,17 @@ class TestSyncingTheGrants(unittest.TestCase):
         self.assertIn("not valid UTF-8", err)
         self.assertEqual([args for args, _script in self.calls if "-e" not in args], [])
 
+    def test_the_refusal_is_reported_rather_than_the_echoed_script(self):
+        # The client echoes the failing BEGIN NOT ATOMIC block before its ERROR
+        # line; the warning must carry MariaDB's message, not the SQL.
+        echoed = ("--------------\nBEGIN NOT ATOMIC\n" + "    DECLARE v INT;\n" * 60
+                  + "END\n--------------\n\nERROR 1644 (45000) at line 545: carlos_report_grants.sql: "
+                    "PUBLIC holds privileges that reach the CARLOS schema\n")
+        applied, _out, err = self._sync(script_answer=_Cp(1, "", echoed))
+        self.assertFalse(applied)
+        self.assertIn("ERROR 1644 (45000) at line 545: carlos_report_grants.sql: PUBLIC holds", err)
+        self.assertNotIn("BEGIN NOT ATOMIC", err)
+
     def test_a_list_that_fails_is_reported_and_never_raised(self):
         refused = _Cp(1, "", "ERROR 1644 (45000) at line 545: carlos_report_grants.sql: PUBLIC "
                              "holds privileges that reach the CARLOS schema")

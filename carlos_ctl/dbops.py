@@ -53,8 +53,7 @@ def schema_has_tables(name: str) -> bool:
                   "SELECT COUNT(*) FROM information_schema.TABLES "
                   f"WHERE TABLE_SCHEMA = '{name}'"], capture_output=True)
     if cp.returncode != 0:
-        reason = " ".join((cp.stderr or "").split())[:400] or f"exit {cp.returncode}"
-        warn(f"could not count the tables of {name} ({reason}); "
+        warn(f"could not count the tables of {name} ({util.mariadb_error(cp)}); "
              "refreshing the Query by Example grants anyway")
         return True
     return cp.stdout.strip() not in ("", "0")

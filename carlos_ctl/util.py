@@ -223,6 +223,22 @@ def genpw() -> str:
 # contract.py now pins the two against each other.
 
 
+def mariadb_error(cp) -> str:
+    """The cause a failed mariadb client run reports, at most 400 characters.
+
+    Reading SQL from a pipe, the client echoes the whole failing statement
+    (between "--------------" rules) before its ERROR line, so the start of
+    stderr is SQL, not the cause: for the Query by Example grant list it was
+    the opening of a 100-line BEGIN NOT ATOMIC block, with MariaDB's own
+    message cut off after it."""
+    errors = [line.strip() for line in (cp.stderr or "").splitlines()
+              if line.startswith("ERROR ")]
+    if errors:
+        return errors[-1][:400]
+    text = " ".join((cp.stderr or "").split())
+    return text[-400:] or f"exit {cp.returncode}"
+
+
 def sql_escape(value: str) -> str:
     """Escape `value` for a single-quoted MySQL string literal.
 

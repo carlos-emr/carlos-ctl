@@ -147,8 +147,7 @@ def sync_grants(db_name: str, db_root) -> bool:
     if cp.returncode != 0:
         # MariaDB's message names the cause (a PUBLIC grant, a missing schema)
         # and never a credential: the script carries no password.
-        reason = " ".join((cp.stderr or "").split())[:400] or f"exit {cp.returncode}"
-        warn(f"the Query by Example grant list did not apply: {reason}")
+        warn(f"the Query by Example grant list did not apply: {util.mariadb_error(cp)}")
         warn("Query by Example stays closed until it does; fix the cause, then "
              "run 'carlos-ctl db-users'")
         return False
