@@ -145,11 +145,20 @@ class TestSyncingTheGrants(unittest.TestCase):
         self.path = _write_list(self.dir, ["('demographic', 'reportable', NULL, NULL);"])
         self.calls = []
 
-    def _sync(self, account_answer=_Cp(0, "2\n"), script_answer=_Cp(0)):
+    def _sync(self, hosts=(_Cp(0, "localhost\n127.0.0.1\n"),), drop_answer=_Cp(0),
+              script_answer=_Cp(0)):
+        # One answer per read of the account's hosts, the last one repeating.
+        hosts = list(hosts)
+
         def fake_db_root(args, **kw):
             self.calls.append((list(args), kw.get("input")))
             if "-e" in args:
-                return account_answer
+                sql = args[-1]
+                if "SELECT Host FROM mysql.global_priv" in sql:
+                    return hosts.pop(0) if len(hosts) > 1 else hosts[0]
+                if sql.startswith("DROP USER"):
+                    return drop_answer
+                raise AssertionError(sql)
             return script_answer
         err = io.StringIO()
         out = io.StringIO()
@@ -175,16 +184,74 @@ class TestSyncingTheGrants(unittest.TestCase):
         self.assertIn("ships no Query by Example grant list", out)
 
     def test_an_account_that_does_not_exist_yet_is_left_for_db_users(self):
-        applied, out, _err = self._sync(account_answer=_Cp(0, "0\n"))
+        applied, out, _err = self._sync(hosts=(_Cp(0, ""),))
         self.assertFalse(applied)
         self.assertEqual(len(self.calls), 1)
         self.assertIn("db-users", out)
 
     def test_an_unanswered_account_probe_is_a_warning_not_a_guess(self):
-        applied, _out, err = self._sync(account_answer=_Cp(1, "", "ERROR 2002"))
+        applied, _out, err = self._sync(hosts=(_Cp(1, "", "ERROR 2002"),))
         self.assertFalse(applied)
         self.assertEqual(len(self.calls), 1)
         self.assertIn("WARNING", err)
+
+    def _sql(self):
+        return [args[-1] for args, _script in self.calls if "-e" in args]
+
+    def _scripts_run(self):
+        return [args for args, _script in self.calls if "-e" not in args]
+
+    def test_a_stray_login_is_dropped_before_the_list_grants_it_anything(self):
+        # The list grants every login the account has, so an operator's
+        # carlos_report@'%' would get the clinical tables too.
+        applied, _out, err = self._sync(hosts=(_Cp(0, "localhost\n127.0.0.1\n%\n"),
+                                               _Cp(0, "localhost\n127.0.0.1\n")))
+        self.assertTrue(applied)
+        drops = [i for i, (args, _s) in enumerate(self.calls)
+                 if "-e" in args and args[-1].startswith("DROP USER")]
+        script_at = [i for i, (args, _s) in enumerate(self.calls) if "-e" not in args]
+        self.assertEqual([self.calls[i][0][-1] for i in drops],
+                         ["DROP USER IF EXISTS 'carlos_report'@'%'"])
+        self.assertEqual(len(script_at), 1)
+        self.assertLess(drops[0], script_at[0])
+        self.assertIn("dropped the carlos_report login for host '%'", err)
+
+    def test_the_approved_logins_are_never_dropped(self):
+        applied, _out, err = self._sync()
+        self.assertTrue(applied)
+        self.assertFalse([sql for sql in self._sql() if sql.startswith("DROP USER")])
+        self.assertEqual(err, "")
+
+    def test_a_stray_host_name_is_escaped_in_the_drop(self):
+        applied, _out, _err = self._sync(hosts=(_Cp(0, "localhost\n127.0.0.1\nev'il\n"),
+                                                _Cp(0, "localhost\n127.0.0.1\n")))
+        self.assertTrue(applied)
+        self.assertIn("DROP USER IF EXISTS 'carlos_report'@'ev\\'il'", self._sql())
+
+    def test_a_stray_that_cannot_be_dropped_stops_the_list(self):
+        refused = _Cp(1, "", "ERROR 1227 (42000): Access denied; you need (at least one of) "
+                             "the CREATE USER privilege(s) for this operation")
+        applied, _out, err = self._sync(hosts=(_Cp(0, "localhost\n127.0.0.1\n%\n"),),
+                                        drop_answer=refused)
+        self.assertFalse(applied)
+        self.assertEqual(self._scripts_run(), [])
+        self.assertIn("ERROR 1227", err)
+        self.assertIn("not refreshed", err)
+
+    def test_a_stray_still_there_after_the_drop_stops_the_list(self):
+        # A host the client printed escaped is dropped under a name that does
+        # not exist (IF EXISTS: no error), so only reading again shows it stayed.
+        applied, _out, err = self._sync(hosts=(_Cp(0, "localhost\n127.0.0.1\n10.0.0.%\n"),))
+        self.assertFalse(applied)
+        self.assertEqual(self._scripts_run(), [])
+        self.assertIn("still has a login other than localhost and 127.0.0.1", err)
+
+    def test_hosts_that_cannot_be_read_again_stop_the_list(self):
+        applied, _out, err = self._sync(hosts=(_Cp(0, "localhost\n127.0.0.1\n%\n"),
+                                               _Cp(1, "", "ERROR 2013 (HY000): Lost connection")))
+        self.assertFalse(applied)
+        self.assertEqual(self._scripts_run(), [])
+        self.assertIn("not refreshed", err)
 
     def test_an_undecodable_list_is_reported_and_never_raised(self):
         with open(self.path, "ab") as fh:
@@ -554,7 +621,9 @@ class TestCheckReportsTheAccount(unittest.TestCase):
 
     def test_a_stray_host_is_bad(self):
         self.answers["hosts"] += "%\n"
-        self.assertIn("also exists for host(s) %", self.bad())
+        bad = self.bad()
+        self.assertIn("also exists for host(s) %", bad)
+        self.assertIn("'carlos-ctl db-users' drops them", bad)
 
     def test_public_grants_and_extra_privileges_are_bad(self):
         self.answers["public"] = "1"
@@ -748,6 +817,40 @@ class TestTheShippedListAgainstMariaDB(unittest.TestCase):
         self.root(self.script, database=self.schema)
         left = self.root(f"SELECT COUNT(*) FROM mysql.proxies_priv WHERE User = '{self.user}'")
         self.assertEqual(left.stdout.strip(), "0")
+
+    def _stray(self):
+        """A login of the account carlos-ctl never creates, with a password of
+        its own, as an operator might leave one."""
+        self.addCleanup(self.root, f"DROP USER IF EXISTS '{self.user}'@'%';", check=False)
+        self.root(f"CREATE USER '{self.user}'@'%' IDENTIFIED BY '{util.genpw()}';")
+
+    def test_the_list_grants_every_login_the_account_has(self):
+        # Why sync_grants drops a stray login first: the list cannot tell an
+        # approved login from one an operator added.
+        self._stray()
+        self.root(self.script, database=self.schema)
+        self.assertIn("`demographic`", self.root(f"SHOW GRANTS FOR '{self.user}'@'%'").stdout)
+
+    def test_sync_drops_a_stray_login_before_it_grants(self):
+        self._stray()
+        tmp = tempfile.mkdtemp(prefix="reporting-live-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        listing = os.path.join(tmp, "carlos_report_grants.sql")
+        with open(listing, "w", encoding="utf-8") as fh:
+            fh.write(self.script)
+
+        def db_root(args, input=None, capture_output=True):
+            return self._client(list(args), input or "")
+        err = io.StringIO()
+        with mock.patch.object(reporting, "REPORT_USER", self.user), \
+                mock.patch.object(reporting, "GRANTS_SQL", listing), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            applied = reporting.sync_grants(self.schema, db_root)
+        self.assertTrue(applied, err.getvalue())
+        hosts = self.root(f"SELECT Host FROM mysql.global_priv WHERE User = '{self.user}'")
+        self.assertEqual(hosts.stdout.split(), ["localhost"])
+        self.assertIn("login for host '%'", err.getvalue())
+        self.assertEqual(self.as_report("SELECT COUNT(*) FROM demographic").returncode, 0)
 
     def test_a_public_grant_on_the_schema_stops_it(self):
         self.root(f"GRANT SELECT, INSERT ON `{self.schema}`.security TO '{self.user}'@'localhost';")

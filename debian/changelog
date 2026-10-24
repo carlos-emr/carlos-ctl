@@ -22,6 +22,12 @@ carlos-ctl (1.2.0~dev1) resolute; urgency=medium
     (with a warning) rather than skipping them, asks for a restart when it
     corrects the recorded reporting username, and an unreadable or
     non-UTF-8 grant list is reported instead of raising.
+  * Before applying the grant list (in db-users and after db-migrate), drop
+    any carlos_report login for a host other than localhost and 127.0.0.1,
+    because the list grants every login the account has. An operator's
+    carlos_report@'%' would otherwise get the clinical tables behind a
+    password carlos-ctl does not manage. If such a login cannot be dropped,
+    the list is not applied.
   * destroy-data drops carlos_report with the other accounts.
   * db-users holds the database-ownership lock that finish-install,
     import-o19 and both postinsts share, from before it reads the recorded

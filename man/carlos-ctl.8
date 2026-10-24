@@ -395,6 +395,11 @@ connections and 30 seconds per statement, and nothing else. A
 .B PUBLIC
 grant that reaches the clinical schema stops the grant list, because every
 account would inherit it.
+The list grants every login the account has, so a
+.B carlos_report
+login for any host other than localhost and 127.0.0.1 (carlos\-ctl creates
+no other) is dropped before the list runs; if one cannot be dropped, the
+list does not run.
 .IP
 It holds the database\-ownership lock
 .RI ( /var/lib/carlos\-emr/.finish\-install.lock ,
