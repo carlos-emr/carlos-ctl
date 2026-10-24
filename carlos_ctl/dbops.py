@@ -282,6 +282,34 @@ def cmd_db_users(argv) -> int:
     for a in argv:
         if a != "--new-passwords":
             die(f"unknown option: {a}")
+    # Reading the recorded passwords, the ALTER USERs and recording the
+    # results are one step. Two runs interleaving (a first-run postinst and a
+    # hand-run rotate, say) could each generate a password and leave the files
+    # recording one generation while MariaDB accepts the other. The
+    # database-ownership lock every provisioning path shares makes them take
+    # turns. A caller that already holds it (a postinst on fd 9,
+    # finish-install in this process) is let through, not refused.
+    held = util.hold_db_ownership_lock("db-users")
+    try:
+        return _provision_accounts(force_new)
+    finally:
+        if held is not None:
+            os.close(held)
+
+
+def _provision_accounts(force_new: bool) -> int:
+    """The body of db-users, run under the database-ownership lock.
+
+    The properties files and backup.env are the record of every credential,
+    and each run sets MariaDB to the passwords they record, generating one
+    only where none is recorded (or for --new-passwords). That is the
+    recovery contract for a run stopped between its SQL and its writes by
+    power loss, a full disk or a kill: MariaDB then accepts a password the
+    files do not record. The next db-users sets it back to what they record
+    (a first run's account gets a fresh password, recorded this time), and
+    until then `check` reports that the recorded reporting password does not
+    log in. The postinst, finish-install and rotate all run db-users, so any
+    of them repairs it."""
     s = config.load()
 
     # Re-use existing passwords so a reconfigure or upgrade never invalidates

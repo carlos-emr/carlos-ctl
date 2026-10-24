@@ -395,6 +395,27 @@ connections and 30 seconds per statement, and nothing else. A
 .B PUBLIC
 grant that reaches the clinical schema stops the grant list, because every
 account would inherit it.
+.IP
+It holds the database\-ownership lock
+.RI ( /var/lib/carlos\-emr/.finish\-install.lock ,
+shared with
+.BR finish\-install ,
+.B import\-o19
+and the package scripts) from before it reads the recorded passwords until
+it has written them, so two runs cannot leave the files recording one
+password while MariaDB accepts another. A caller that already holds the
+lock (a package script, or
+.B finish\-install
+calling it) goes ahead; while another run holds it,
+.B db\-users
+refuses and changes nothing. The files are the record: every run sets
+MariaDB to the passwords they hold. A run stopped after its ALTER USERs but
+before its writes (power loss, a full disk, a kill) is therefore repaired by
+running
+.B db\-users
+again;
+.B check
+reports the mismatch until then.
 .TP
 .B rotate
 Rotate every generated database password, the

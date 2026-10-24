@@ -23,6 +23,16 @@ carlos-ctl (1.2.0~dev1) resolute; urgency=medium
     corrects the recorded reporting username, and an unreadable or
     non-UTF-8 grant list is reported instead of raising.
   * destroy-data drops carlos_report with the other accounts.
+  * db-users holds the database-ownership lock that finish-install,
+    import-o19 and both postinsts share, from before it reads the recorded
+    passwords until it has written them, so two runs (a first-run postinst
+    and a hand-run rotate, say) can no longer leave carlos.properties
+    recording one password while MariaDB accepts another. A caller already
+    holding the lock (a postinst on fd 9, finish-install in-process) is let
+    through; while another run holds it, db-users refuses and changes
+    nothing. A run stopped between its ALTER USERs and its writes is
+    repaired by the next db-users, which sets MariaDB back to the recorded
+    passwords.
 
  -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Thu, 22 Oct 2026 12:00:00 +0000
 

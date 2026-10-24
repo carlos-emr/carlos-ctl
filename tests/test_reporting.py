@@ -13,6 +13,8 @@ a carlos checkout; the live test runs it against a disposable MariaDB.
 
 import argparse
 import contextlib
+import errno
+import fcntl
 import io
 import os
 import shutil
@@ -240,6 +242,9 @@ class _DbUsersHarness(unittest.TestCase):
 
         settings = argparse.Namespace(db_name="carlos")
         patches = [
+            # db-users takes the database-ownership lock; a temp file stands in
+            # for /var/lib/carlos-emr, which a test runner neither owns nor needs
+            mock.patch.object(util, "DB_OWNERSHIP_LOCK", os.path.join(self.dir, ".finish-install.lock")),
             mock.patch.object(dbops, "need_root", lambda verb: None),
             mock.patch.object(dbops, "require_db_root", lambda: None),
             mock.patch.object(dbops.config, "load", lambda: settings),
@@ -325,6 +330,63 @@ class TestDbUsersProvisionsTheReportingAccount(_DbUsersHarness):
         util.prop_set(self.properties, "db_reporting_password", old)
         self._db_users(["--new-passwords"])
         self.assertNotEqual(self.prop("db_reporting_password"), old)
+
+
+class TestAnInterruptedRunIsRepairedByTheNext(_DbUsersHarness):
+    """The recovery contract for a db-users stopped between its ALTER USERs
+    and its writes (power loss, a full disk, a kill). MariaDB is left
+    accepting a password carlos.properties does not record, and the next
+    db-users sets MariaDB back to what the file records."""
+
+    def accepted(self, user):
+        """The password the fake MariaDB was last set to for user@localhost."""
+        prefix = f"ALTER USER '{user}'@'localhost' IDENTIFIED BY '"
+        found = [line[len(prefix):-len("';")] for batch in self.batches
+                 for line in batch.splitlines() if line.startswith(prefix)]
+        return found[-1] if found else None
+
+    def interrupted(self, fault, argv=()):
+        """A db-users stopped by `fault` as it records the reporting password,
+        after MariaDB has already been set."""
+        real = util.prop_set
+
+        def stopping(path, key, value):
+            if key == reporting.PASSWORD_KEY:
+                raise fault
+            real(path, key, value)
+        with mock.patch.object(dbops, "prop_set", stopping), self.assertRaises(type(fault)):
+            self._db_users(argv)
+
+    def test_a_first_run_stopped_by_a_full_disk_is_repaired_by_the_next(self):
+        self.interrupted(OSError(errno.ENOSPC, "No space left on device"))
+        stranded = self.accepted("carlos_report")
+        self.assertIsNotNone(stranded)
+        self.assertEqual(self.prop("db_reporting_password"), "")
+        self.assertEqual(self._db_users(), 0)
+        recorded = self.prop("db_reporting_password")
+        self.assertEqual(self.accepted("carlos_report"), recorded)
+        self.assertNotEqual(recorded, stranded)
+
+    def test_a_rotation_killed_before_it_records_is_undone_by_the_next_run(self):
+        recorded = util.genpw()
+        util.prop_set(self.properties, "db_reporting_password", recorded)
+        self.interrupted(KeyboardInterrupt(), ["--new-passwords"])
+        self.assertNotEqual(self.accepted("carlos_report"), recorded)
+        self.assertEqual(self.prop("db_reporting_password"), recorded)
+        self.assertEqual(self._db_users(), 0)
+        self.assertEqual(self.accepted("carlos_report"), recorded)
+        self.assertEqual(self.prop("db_reporting_password"), recorded)
+        # the application account, recorded before the stop, agrees too
+        self.assertEqual(self.accepted("carlos"), self.prop("db_password"))
+
+    def test_an_interrupted_run_gives_the_lock_back(self):
+        # rotate and finish-install call db-users in-process; a stop must not
+        # leave them, or the next run, facing a lock nobody will release
+        self.interrupted(OSError(errno.EIO, "Input/output error"))
+        lock = os.path.join(self.dir, ".finish-install.lock")
+        fd = os.open(lock, os.O_WRONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 class TestMigrationRefreshesTheGrants(unittest.TestCase):
