@@ -129,6 +129,11 @@ class TestCompleteBackupSet(unittest.TestCase):
                         source = b"SET " + target + b"=" + quote + mode + quote + b"; SELECT 'ordinary text';"
                         with self.assertRaisesRegex(ValueError, "dump changes SQL quoting modes"):
                             b"".join(o19sources.restore_chunks(io.BytesIO(source)))
+        # MariaDB decodes the otherwise unrecognized \S escape as S, so
+        # the guard must inspect the decoded literal rather than its bytes.
+        source = b"SET sql_mode='AN\\SI'; SELECT 'ordinary text';"
+        with self.assertRaisesRegex(ValueError, "dump changes SQL quoting modes"):
+            b"".join(o19sources.restore_chunks(io.BytesIO(source)))
         # Saving a value in a user variable does not change session quoting.
         for target in (b"@sql_mode", b"@session.sql_mode", b"@clinic.session.sql_mode", b"@`sql_mode`"):
             with self.subTest(user_variable=target):
