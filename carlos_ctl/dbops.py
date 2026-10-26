@@ -540,7 +540,8 @@ def run_flyway(command: str) -> int:
     # world-readable and this connects to a database holding PHI.
     env.update(
         FLYWAY_URL=f"jdbc:mysql://{s.db_host}:{s.db_port}/{s.db_name}"
-                   "?useSSL=false&allowPublicKeyRetrieval=true",
+                   "?useSSL=false&allowPublicKeyRetrieval=true"
+                   "&characterEncoding=UTF-8&connectionCollation=utf8mb4_general_ci",
         FLYWAY_USER=user,
         FLYWAY_PASSWORD=password,
     )

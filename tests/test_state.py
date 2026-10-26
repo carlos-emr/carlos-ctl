@@ -1954,7 +1954,7 @@ class TestStagingRestore(unittest.TestCase):
              b"use the inhaler twice daily');\n"]))
 
     def test_a_line_longer_than_the_carry_bound_stays_mid_line(self):
-        filler = b"x" * (o19import.DUMP_CARRY_MAX * 2)
+        filler = b"x" * ((1 << 16) * 2)
         big = b"INSERT INTO n VALUES ('" + filler + b" use it');\n"
         half = len(big) // 2
         self.assertIsNone(self._scan([big[:half], big[half:]]))
@@ -2235,6 +2235,9 @@ class TestBundleDigest(unittest.TestCase):
                                  "properties": None, "bundle_sha256": "x"})
         self.addCleanup(setattr, o19import.o19bundle, "open_bundle",
                         real_open)
+        prepare = mock.patch.object(o19import, "_prepare_input_sets", side_effect=lambda inputs, *_: inputs)
+        prepare.start()
+        self.addCleanup(prepare.stop)
         args = argparse.Namespace(
             bundle=bundle, bundle_pass=None, bundle_sha256=None,
             bundle_cipher="aes-256-cbc", bundle_openssl_opt=[],
@@ -3584,7 +3587,8 @@ class TestArgumentRefusals(unittest.TestCase):
     def test_the_loose_files_resolve_when_they_are_all_there(self):
         inputs = self.resolve(dump=self.dump, properties=self.props,
                               skip_documents=True)
-        self.assertEqual(inputs["dump"], self.dump)
+        self.assertEqual(Path(inputs["dump"]).read_bytes(), Path(self.dump).read_bytes())
+        self.assertNotEqual(inputs["dump"], self.dump)
         self.assertIsNone(inputs["bundle_sha256"])
 
 

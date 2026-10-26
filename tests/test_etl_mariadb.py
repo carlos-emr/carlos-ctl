@@ -104,6 +104,47 @@ class TestCopyMariaDB(unittest.TestCase):
         self.assertEqual(self.target_count(), 0)
         self.assertTrue(self.state["done"])
 
+    def test_should_refuse_silent_float_narrowing_before_checkpoint(self):
+        self.plain("ALTER TABLE `{0}`.sample ADD COLUMN dose DOUBLE".format(self.src))
+        self.plain("ALTER TABLE `{0}`.sample ADD COLUMN dose FLOAT".format(self.dst))
+        self.plain("INSERT INTO `{0}`.sample VALUES (1,'first',0.1)".format(self.src))
+        self.entry["cols"].append("dose")
+        self.columns = o19etl.introspect_columns(self.plain, self.dst)["sample"]
+        with self.assertRaisesRegex(o19etl.QueryError, "no completion checkpoint"):
+            self.copy()
+        self.assertFalse(self.state.get("done"))
+
+    def test_should_pair_text_keys_using_target_collation(self):
+        for schema, collation in ((self.src, "utf8mb4_unicode_ci"), (self.dst, "utf8mb4_general_ci")):
+            self.plain("ALTER TABLE `{0}`.sample MODIFY id VARCHAR(20) CHARACTER SET utf8mb4 COLLATE {1} NOT NULL".format(schema, collation))
+        self.seed("('key','first')")
+        self.columns = o19etl.introspect_columns(self.plain, self.dst)["sample"]
+        self.copy()
+        self.assertTrue(self.state["done"])
+
+    def make_keyless(self):
+        self.plain("ALTER TABLE `{0}`.sample DROP PRIMARY KEY".format(self.src))
+        self.plain("ALTER TABLE `{0}`.sample DROP PRIMARY KEY, DROP INDEX uq_name".format(self.dst))
+
+    def test_should_verify_keyless_duplicate_rows_and_trailing_spaces(self):
+        self.make_keyless()
+        self.seed("(1,'note '),(1,'note ')")
+        self.copy()
+        self.assertTrue(self.state["done"])
+        self.plain("UPDATE `{0}`.sample SET name='note'".format(self.dst))
+        failures = o19etl.copy_multiset_parity(self.plain, "sample", self.entry, self.src, self.dst, self.columns)
+        self.assertTrue(any("CONTENT differs" in line for line in failures))
+
+    def test_should_verify_keyless_decimal_values_across_scale_widening(self):
+        self.make_keyless()
+        self.plain("ALTER TABLE `{0}`.sample ADD COLUMN dose DECIMAL(8,2)".format(self.src))
+        self.plain("ALTER TABLE `{0}`.sample ADD COLUMN dose DECIMAL(10,4)".format(self.dst))
+        self.plain("INSERT INTO `{0}`.sample VALUES (1,'first',1.40)".format(self.src))
+        self.entry["cols"].append("dose")
+        self.columns = o19etl.introspect_columns(self.plain, self.dst)["sample"]
+        self.copy()
+        self.assertTrue(self.state["done"])
+
     def test_should_preserve_a_completed_window_when_the_next_window_collides(self):
         self.entry["chunk_by"] = "id"
         last = o19etl.CHUNK_ROWS + 2

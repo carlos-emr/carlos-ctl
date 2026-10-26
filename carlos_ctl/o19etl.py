@@ -37,6 +37,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from . import o19digest, o19map_schema
 from .util import sql_escape, warn
 
+ETL_CONTRACT_VERSION = 2
+
 # a copy is windowed over the id RANGE, so a sparse id space costs
 # windows rather than rows. Beyond this the range is not a table's id
 # space any more and building the list alone would exhaust memory.
@@ -158,6 +160,23 @@ def double_encoded_predicate(expr: str) -> str:
 MOJIBAKE_MARKER_RE = "'[\\\\x{C3}\\\\x{C2}][\\\\x{80}-\\\\x{BF}]'"
 
 
+# Guard speculative conversions with target-side binary PCRE. Never HEX a
+# whole note: HEX doubles its size and can exceed max_allowed_packet even
+# when the value itself fits. These guards do not run on the old source DB.
+UTF8_BYTE_PATTERN = (
+    r"\A(?:[\x00-\x7F]|[\xC2-\xDF][\x80-\xBF]|"
+    r"\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|"
+    r"\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|"
+    r"[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2})*+\z")
+
+# MySQL/MariaDB latin1 is Windows-1252; these are its Unicode encodings.
+LATIN1_UTF8_BYTE_PATTERN = (
+    r"\A(?:[\x00-\x7F]|\xC2(?:[\xA0-\xBF]|[\x81\x8D\x8F\x90\x9D])|"
+    r"\xC3[\x80-\xBF]|\xC5[\x92\x93\xA0\xA1\xB8\xBD\xBE]|\xC6\x92|"
+    r"\xCB[\x86\x9C]|\xE2(?:\x80[\x93\x94\x98\x99\x9A\x9C\x9D\x9E"
+    r"\xA0\xA1\xA2\xA6\xB0\xB9\xBA]|\x82\xAC|\x84\xA2))*+\z")
+
+
 def repair_expr(expr: str) -> str:
     """Per-row conditional latin1->utf8mb4 repair: rows that are not
     provably double-encoded pass through untouched.
@@ -172,8 +191,15 @@ def repair_expr(expr: str) -> str:
     Converting the untouched branch too costs nothing (the target column
     is utf8mb4 and a latin1 value converts losslessly) and gives the
     CASE one character set and one derivation on every server."""
-    return "CASE WHEN {0} THEN {1} ELSE CONVERT({2} USING utf8mb4) END".format(
-        double_encoded_predicate(expr), REPAIR_TEMPLATE.format(expr), expr)
+    candidate = "CONVERT(CONVERT({0} USING utf8mb4) USING latin1)".format(expr)
+    return ("CASE WHEN BINARY CONVERT({2} USING utf8mb4) REGEXP '{5}' THEN "
+            "CASE WHEN BINARY {3} REGEXP '{4}' THEN "
+            "CASE WHEN {0} THEN {1} ELSE CONVERT({2} USING utf8mb4) END "
+            "ELSE CONVERT({2} USING utf8mb4) END "
+            "ELSE CONVERT({2} USING utf8mb4) END").format(
+        double_encoded_predicate(expr), REPAIR_TEMPLATE.format(expr), expr,
+        candidate, UTF8_BYTE_PATTERN.replace("\\", "\\\\"),
+        LATIN1_UTF8_BYTE_PATTERN.replace("\\", "\\\\"))
 
 
 # --------------------------------------------------------------------------
@@ -220,9 +246,7 @@ def introspect_columns(query, schema: str) -> Dict[str, Dict[str, dict]]:
             # and escapes inside them; MySQL 5.x reports the bare value.
             # The stored value is the VALUE, so a caller re-emitting it
             # escapes once rather than twice (see unquote_default).
-            value = unquote_default(value)
-        if value is not None and value.upper() == "NULL":
-            value = None
+            value = None if value.upper() == "NULL" else unquote_default(value)
         out.setdefault(t, {})[c] = {
             "type": dtype.lower(),
             "column_type": ctype,
@@ -785,6 +809,25 @@ def copy_statement(table: str, entry: dict, src_schema: str,
     return sql
 
 
+def target_key_expr(expr: str, info: dict) -> str:
+    """Interpret a source key with the destination column's comparisons."""
+    dtype = info.get("type")
+    if dtype in ("tinyint", "smallint", "mediumint", "int", "integer", "bigint", "bit"):
+        return "CAST({0} AS {1})".format(expr, "UNSIGNED" if "unsigned" in info.get("column_type", "").lower() or dtype == "bit" else "SIGNED")
+    if dtype in ("decimal", "numeric"):
+        match = re.search(r"\((\d+)\s*,\s*(\d+)\)", info.get("column_type", ""))
+        if match:
+            return "CAST({0} AS DECIMAL({1},{2}))".format(expr, *match.groups())
+    if dtype in ("float", "double", "real"):
+        return "CAST({0} AS {1})".format(expr, "FLOAT" if dtype == "float" else "DOUBLE")
+    if dtype in COLLATED_TYPES and info.get("charset") and info.get("collation"):
+        charset, collation = info["charset"], info["collation"]
+        if not (_CHARSET_NAME_RE.fullmatch(charset) and _CHARSET_NAME_RE.fullmatch(collation)):
+            raise ValueError("invalid target character set/collation metadata")
+        return "CONVERT({0} USING {1}) COLLATE {2}".format(expr, charset, collation)
+    return expr
+
+
 def merge_key_exprs(entry: dict, archive_schema: Optional[str] = None,
                     dst_cols: Optional[Dict[str, dict]] = None
                     ) -> List[str]:
@@ -803,6 +846,7 @@ def merge_key_exprs(entry: dict, archive_schema: Optional[str] = None,
                            if dst_cols and k in dst_cols else None)
         if dst_cols and k in dst_cols:
             expr = sanitize_expr(expr, dst_cols[k])
+            expr = target_key_expr(expr, dst_cols[k])
         out.append(expr)
     return out
 
@@ -1130,6 +1174,75 @@ def coercion_precheck_sql(table: str, entry: dict, src_schema: str,
                    "'{3}'".format(src_schema, table, src_name,
                                   NUMERIC_LITERAL_SQL_RE))
             out.append((c, sql))
+    return out
+
+
+def numeric_capacity_precheck_sql(table: str, entry: dict, src_schema: str,
+                                 dst_cols: Dict[str, dict],
+                                 src_cols: Dict[str, dict], repaired=None,
+                                 archive_schema=None) -> List[Tuple[str, str]]:
+    """Refuse range/scale loss before a live table or checkpoint changes.
+
+    Display widths such as INT(4) are not ranges. Signedness and DECIMAL
+    precision/scale are; compare the transformed source value to those bounds.
+    """
+    bits = {"tinyint": 8, "smallint": 16, "mediumint": 24,
+            "int": 32, "integer": 32, "bigint": 64}
+    out = []
+    for name in entry.get("cols", []):
+        target = dst_cols.get(name)
+        source = src_col(src_cols, entry.get("renames", {}).get(name, name))
+        if not target or not source or target["type"] not in NUMERIC_TYPES:
+            continue
+        if name in entry.get("fk_remap", {}) and not archive_schema:
+            # Surrogate IDs are checked once their parent map exists. The
+            # raw source ID may exceed the target while its mapped ID fits.
+            continue
+        dtype = target["type"]
+        ctype = target.get("column_type", dtype).lower()
+        unsigned = "unsigned" in ctype
+        scale = None
+        if dtype in bits:
+            width = bits[dtype]
+            lo, hi = (0, 2 ** width - 1) if unsigned else (-2 ** (width - 1), 2 ** (width - 1) - 1)
+            scale = 0
+        elif dtype in ("decimal", "numeric"):
+            match = re.search(r"\((\d+)\s*,\s*(\d+)\)", ctype)
+            if not match:
+                continue
+            precision, scale = map(int, match.groups())
+            hi = ("9" * (precision - scale) or "0") + (("." + "9" * scale) if scale else "")
+            lo = "0" if unsigned else "-" + hi
+        elif dtype in ("float", "double", "real"):
+            hi = "3.4028234663852886e38" if dtype == "float" else "1.7976931348623157e308"
+            lo = "0" if unsigned else "-" + hi
+        else:
+            continue
+        expr = source_expr(entry, name, repaired, archive_schema)
+        predicates = ["{0} < {1}".format(expr, lo), "{0} > {1}".format(expr, hi)]
+        if scale is not None:
+            predicates.append("{0} <> TRUNCATE({0}, {1})".format(expr, scale))
+        elif dtype == "float":
+            predicates.append("{0} <> CAST({0} AS FLOAT)".format(expr))
+        if dtype in ("float", "double", "real"):
+            source_type = source.get("type")
+            precision = scale_from_source = None
+            if source_type in bits:
+                precision, scale_from_source = 65, 0
+            elif source_type in ("decimal", "numeric"):
+                source_shape = re.search(r"\((\d+)\s*,\s*(\d+)\)", source.get("column_type", ""))
+                if source_shape:
+                    precision, scale_from_source = map(int, source_shape.groups())
+            elif source_type in STRING_TYPES and name not in entry.get("value_exprs", {}):
+                precision, scale_from_source = 65, 30
+                predicates.extend(["ABS({0} + 0) > 1e35".format(expr),
+                                   "({0} + 0 <> 0 AND ABS({0} + 0) < 1e-30)".format(expr)])
+            if precision is not None:
+                floating = "FLOAT" if dtype == "float" else "DOUBLE"
+                predicates.append("CAST(CAST({0} AS {1}) AS DECIMAL({2},{3})) <> CAST({0} AS DECIMAL({2},{3}))"
+                                  .format(expr, floating, precision, scale_from_source))
+        out.append((name, "SELECT COUNT(*) FROM `{0}`.`{1}` s WHERE {2} IS NOT NULL AND ({3})".format(
+            src_schema, table, expr, " OR ".join(predicates))))
     return out
 
 
@@ -2089,7 +2202,8 @@ def progress_path(state_dir: str) -> str:
 
 
 def load_progress(state_dir: str, dump_sha256: Optional[str] = None,
-                  schema_map_version: Optional[str] = None) -> Dict:
+                  schema_map_version: Optional[str] = None,
+                  etl_contract: Optional[int] = None) -> Dict:
     """The ETL checkpoint ledger, BOUND to the staged dump's digest and to
     the manifest that classified it. Readers that only inspect the ledger
     pass neither; the ETL passes both and refuses to continue a ledger
@@ -2139,6 +2253,10 @@ def load_progress(state_dir: str, dump_sha256: Optional[str] = None,
                 "over with one package version.".format(
                     recorded, schema_map_version))
         progress["schema_map_version"] = schema_map_version
+    if etl_contract is not None:
+        if (progress.get("tables") or progress.get("admin_provider_no")) and progress.get("etl_contract") != etl_contract:
+            die("the ETL implementation contract changed during this partial import; finish with the original package or restore the pre-import snapshot")
+        progress["etl_contract"] = etl_contract
     return progress
 
 
@@ -2518,6 +2636,13 @@ def etl_precheck_problems(ctx, plain, query, src_schema: str,
                     "stores as a number — the copy would store 0 for them; "
                     "curate a value_exprs entry or fix the source"
                     .format(table, col, n))
+        for col, sql in numeric_capacity_precheck_sql(
+                table, entry, src, dst_info[table], src_info[table],
+                repairs.get(table)):
+            n = int(query(sql)[0][0])
+            if n:
+                problems.append("{0}.{1}: {2} value(s) exceed the target numeric range, scale or precision — refusing a lossy conversion"
+                                .format(table, col, n))
     # the roles post-step's own preconditions, predicted from staging (the
     # tables involved are id-intact copies): refuse here, before the first
     # write, rather than after the whole copy
@@ -2996,6 +3121,33 @@ def etl_copy_table(run: 'EtlRun', table: str, entry: dict, tstate: dict,
     state_dir, progress = run.state_dir, run.progress
     counts, seed_group = run.counts, run.seed_group
     admin_user, admin_pn = run.admin_user, run.admin_pn
+    if not hasattr(run, "copy_primary_keys"):
+        run.copy_primary_keys = primary_key_columns(plain, dst)
+    key = run.copy_primary_keys.get(table) or []
+    pairable = bool(key) and all(column in entry["cols"] and column in dcols for column in key)
+
+    def insert_and_verify(window=None):
+        before = None if pairable else int(plain("SELECT COUNT(*) FROM `{0}`.`{1}`".format(dst, table))[0][0])
+        if not pairable and not window and before:
+            raise QueryError("{0}: keyless target already holds rows without a declared replacement policy; refusing before copy".format(table))
+        query(copy_statement(table, entry, src, dst, dcols, repaired, window, arch))
+        if pairable:
+            n = int(plain(copy_value_mismatch_sql(table, entry, src, dst, dcols, key,
+                repaired, arch, include_missing=True, window=window))[0][0])
+            if n:
+                raise QueryError("{0}: {1} copied row(s) differ from their declared values; no completion checkpoint recorded".format(table, n))
+        else:
+            condition = (" WHERE s.`{0}` > {1} AND s.`{0}` <= {2}".format(entry["chunk_by"], *window)
+                         if window else "")
+            expected = int(plain("SELECT COUNT(*) FROM `{0}`.`{1}` s{2}".format(src, table, condition))[0][0])
+            after = int(plain("SELECT COUNT(*) FROM `{0}`.`{1}`".format(dst, table))[0][0])
+            if after - before != expected:
+                raise QueryError("{0}: copied row count differs before checkpoint".format(table))
+            if before == 0 or window:
+                failures = copy_multiset_parity(plain, table, entry, src, dst, dcols, repaired, arch,
+                                               window=window)
+                if failures:
+                    raise QueryError("{0}: {1}; no completion checkpoint recorded".format(table, "; ".join(failures)))
     if entry.get("chunk_by"):
         chunk = entry["chunk_by"]
         bounds = plain(
@@ -3036,8 +3188,7 @@ def etl_copy_table(run: 'EtlRun', table: str, entry: dict, tstate: dict,
                 query(window_delete_statement(table, entry, dst,
                                               window))
                 resumed = False
-            query(copy_statement(table, entry, src, dst, dcols,
-                                 repaired, window, arch))
+            insert_and_verify(window)
             tstate["done_through"] = window[1]
             save_progress(state_dir, progress)
         tstate["done"] = True
@@ -3050,8 +3201,7 @@ def etl_copy_table(run: 'EtlRun', table: str, entry: dict, tstate: dict,
                 query("DELETE FROM `{0}`.`{1}`".format(dst, table))
             tstate["started"] = True
             save_progress(state_dir, progress)
-            query(copy_statement(table, entry, src, dst, dcols,
-                                 repaired, None, arch))
+            insert_and_verify()
             tstate["done"] = True
     save_progress(state_dir, progress)
     counts["copy"] += 1
@@ -3431,7 +3581,7 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
             arch, schema_collation(plain, dst)):
         plain(statement)
     progress = load_progress(state_dir, ctx.get("dump_sha256"),
-                             o19map_schema.SCHEMA_MAP_VERSION)
+                             o19map_schema.SCHEMA_MAP_VERSION, ETL_CONTRACT_VERSION)
     # The repair set goes in the ledger because P7's value-level check
     # rebuilds the copy's own expressions and must use the set THAT RAN.
     # Re-deriving it there would be a second scan that could disagree,
@@ -3533,6 +3683,12 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
 
         dcols = dst_info[table]
         repaired = repairs.get(table)
+        mapped = dict(entry, cols=[c for c in entry.get("cols", []) if c in entry.get("fk_remap", {})])
+        for col, sql in numeric_capacity_precheck_sql(
+                table, mapped, src, dcols, src_info[table], repaired, arch):
+            n = int(query(sql)[0][0])
+            if n:
+                raise QueryError("{0}.{1}: {2} mapped value(s) exceed the target numeric range, scale or precision; no table copy checkpoint recorded".format(table, col, n))
         # the shadow captures in etl_post_copy describe the manifest's own
         # view of this table, so they read the entry BEFORE the archived
         # columns are folded in -- otherwise a vendor-fork column stops
@@ -3635,7 +3791,7 @@ ROLES_STEP_TABLES = tuple(o19map_schema.REQUIRED_TABLES)
 
 
 def appended_row_count_sql(table: str, src_schema: str,
-                           dst_schema: str) -> Optional[str]:
+                           dst_schema: str, dst_cols=None) -> Optional[str]:
     """Counts target rows in `table` with no staging twin on the keys the
     roles post-step legitimately appends by, or None for a table it does
     not append to.
@@ -3645,7 +3801,7 @@ def appended_row_count_sql(table: str, src_schema: str,
     keys = APPENDED_ROW_KEYS.get(table)
     if not keys:
         return None
-    join = " AND ".join("d.`{0}` <=> s.`{0}`".format(k) for k in keys)
+    join = " AND ".join("d.`{0}` <=> {1}".format(k, target_key_expr("s.`{0}`".format(k), (dst_cols or {}).get(k, {}))) for k in keys)
     return ("SELECT COUNT(*) FROM `{0}`.`{1}` d WHERE NOT EXISTS (SELECT 1 "
             "FROM `{2}`.`{1}` s WHERE {3})".format(
                 dst_schema, table, src_schema, join))
@@ -3818,7 +3974,7 @@ def value_comparison(col: str, expr: str, dst_info: dict) -> str:
     a VERIFICATION has to compare.
 
     For a character column that means converting both sides to utf8mb4
-    and forcing `utf8mb4_bin`. MariaDB's default collation is
+    and comparing binary strings, including trailing spaces. MariaDB's default collation is
     `utf8mb4_general_ci`, and measured on 10.11 it folds BOTH accents and
     case: `'Santé' = 'Sante'` and `'SMITH' = 'smith'` are each 1 under
     it. A plain `<=>` would therefore report a faithful copy for a
@@ -3826,7 +3982,7 @@ def value_comparison(col: str, expr: str, dst_info: dict) -> str:
     corruption this check exists to find, and the one a latin1 ->
     utf8mb4 migration is most likely to produce. The CONVERT is what
     makes the two sides comparable at all (staging is latin1, the target
-    utf8mb4); the COLLATE is what makes the comparison mean equality.
+    utf8mb4); the binary comparison makes equality exact after conversion.
 
     Everything else keeps the plain `<=>`: it is NULL-safe, exact, and
     type-aware, and rendering a number or a date as text to compare it
@@ -3846,8 +4002,10 @@ def value_comparison(col: str, expr: str, dst_info: dict) -> str:
         return "({0} IS NULL OR {1} <=> {0})".format(expr, target)
     if dtype not in COLLATED_TYPES:
         return "{0} <=> {1}".format(target, expr)
-    return ("CONVERT({0} USING utf8mb4) COLLATE utf8mb4_bin <=> "
-            "CONVERT({1} USING utf8mb4) COLLATE utf8mb4_bin"
+    # A binary *collation* still has PAD SPACE semantics. Binary strings
+    # compare every converted byte, including trailing spaces in VARCHAR/TEXT.
+    return ("BINARY CONVERT({0} USING utf8mb4) <=> "
+            "BINARY CONVERT({1} USING utf8mb4)"
             .format(target, expr))
 
 
@@ -3876,7 +4034,9 @@ def copy_value_mismatch_sql(table: str, entry: dict, src_schema: str,
                             key: Sequence[str],
                             repaired: Optional[set] = None,
                             archive_schema: Optional[str] = None,
-                            select: Optional[str] = None) -> str:
+                            select: Optional[str] = None,
+                            include_missing: bool = False,
+                            window: Optional[Tuple[int, int]] = None) -> str:
     """Staging rows whose target twin does NOT hold the value the copy's
     own expression produced.
 
@@ -3907,14 +4067,63 @@ def copy_value_mismatch_sql(table: str, entry: dict, src_schema: str,
     # the JOIN uses the server's own equality, because that is what
     # decided which target row IS this staging row's twin; the value
     # comparison is stricter (see value_comparison)
-    join = " AND ".join("d.{0} <=> {1}".format(ident(k), expr(k))
+    join = " AND ".join("d.{0} <=> {1}".format(ident(k), target_key_expr(expr(k), dst_cols[k]))
                         for k in key)
     same = " AND ".join(value_comparison(c, expr(c), dst_cols[c])
                         for c in entry["cols"])
-    return ("SELECT {0} FROM `{1}`.`{2}` s JOIN `{3}`.`{2}` d ON {4} "
-            "WHERE NOT ({5})".format(
-                select or "COUNT(*)", src_schema, table, dst_schema,
-                join, same))
+    predicate = "NOT ({0})".format(same)
+    if include_missing:
+        predicate = "(d.{0} IS NULL OR {1})".format(ident(key[0]), predicate)
+    if window:
+        predicate += " AND s.{0} > {1} AND s.{0} <= {2}".format(ident(entry["chunk_by"]), *window)
+    return ("SELECT {0} FROM `{1}`.`{2}` s {6}JOIN `{3}`.`{2}` d ON {4} "
+            "WHERE {5}".format(select or "COUNT(*)", src_schema, table, dst_schema,
+                                join, predicate, "LEFT " if include_missing else ""))
+
+
+def copy_multiset_parity(query, table, entry, src, dst, dcols, repaired=None,
+                         archive_schema=None, window=None, allow_appended=False):
+    """Exact payload/multiplicity proof when rows have no addressable primary key.
+
+    Use the existing independently accumulated SHA lanes with bounded per-field
+    hashes. Normalize numeric scale to the target's declared type on both sides;
+    text retains every converted byte. SQL collations never decide hash equality.
+    """
+    columns = entry["cols"]
+    types = {column: dcols[column]["type"] for column in columns}
+    expected = {}
+    actual = {}
+    for column in columns:
+        info = dcols[column]
+        source = written_expr(entry, column, dcols, repaired, archive_schema)
+        stored = "d." + ident(column)
+        if info["type"] in NUMERIC_TYPES or info["type"] == "bit":
+            source = target_key_expr(source, info)
+            stored = target_key_expr(stored, info)
+        elif info["type"] in ("date", "datetime", "timestamp", "time"):
+            ctype = info.get("column_type", info["type"])
+            ctype = re.sub(r"^timestamp", "datetime", ctype, flags=re.I)
+            source = "CAST({0} AS {1})".format(source, ctype)
+            stored = "CAST({0} AS {1})".format(stored, ctype)
+        expected[column], actual[column] = source, stored
+    source_where = None
+    target_where = None
+    if window:
+        chunk = ident(entry["chunk_by"])
+        source_where = "s.{0} > {1} AND s.{0} <= {2}".format(chunk, *window)
+        target_where = "d.{0} > {1} AND d.{0} <= {2}".format(chunk, *window)
+    if allow_appended and table in APPENDED_ROW_KEYS:
+        keys = APPENDED_ROW_KEYS[table]
+        if not all(key in dcols and key in entry["cols"] for key in keys):
+            raise ValueError("cannot verify appended rows without the declared natural key")
+        join = " AND ".join("d.{0} <=> {1}".format(ident(key), target_key_expr(expected[key], dcols[key])) for key in keys)
+        target_where = "EXISTS (SELECT 1 FROM {0}.{1} s WHERE {2})".format(ident(src), ident(table), join)
+    digests = []
+    for schema, expressions, alias, condition in ((src, expected, "s", source_where), (dst, actual, "d", target_where)):
+        rows = query(o19digest.digest_sql(schema, table, columns, types, where=condition,
+                                          expressions=expressions, alias=alias))
+        digests.append(o19digest.Digest(*map(int, rows[0])))
+    return o19digest.compare(table, *digests)
 
 
 #: Copy- and merge-class tables whose MIGRATED ROWS a declared later
@@ -4013,7 +4222,15 @@ def copy_content_parity(plain_query, src_schema: str, dst_schema: str,
         reason = _unpairable_reason(table, entry, dst_keys.get(table) or [],
                                     dst_info[table])
         if reason:
-            unchecked(table, reason)
+            try:
+                failures = copy_multiset_parity(plain_query, table, entry, src_schema, dst_schema,
+                    dst_info[table], set(repairs.get(table) or ()), archive_schema, allow_appended=True)
+                if failures:
+                    bad.extend(failures)
+                else:
+                    ok.append("{0} (copy): exact multiset values and multiplicity match".format(table))
+            except (RuntimeError, ValueError, IndexError, TypeError) as exc:
+                bad.append("{0}: keyless values could not be verified ({1})".format(table, _query_reason(exc)))
             continue
         sql = copy_value_mismatch_sql(
             table, entry, src_schema, dst_schema, dst_info[table],
@@ -4183,7 +4400,8 @@ def merge_backfill_mismatch_sql(table: str, entry: dict, src_schema: str,
     them would report a mismatch the import cannot avoid."""
     archived = entry.get("archived_cols") or {}
     same = " AND ".join(
-        "d.{0} <=> s.{1}".format(ident(t), ident(src))
+        value_comparison(t, "s.{0}".format(ident(src)), dst_cols[t]) if dst_cols and t in dst_cols
+        else "d.{0} <=> s.{1}".format(ident(t), ident(src))
         for t, src in sorted(archived.items()))
     # `dst_cols` for the same reason archived_backfill_statement passes
     # it: merge_join sanitizes the key expressions only when it has the
@@ -4847,7 +5065,7 @@ def row_parity(plain_query, src_schema: str, dst_schema: str,
                 note = " (+{0} break-glass admin row(s))".format(admin_rows)
         if table in appended:
             recorded = int(appended[table])
-            sql = appended_row_count_sql(table, src_schema, dst_schema)
+            sql = appended_row_count_sql(table, src_schema, dst_schema, (dst_info or {}).get(table))
             twinless = int(plain_query(sql)[0][0]) if sql else 0
             expected += recorded
             note += " (+{0} synthesised row(s))".format(recorded)

@@ -586,10 +586,22 @@ Options:
 (default aes\-256\-cbc),
 .BR \-\-bundle-openssl-opt " OPT"
 (repeatable passthrough for legacy bundles, e.g. \-md then md5);
-.BR \-\-dump " FILE,"
-.BR \-\-documents " FILE,"
+.BR \-\-dump " FILE"
+(repeat for complementary full SQL dumps; identical table overlaps are restored
+once and conflicting overlaps are refused),
+.BR \-\-documents " FILE"
+(repeat in full/incremental restore order; later files replace earlier paths),
 .BR \-\-properties " FILE,"
 .BR \-\-o19-digests " FILE;"
+.PP
+Native OSCAR backups may contain nested files, multiple SQL parts and auxiliary
+artifacts. An optional format-1 o19-inputs.json selects dumps, properties,
+documents (in restore order) and digests when automatic roles are ambiguous.
+Source definitions stay in staging. Application columns and indexes follow the
+packaged Flyway schema; conversion diagnostics and value mismatches stop the
+import before its checkpoint. Resume binds the complete private source set and
+the target schema and ETL contracts.
+.PP
 .B \-\-skip-documents
 (needs
 .BR "\-\-accept no-documents" );

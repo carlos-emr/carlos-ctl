@@ -21,6 +21,7 @@ Run (from the repository root):
 """
 
 import unittest
+import re
 
 from carlos_ctl import o19etl, o19map_schema
 
@@ -57,15 +58,14 @@ class TestTheStatementPairsAndCompares(unittest.TestCase):
     def test_it_joins_staging_to_the_target_on_the_primary_key(self):
         sql = self.sql()
         self.assertIn("FROM `o19_import`.`t` s JOIN `carlos`.`t` d", sql)
-        self.assertIn("ON d.`id` <=> IFNULL(s.`id`, 0)", sql)
+        self.assertIn("ON d.`id` <=> CAST(IFNULL(s.`id`, 0) AS SIGNED)", sql)
 
     def test_it_counts_the_rows_whose_values_disagree(self):
         sql = self.sql()
         self.assertTrue(sql.startswith("SELECT COUNT(*)"))
         self.assertIn("WHERE NOT (d.`id` <=> IFNULL(s.`id`, 0) AND "
-                      "CONVERT(d.`name` USING utf8mb4) COLLATE "
-                      "utf8mb4_bin <=> CONVERT(s.`name` USING utf8mb4) "
-                      "COLLATE utf8mb4_bin)", sql)
+                      "BINARY CONVERT(d.`name` USING utf8mb4) <=> "
+                      "BINARY CONVERT(s.`name` USING utf8mb4))", sql)
 
     def test_the_comparison_is_null_safe(self):
         """A copied NULL must compare equal to the NULL that arrived. `=`
@@ -85,8 +85,8 @@ class TestTheStatementPairsAndCompares(unittest.TestCase):
                  "renames": {"isactive": "isActive"}}
         cols = dst_cols(id={"nullable": False}, isactive={})
         self.assertIn(
-            "CONVERT(d.`isactive` USING utf8mb4) COLLATE utf8mb4_bin <=> "
-            "CONVERT(s.`isActive` USING utf8mb4) COLLATE utf8mb4_bin",
+            "BINARY CONVERT(d.`isactive` USING utf8mb4) <=> "
+            "BINARY CONVERT(s.`isActive` USING utf8mb4)",
             self.sql(entry=entry, cols=cols))
 
     def test_a_curated_expression_is_the_one_the_copy_uses(self):
@@ -94,9 +94,8 @@ class TestTheStatementPairsAndCompares(unittest.TestCase):
                  "value_exprs": {"receivedDate": "s.`observationdate`"}}
         cols = dst_cols(id={"nullable": False}, receivedDate={})
         self.assertIn(
-            "CONVERT(d.`receivedDate` USING utf8mb4) COLLATE utf8mb4_bin "
-            "<=> CONVERT(s.`observationdate` USING utf8mb4) COLLATE "
-            "utf8mb4_bin", self.sql(entry=entry, cols=cols))
+            "BINARY CONVERT(d.`receivedDate` USING utf8mb4) "
+            "<=> BINARY CONVERT(s.`observationdate` USING utf8mb4)", self.sql(entry=entry, cols=cols))
 
     def test_a_zero_date_is_expected_as_the_null_the_copy_wrote(self):
         entry = {"class": "copy", "cols": ["id", "d"]}
@@ -112,7 +111,7 @@ class TestTheStatementPairsAndCompares(unittest.TestCase):
         sql = self.sql(entry=entry, cols=cols)
         self.assertIn("CASE WHEN s.`e` IS NULL THEN NULL WHEN s.`e` "
                       "IN ('a', 'b') THEN s.`e` ELSE NULL END", sql)
-        self.assertIn("CONVERT(d.`e` USING utf8mb4) COLLATE utf8mb4_bin",
+        self.assertIn("BINARY CONVERT(d.`e` USING utf8mb4)",
                       sql)
 
     def test_a_repaired_column_is_expected_repaired(self):
@@ -190,9 +189,12 @@ class Db(object):
         if "information_schema.STATISTICS" in sql:
             return [[t, c] for t in sorted(self.keys)
                     for c in self.keys[t]]
-        table = sql.split("`o19_import`.`", 1)[1].split("`", 1)[0]
+        table = re.search(r"`(?:o19_import|carlos)`\.`([^`]+)`", sql).group(1)
         if table in self.errors:
             raise RuntimeError("banner\n" + self.errors[table])
+        if "BIT_XOR(" in sql:
+            total = self.mismatches.get(table, 0) if "FROM `carlos`" in sql else 0
+            return [["1", str(total), "0", "0"]]
         return [[str(self.mismatches.get(table, 0))]]
 
 
@@ -225,30 +227,23 @@ class TestTheDriver(unittest.TestCase):
         self.assertEqual(ok, [])
         self.assertIn("3 copied row(s)", bad[0])
 
-    def test_a_table_with_no_primary_key_is_reported_unchecked(self):
-        """Named, not silently passed — "we could not look" and "we
-        looked and it was fine" are different answers. But not FAILED
-        either: a table with no primary key is a structural fact the
-        operator cannot change, and refusing it would block every import
-        rather than the unsound ones."""
+    def test_a_table_with_no_primary_key_is_verified_as_a_multiset(self):
         _db, (ok, bad) = self.drive(keys={})
         self.assertEqual(bad, [])
-        self.assertIn("NOT CHECKED", ok[0])
-        self.assertIn("no primary key", ok[0])
+        self.assertIn("exact multiset", ok[0])
 
-    def test_a_key_that_is_not_copied_is_reported_unchecked(self):
+    def test_a_key_that_is_not_copied_still_allows_payload_verification(self):
         entry = o19map_schema.TABLES[self.TABLE]
         cols = entry["cols"][:2]
         _db, (ok, bad) = self.drive(
             keys={self.TABLE: ["not_copied"]}, cols=cols + ["not_copied"])
         self.assertEqual(bad, [])
-        self.assertIn("not copied", ok[0])
+        self.assertIn("exact multiset", ok[0])
 
-    def test_an_unchecked_line_never_reads_as_a_verification(self):
-        """It lands in the PASSING list, so its wording is the only thing
-        stopping an operator reading it as "checked, and fine"."""
-        _db, (ok, _bad) = self.drive(keys={})
-        self.assertTrue(ok[0].startswith("NOT CHECKED"), ok[0])
+    def test_a_keyless_payload_change_is_a_failure(self):
+        _db, (ok, bad) = self.drive(keys={}, mismatches={self.TABLE: 1})
+        self.assertEqual(ok, [])
+        self.assertIn("CONTENT differs", bad[0])
 
     def test_a_failed_check_is_a_mismatch_not_a_pass(self):
         _db, (ok, bad) = self.drive(

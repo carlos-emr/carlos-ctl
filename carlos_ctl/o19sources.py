@@ -1,0 +1,351 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+"""Complete OSCAR dump sets, with checked table ownership before restore.
+
+Never concatenate overlapping dumps blindly: mysqldump emits DROP TABLE and
+the last copy would erase the first. Complementary tables are combined; an
+overlap is accepted only for identical schema/data statement fingerprints.
+All input bytes are retained in private snapshots. Ambiguous overlaps stop
+before the live schema is touched. Literals are never rewritten.
+"""
+import gzip
+import hashlib
+import json
+import os
+import shutil
+import tempfile
+import tarfile
+
+from . import o19sql
+
+FORMAT = 1
+TRAILER = b"-- Dump completed"
+
+
+def snapshot_file(path, destination):
+    """Copy an opened input atomically, including when source equals destination."""
+    incoming = destination + ".incoming"
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as source:
+            fd = os.open(incoming, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as dest:
+                os.fchmod(dest.fileno(), 0o600)
+                for chunk in iter(lambda: source.read(1 << 20), b""):
+                    digest.update(chunk)
+                    dest.write(chunk)
+                dest.flush()
+                os.fsync(dest.fileno())
+        os.replace(incoming, destination)
+    finally:
+        if os.path.exists(incoming):
+            os.unlink(incoming)
+    return digest.hexdigest()
+
+
+def statements(stream, spool_dir=None):
+    """Yield seekable statement files; large INSERTs spill to disk.
+
+    Semicolon boundaries come from the quote/comment-aware lexer. One trailing
+    comment fragment is yielded too, so dump completion markers survive.
+    """
+    lexer = o19sql.Lexer()
+    spool = tempfile.SpooledTemporaryFile(max_size=1 << 20, dir=spool_dir)
+    start = 0
+    position = 0
+    try:
+        while True:
+            chunk = stream.read(1 << 20)
+            lexer.feed(chunk, final=not chunk)
+            offset = 0
+            for boundary in lexer.boundaries:
+                take = boundary - position
+                spool.write(chunk[offset:take])
+                spool.seek(0)
+                yield spool
+                spool.close()
+                spool = tempfile.SpooledTemporaryFile(max_size=1 << 20, dir=spool_dir)
+                start = boundary
+                offset = take
+            spool.write(chunk[offset:])
+            position += len(chunk)
+            if not chunk:
+                if lexer.state not in ("sql", "line") or lexer.executable:
+                    raise ValueError("incomplete SQL statement (unclosed quote or comment)")
+                if position > start:
+                    spool.seek(0)
+                    yield spool
+                break
+    finally:
+        spool.close()
+
+
+def statement_info(statement):
+    """(verb, table, first keyword offset) without materializing INSERT data."""
+    statement.seek(0)
+    lexer = o19sql.Lexer()
+    tokens = []
+    while len(tokens) < 8:
+        chunk = statement.read(8192)
+        tokens.extend(lexer.feed(chunk, final=not chunk))
+        if not chunk:
+            break
+        if tokens and tokens[0][1].upper() not in (b"CREATE", b"DROP", b"INSERT", b"REPLACE", b"ALTER", b"LOCK"):
+            break
+    offset = lexer.first_token_position or 0
+    words = [(kind, value.decode("ascii", "replace")) for kind, value in tokens]
+    if not words:
+        return "", None, 0
+    upper = [value.upper() for _, value in words]
+    verb = upper[0]
+    index = None
+    if upper[:2] == ["CREATE", "TABLE"]:
+        index = 2
+        if upper[2:5] == ["IF", "NOT", "EXISTS"]:
+            index = 5
+    elif upper[:2] == ["DROP", "TABLE"]:
+        index = 2
+        if upper[2:4] == ["IF", "EXISTS"]:
+            index = 4
+    elif verb in ("INSERT", "REPLACE"):
+        if "INTO" in upper[:4]:
+            index = upper.index("INTO") + 1
+    elif upper[:2] in (["ALTER", "TABLE"], ["LOCK", "TABLES"]):
+        index = 2
+    if index is not None:
+        if index >= len(words) or words[index][0] not in ("word", "identifier"):
+            raise ValueError("cannot identify table in dump statement")
+        if index + 1 < len(words) and words[index + 1][1] == ".":
+            raise ValueError("schema-qualified dump statements need a database-only export (no --databases)")
+        return verb, words[index][1], offset
+    if verb in ("USE", "DELIMITER", "DELETE", "UPDATE", "TRUNCATE") or verb == "CREATE":
+        raise ValueError("unsupported {0} statement in dump set; export base tables without --databases, views, routines or triggers".format(verb))
+    return verb, None, offset
+
+
+def restore_chunks(stream, spool_dir=None):
+    """Restore original SQL with uniqueness enforced after dump SET controls.
+
+    mysqldump itself sets UNIQUE_CHECKS=0, overriding --init-command. Append
+    a separate control statement after session SET statements; never edit a
+    literal, INSERT or source file. Large statements remain disk-spooled.
+    """
+    for statement in statements(stream, spool_dir):
+        verb, _, offset = statement_info(statement)
+        if verb == "SET":
+            statement.seek(offset)
+            session_assignments(o19sql.Lexer().feed(statement.read(32768), final=True))
+        statement.seek(0)
+        for chunk in iter(lambda: statement.read(1 << 20), b""):
+            yield chunk
+        if verb == "SET":
+            yield b"\nSET SESSION UNIQUE_CHECKS=1;\n"
+
+
+def session_assignments(tokens):
+    """Relevant literal interpretation controls, excluding @OLD_* captures."""
+    result = {}
+    keys = {b"SQL_MODE", b"TIME_ZONE", b"CHARACTER_SET_CLIENT", b"COLLATION_CONNECTION", b"OLD_MODE"}
+    for index, (kind, value) in enumerate(tokens):
+        value = value.upper()
+        if kind != "word":
+            continue
+        if value == b"NAMES":
+            result["NAMES"] = tokens[index + 1:]
+        elif value in keys and index + 1 < len(tokens) and tokens[index + 1] == ("symbol", b"="):
+            if index and tokens[index - 1] == ("symbol", b"@"):
+                continue
+            end = index + 2
+            while end < len(tokens) and tokens[end] not in (("symbol", b","), ("symbol", b";")):
+                end += 1
+            assigned = tokens[index + 2:end]
+            if value == b"SQL_MODE" and any(kind == "string" and (
+                    b"NO_BACKSLASH_ESCAPES" in item.upper() or b"ANSI_QUOTES" in item.upper()) for kind, item in assigned):
+                raise ValueError("dump changes SQL quoting modes; export with ordinary mysqldump quoting (no ANSI_QUOTES or NO_BACKSLASH_ESCAPES)")
+            result[value.decode("ascii")] = assigned
+    return result
+
+
+def inventory(path):
+    tables = {}
+    created = set()
+    opener = gzip.open if path.endswith(".gz") else open
+    tail = b""
+    session = {}
+    with opener(path, "rb") as stream:
+        for statement in statements(stream, os.path.dirname(path)):
+            verb, table, offset = statement_info(statement)
+            if verb == "SET":
+                statement.seek(offset)
+                value = statement.read(32768)
+                tokens = o19sql.Lexer().feed(value, final=True)
+                session.update(session_assignments(tokens))
+            # Ignore comments surrounding statements, locks, and key-disable
+            # wrappers. Compare the actual CREATE and INSERT/REPLACE bytes.
+            wrapper = False
+            if verb == "ALTER":
+                statement.seek(offset)
+                tokens = o19sql.Lexer().feed(statement.read(32768), final=True)
+                wrapper = len(tokens) == 6 and [value.upper() for _, value in tokens[3:5]] in ([b"DISABLE", b"KEYS"], [b"ENABLE", b"KEYS"])
+            if table and (verb in ("CREATE", "INSERT", "REPLACE") or (verb == "ALTER" and not wrapper)):
+                if verb == "CREATE":
+                    if table in created:
+                        raise ValueError("table {0!r} is defined twice within one dump".format(table))
+                    created.add(table)
+                digest = tables.setdefault(table, hashlib.sha256())
+                digest.update(repr(sorted(session.items())).encode("ascii"))
+                statement.seek(offset)
+                for chunk in iter(lambda: statement.read(1 << 20), b""):
+                    digest.update(chunk)
+            statement.seek(0)
+            for chunk in iter(lambda: statement.read(1 << 20), b""):
+                tail = (tail + chunk)[-8192:]
+    if TRAILER not in tail:
+        raise ValueError("dump part lacks its completion trailer; obtain a complete export")
+    if set(tables) != created:
+        raise ValueError("dump part has table data without a CREATE TABLE definition")
+    return {table: digest.hexdigest() for table, digest in sorted(tables.items())}
+
+
+def prepare_dump_set(paths, workdir):
+    """Snapshot, inventory and combine two or more dumps; return paths/provenance.
+
+    A single dump retains the established interface. For multiple dumps the
+    output contains one owner for each table, with each part's session prelude
+    and epilogue intact. File order and all part digests are bound to the run.
+    """
+    if not paths:
+        raise ValueError("no SQL dump selected")
+    os.makedirs(workdir, mode=0o700, exist_ok=True)
+    parts = []
+    owners = {}
+    duplicates = []
+    for number, path in enumerate(paths):
+        size = os.path.getsize(path)
+        if shutil.disk_usage(workdir).free < size:
+            raise ValueError("insufficient disk to snapshot the complete SQL dump set")
+        snapshot = os.path.join(workdir, "part-{0:03d}.sql{1}".format(number, ".gz" if path.endswith(".gz") else ""))
+        digest = snapshot_file(path, snapshot)
+        tables = inventory(snapshot) if len(paths) > 1 else {}
+        for table, fingerprint in tables.items():
+            if table in owners:
+                previous, previous_fingerprint = owners[table]
+                if fingerprint != previous_fingerprint:
+                    raise ValueError("overlapping table {0!r} differs between dump parts {1} and {2}; select one consistent snapshot"
+                                     .format(table, previous + 1, number + 1))
+                duplicates.append({"table": table, "part": number, "owner": previous})
+            else:
+                owners[table] = number, fingerprint
+        parts.append({"name": os.path.basename(path), "sha256": digest,
+                      "snapshot": snapshot, "tables": tables})
+    if len(paths) == 1:
+        return {"dump": parts[0]["snapshot"], "parts": [
+            {"name": parts[0]["name"], "sha256": parts[0]["sha256"]}], "duplicates": []}
+    dest_path = os.path.join(workdir, "combined.sql")
+    incoming = dest_path + ".incoming"
+    fd = os.open(incoming, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as dest:
+            os.fchmod(dest.fileno(), 0o600)
+            for number, part in enumerate(parts):
+                opener = gzip.open if part["snapshot"].endswith(".gz") else open
+                with opener(part["snapshot"], "rb") as source:
+                    for statement in statements(source, workdir):
+                        verb, table, _ = statement_info(statement)
+                        if table and owners[table][0] != number:
+                            continue
+                        statement.seek(0)
+                        shutil.copyfileobj(statement, dest, 1 << 20)
+                        dest.write(b"\n")
+            dest.write(b"\n-- Dump completed (complete OSCAR dump set)\n")
+            dest.flush()
+            os.fsync(dest.fileno())
+        os.replace(incoming, dest_path)
+    finally:
+        if os.path.exists(incoming):
+            os.unlink(incoming)
+    provenance = {"format": FORMAT, "parts": [
+        {key: value for key, value in part.items() if key != "snapshot"} for part in parts],
+        "duplicates": duplicates}
+    with open(os.path.join(workdir, "sources.json"), "w", encoding="utf-8") as document:
+        os.fchmod(document.fileno(), 0o600)
+        json.dump(provenance, document, sort_keys=True, indent=2)
+    return {"dump": dest_path, "parts": provenance["parts"], "duplicates": duplicates}
+
+
+def prepare_documents(paths, workdir):
+    """Combine full plus incremental document archives in explicit input order.
+
+    The last occurrence of a path wins, as in OSCAR's documented restore.
+    Emit one tar member per final path so P5's duplicate-path checks remain
+    meaningful. All input digests and order belong to the provenance.
+    """
+    if not paths:
+        return {"documents": None, "parts": []}
+    os.makedirs(workdir, mode=0o700, exist_ok=True)
+    snapshots = []
+    parts = []
+    for number, path in enumerate(paths):
+        if shutil.disk_usage(workdir).free < os.path.getsize(path):
+            raise ValueError("insufficient disk to snapshot the documents backup set")
+        snapshot = os.path.join(workdir, "documents-{0:03d}.tar{1}".format(number, ".gz" if path.endswith(".gz") else ""))
+        digest = snapshot_file(path, snapshot)
+        snapshots.append(snapshot)
+        parts.append({"name": os.path.basename(path), "sha256": digest})
+    paths = snapshots
+    if len(paths) == 1:
+        return {"documents": paths[0], "parts": parts}
+    from . import o19bundle, o19docs
+    os.makedirs(workdir, mode=0o700, exist_ok=True)
+    owners = {}
+    context = None
+    prefixes = []
+    document_directories = {"document", "eform", "form", "hrm", "billing", "measurementMap",
+                            "intake", "tickler", "image", "document_cache", "incoming", "outgoing"}
+    required = 0
+    for number, path in enumerate(paths):
+        entries = o19bundle.read_tar_entries(path, path.endswith(".gz"))
+        o19bundle.validate_tar_members([(kind, name) for kind, name, _ in entries], allow_dirs=True)
+        # Native incremental backups are made from INSIDE oscar/, unlike
+        # full document backups. Recognize their known context subdirectories.
+        tops = {os.path.normpath(name).split("/")[0] for kind, name, _ in entries
+                if kind == o19bundle.TAR_TYPE_FILE}
+        prefix = ""
+        if context and tops and tops <= document_directories:
+            prefix = context
+        else:
+            current = o19docs.detect_context_dir([(kind, name) for kind, name, _ in entries])
+            if context and context != current:
+                raise ValueError("document backup parts use different context directories")
+            context = current
+        prefixes.append(prefix)
+        for kind, name, size in entries:
+            if kind == o19bundle.TAR_TYPE_FILE:
+                owners[os.path.join(prefix, os.path.normpath(name))] = number, size
+    required = sum(size for _, size in owners.values()) + len(owners) * 1024 + 10240
+    if shutil.disk_usage(workdir).free < required:
+        raise ValueError("insufficient disk to prepare the complete documents backup set")
+    output = os.path.join(workdir, "documents.tar")
+    incoming = output + ".incoming"
+    fd = os.open(incoming, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as dest, tarfile.open(fileobj=dest, mode="w") as combined:
+            os.fchmod(dest.fileno(), 0o600)
+            for number, path in enumerate(paths):
+                with tarfile.open(path, mode="r|*") as source:
+                    for member in source:
+                        key = os.path.join(prefixes[number], os.path.normpath(member.name))
+                        if member.isfile() and owners.get(key, (None,))[0] == number:
+                            member.name = key
+                            member.uid = member.gid = 0
+                            member.uname = member.gname = ""
+                            member.mode = 0o600
+                            with source.extractfile(member) as content:
+                                combined.addfile(member, content)
+            dest.flush()
+            os.fsync(dest.fileno())
+        os.replace(incoming, output)
+    finally:
+        if os.path.exists(incoming):
+            os.unlink(incoming)
+    return {"documents": output, "parts": parts}

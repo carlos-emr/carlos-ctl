@@ -7,8 +7,24 @@ import os
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from carlos_ctl import validate
+
+
+class TestImportStatus(unittest.TestCase):
+    def test_active_import_does_not_wait_for_application_start(self):
+        with patch.object(validate, "need_root"), patch.object(validate.config, "load", return_value=SimpleNamespace(server_name="review.invalid")), \
+                patch.object(validate, "_package_versions", return_value=[]), \
+                patch.object(validate, "_check_import_state", return_value=True), \
+                patch.object(validate.time, "sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(validate.cmd_check([]), 1)
+            sleep.assert_not_called()
+
+    def test_shared_guard_controls_the_status(self):
+        with patch.object(validate.os.path, "exists", return_value=True), \
+                patch.object(validate, "run", return_value=subprocess.CompletedProcess([], 0)):
+            self.assertFalse(validate._check_import_state())
 
 
 class TestProcessOwnership(unittest.TestCase):

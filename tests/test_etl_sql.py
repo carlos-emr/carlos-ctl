@@ -345,9 +345,9 @@ class TestSurrogateIdRemap(unittest.TestCase):
                                      "dst", self.DST, archive_schema="arch")
         # the anti-join compares the SAME expression the insert writes
         # (the nullable column maps to NULL when unmapped, on both sides)
-        self.assertIn("d.`lookupListId` <=> (SELECT m.new_id FROM "
+        self.assertIn("d.`lookupListId` <=> CAST((SELECT m.new_id FROM "
                       "`arch`.`LookupList__idmap` m WHERE m.old_id = "
-                      "s.`lookupListId`)", sql)
+                      "s.`lookupListId`) AS SIGNED)", sql)
         self.assertIn("d.`value` <=> s.`value`", sql)
         self.assertTrue(sql.endswith("ORDER BY s.`id`"))
 
@@ -1097,10 +1097,10 @@ class TestCharsetRepairPredicate(unittest.TestCase):
         # normalised to utf8mb4 before comparing (latin1 staging tables)
         self.assertIn("LENGTH(CONVERT(s.`note` USING utf8mb4)) <> "
                       "CHAR_LENGTH(CONVERT(s.`note` USING utf8mb4))", expr)
-        # doubled backslashes in the SQL text (the server's string parser
-        # eats one before the regex engine sees the escape)
-        # no REGEXP: the Spencer engine of MySQL < 8 misreads a \x class
-        self.assertNotIn("REGEXP", expr)
+        # The source-compatible predicate avoids Unicode regex escapes;
+        # target-only guards validate binary bytes before speculative conversion.
+        self.assertNotIn("REGEXP", o19etl.double_encoded_predicate("s.`note`"))
+        self.assertIn(o19etl.UTF8_BYTE_PATTERN.replace("\\", "\\\\"), expr)
         self.assertIn("CONVERT(BINARY CONVERT(s.`note` USING latin1) USING "
                       "utf8mb4)", expr)
         # the untouched branch is converted too: a raw latin1 column

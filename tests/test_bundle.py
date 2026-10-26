@@ -51,29 +51,25 @@ class TestClassifyMembers(unittest.TestCase):
     def test_two_digest_files_are_ambiguous(self):
         with self.assertRaises(ValueError) as cm:
             o19bundle.classify_members(
-                self.GOOD + ["a.json", "b.json"])
+                self.GOOD + ["a.o19-digests.json", "b.o19-digests.json"])
         self.assertIn("at most one", str(cm.exception))
 
-    def test_two_dumps_are_ambiguous(self):
-        with self.assertRaises(ValueError) as cm:
-            o19bundle.classify_members(self.GOOD + ["extra.sql"])
-        self.assertIn("exactly one", str(cm.exception))
+    def test_multiple_dumps_are_a_set_to_be_verified(self):
+        roles = o19bundle.classify_members(self.GOOD + ["extra.sql"])
+        self.assertEqual(roles["dumps"], ["o19.sql.gz", "extra.sql"])
 
     def test_missing_properties_is_refused(self):
         with self.assertRaises(ValueError):
             o19bundle.classify_members(["o19.sql.gz",
                                         "o19-documents.tar.gz"])
 
-    def test_unknown_member_is_refused(self):
-        with self.assertRaises(ValueError) as cm:
-            o19bundle.classify_members(self.GOOD + ["notes.txt"])
-        self.assertIn("unrecognized", str(cm.exception))
+    def test_unrelated_backup_artifact_is_preserved(self):
+        roles = o19bundle.classify_members(self.GOOD + ["notes.txt"])
+        self.assertIn("notes.txt", roles["extras"])
 
-    def test_pathed_member_is_refused(self):
-        with self.assertRaises(ValueError) as cm:
-            o19bundle.classify_members(["sub/o19.sql.gz",
-                                        "oscar.properties"])
-        self.assertIn("path", str(cm.exception))
+    def test_nested_backup_members_are_recognized(self):
+        roles = o19bundle.classify_members(["sub/o19.sql.gz", "oscar.properties"])
+        self.assertEqual(roles["dump"], "sub/o19.sql.gz")
 
     def test_traversal_member_is_refused(self):
         with self.assertRaises(ValueError):
@@ -227,7 +223,7 @@ class TestTarListingAndMemberTypes(unittest.TestCase):
         # the dump and blow up later in sha256_file
         with self.assertRaises(ValueError) as cm:
             o19bundle.classify_members(["o19.sql/", "oscar.properties"])
-        self.assertIn("directory", str(cm.exception))
+        self.assertIn("no EMR", str(cm.exception))
 
 
 class TestTarEntriesFromHeaders(unittest.TestCase):
@@ -266,6 +262,13 @@ class TestTarEntriesFromHeaders(unittest.TestCase):
             o19bundle.validate_tar_members(
                 [(k, n) for k, n, _ in entries], allow_dirs=True)
         self.assertIn("not a plain file", str(cm.exception))
+
+    def test_native_embedded_documents_allow_mixed_cosmetic_prefixes(self):
+        members = o19bundle.classify_members([
+            "./backup/oscar/oscar.properties", "backup/oscar.sql",
+            "backup/oscar/document/report.pdf"])
+        self.assertEqual(members["embedded_documents"], ["backup/oscar/document/report.pdf"])
+        self.assertEqual(members["document_context"], "backup/oscar")
 
     def test_a_dot_built_bundle_extracts(self):
         # `tar -C dir -czf bundle .` is the ordinary way to build one: it
@@ -479,13 +482,13 @@ class TestOpenBundleEndToEnd(unittest.TestCase):
                                   pass_spec="file:" + self.passfile)
 
     def test_refusal_after_decryption_leaves_no_plaintext_behind(self):
-        # two dumps: classified as ambiguous AFTER the decrypt; the
+        # Missing properties is refused AFTER the decrypt; the
         # plaintext tar must not survive the refusal in the workdir
         with open(os.path.join(self.src, "other.sql"), "w") as fh:
             fh.write("-- second dump\n")
         plain = os.path.join(self.work, "two.tar")
         subprocess.check_call(["tar", "-C", self.src, "-cf", plain,
-                               "o19.sql", "other.sql", "oscar.properties"])
+                               "o19.sql", "other.sql"])
         enc = plain + ".enc"
         self._enc(plain, enc)
         dest = tempfile.mkdtemp(dir=self.work)

@@ -448,13 +448,12 @@ class TestVerdicts(unittest.TestCase):
                       "dropped-columns", "olis-gone", "charset-repair"])
         self.assertEqual(report["verdict"], "no-go")
 
-    def test_encrypted_notes_are_a_hard_no_go(self):
-        # judged on the rows: a note with a password is stored encrypted
+    def test_locked_notes_are_a_hard_no_go(self):
         props = clean_props()
         report = pf.run_checks(
             FakeDb(base_tables(),
                    where_counts={("casemgmt_note",
-                                  "password IS NOT NULL"): 3}),
+                                  "locked = '1'"): 3}),
             properties=props)
         self.assertEqual(report["verdict"], "no-go")
         ids = {f["id"]: f for f in report["findings"]}

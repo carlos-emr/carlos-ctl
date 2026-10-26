@@ -1,31 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 CARLOS Contributors
-"""--bundle handling for the OSCAR 19 importer (experimental).
+"""Migration bundles and native OSCAR full backups.
 
-A bundle is ONE archive holding the migration inputs at its ROOT, paths
-trimmed: the database dump (*.sql / *.sql.gz), optionally the
-OscarDocument tar (*.tar / *.tar.gz), the clinic's *.properties file and,
-optionally, the clinic-side content digests (*.json, written by
-`o19_preflight.py --digests`) that P2 compares the restored staging
-schema against.
-Accepted bundle names: *.tar, *.tar.gz, *.tar.enc, *.tar.gz.enc — .enc means
-openssl password-based symmetric encryption (canonical creation command in
-docs/o19-import-deb.md; default derivation -pbkdf2 -iter 200000).
+SQL parts form a verified source set; identical overlapping tables are restored
+once and conflicting overlap is refused. Nested backup documents and auxiliary
+artifacts are retained. An optional o19-inputs.json declares ambiguous roles and
+the order of full/incremental document archives.
 
-Design rules (migration plan §"--bundle"):
- - member identification is by extension and AMBIGUITY IS A HARD ERROR —
-   never guess which of two .sql files is the dump;
- - tar members with path separators or '..' are refused (no traversal from
-   a clinic-supplied archive);
- - a wrong password/derivation NEVER fails silently: openssl's exit code or
-   a failed tar magic check aborts with the two usual causes and their
-   --bundle-openssl-opt remedies spelled out.
-
-Pure classification/command-construction functions live up top (unit
-tested); the thin execution helpers at the bottom go through util.run.
+Accepted outer archives are .tar, .tar.gz and encrypted .enc variants. Encryption
+uses the documented openssl derivation; decryption and tar checks must succeed.
+Members may have safe nested paths. Traversal, links and special files are
+refused, and extracted clinic files remain private.
 """
 
 import hashlib
+import json
 import os
 import shutil
 import stat
@@ -98,86 +87,94 @@ def _strip_dot_slash(name: str) -> str:
     return name
 
 
-def classify_members(names: List[str]) -> Dict[str, Optional[str]]:
-    """Map tar member names to their roles; hard error on anything odd.
+def classify_members(names: List[str]) -> Dict[str, object]:
+    """Recognize both migration bundles and native OSCAR full backups.
 
-    Returns {"dump": name, "documents": name-or-None, "properties": name,
-    "digests": name-or-None} with the names EXACTLY as the archive stores
-    them (a `./` prefix included), because those are what tar must be
-    given to extract them; the file each one lands at is the name with
-    that prefix removed.
-
-    `digests` is optional because a clinic may have run an older
-    assessment, or declined the extra full scan. Its ABSENCE is reported
-    by the import (the P2 content check cannot run without it) rather
-    than refused here -- but a bundle carrying two of them is ambiguous,
-    and ambiguity is a hard error like every other member role.
+    Multiple EMR SQL parts are a set, verified before staging by o19sources.
+    Auxiliary drugref SQL and unrelated backup artifacts are retained without
+    becoming EMR input. Native full backups keep their documents inside the
+    context directory rather than in a second tar.
     """
-    problems: List[str] = []
-    dumps: List[str] = []
-    docs: List[str] = []
-    props: List[str] = []
-    digests: List[str] = []
-    unknown: List[str] = []
-    for raw in names:
-        if raw.endswith("/") or not raw:
-            # a directory entry (or an empty name) can never be one of the
-            # named inputs — refusing it here keeps the later chmod/sha256
-            # from ever touching a directory
-            problems.append("member '{0}' is a directory — bundle members "
-                            "must be the named plain files at the archive "
-                            "root".format(raw))
-            continue
-        name = _strip_dot_slash(raw)
-        if "/" in name:
-            problems.append("member '{0}' carries a path — bundle members "
-                            "must sit at the archive root with paths "
-                            "trimmed".format(raw))
-            continue
-        if name.startswith("."):
-            problems.append("member '{0}' is a dot-file — the bundle holds "
-                            "the named inputs only".format(raw))
-            continue
-        if name.startswith("-"):
-            # a name that looks like an option must never reach tar's
-            # argv, even behind the "--" separator used at extraction
-            problems.append("member '{0}' starts with '-' — refused"
-                            .format(raw))
-            continue
-        # classified on the normalised name, but the ARCHIVE's own name
-        # is what goes back to tar: `tar -xzf b.tar.gz -- o19.sql.gz`
-        # does not match a member stored as `./o19.sql.gz`
-        if name.endswith(".sql") or name.endswith(".sql.gz"):
-            dumps.append(raw)
-        elif name.endswith(".tar") or name.endswith(".tar.gz"):
-            docs.append(raw)
-        elif name.endswith(".properties"):
-            props.append(raw)
-        elif name.endswith(".json"):
-            digests.append(raw)
-        else:
-            unknown.append(raw)
-    if len(dumps) != 1:
-        problems.append("expected exactly one *.sql/*.sql.gz dump, found "
-                        "{0}: {1}".format(len(dumps), dumps or "none"))
-    if len(docs) > 1:
-        problems.append("expected at most one documents *.tar/*.tar.gz, "
-                        "found {0}: {1}".format(len(docs), docs))
+    files = [name for name in names if name and not name.endswith("/")]
+    for raw in files:
+        clean = _strip_dot_slash(raw)
+        if clean.startswith(("/", "-")) or ".." in clean.split("/"):
+            raise ValueError("invalid bundle member path: {0}".format(raw))
+    document_subdirs = {"document", "eform", "hrm", "image", "templates"}
+    sql = [name for name in files if name.endswith((".sql", ".sql.gz"))
+           and not document_subdirs.intersection(_strip_dot_slash(name).split("/")[:-1])]
+    auxiliary = [name for name in sql if os.path.basename(name).lower().startswith("drugref")
+                 or os.path.basename(name).lower() in ("mysql.sql", "mysql.sql.gz", "sys.sql", "sys.sql.gz")]
+    dumps = [name for name in sql if name not in auxiliary]
+    props = [name for name in files if os.path.basename(name).lower() in ("oscar.properties", "carlos.properties")]
+    if not props:
+        props = [name for name in files if name.endswith(".properties")]
+    if props:
+        depth = min(_strip_dot_slash(name).count("/") for name in props)
+        props = [name for name in props if _strip_dot_slash(name).count("/") == depth]
+    if not dumps:
+        raise ValueError("bundle contains no EMR *.sql/*.sql.gz dump")
     if len(props) != 1:
-        problems.append("expected exactly one *.properties file, found "
-                        "{0}: {1}".format(len(props), props or "none"))
+        raise ValueError("expected exactly one deployed properties file, found {0}".format(len(props)))
+    docs = [name for name in files if name.endswith((".tar", ".tar.gz"))]
+    digests = [name for name in files if os.path.basename(name).lower() in ("o19-digests.json", "o19_digests.json", "digests.json")
+               or name.lower().endswith(".o19-digests.json")]
+    descriptors = [name for name in files if os.path.basename(name) == "o19-inputs.json"]
+    if len(descriptors) > 1:
+        raise ValueError("expected at most one o19-inputs.json descriptor")
     if len(digests) > 1:
-        problems.append("expected at most one content-digest *.json, "
-                        "found {0}: {1}".format(len(digests), digests))
-    if unknown:
-        problems.append("unrecognized member(s): {0} — a bundle carries "
-                        "only the dump, the documents tar, the properties "
-                        "file and the content digests".format(unknown))
-    if problems:
-        raise ValueError("bundle rejected:\n  " + "\n  ".join(problems))
-    return {"dump": dumps[0], "documents": docs[0] if docs else None,
-            "properties": props[0],
-            "digests": digests[0] if digests else None}
+        raise ValueError("expected at most one content-digest document")
+    selected = set(dumps + docs + props + digests)
+    extras = [name for name in files if name not in selected]
+    root = os.path.dirname(_strip_dot_slash(props[0]))
+    embedded = []
+    if root:
+        for name in extras:
+            clean = _strip_dot_slash(name)
+            if not clean.startswith(root + "/") or name in auxiliary:
+                continue
+            relative = clean[len(root) + 1:]
+            if "/" in relative or not relative.endswith((".war", ".sh", ".log", ".json")):
+                embedded.append(name)
+    if docs and embedded and not descriptors:
+        raise ValueError("bundle mixes embedded documents and documents archives; select an explicit document backup set")
+    if len(docs) > 1 and not descriptors:
+        # Filename order is not proof of an incremental restore order.
+        raise ValueError("multiple documents archives require o19-inputs.json to declare their full/incremental order")
+    if len(dumps) == 1 and len(docs) <= 1 and not extras and not embedded:
+        return {"dump": dumps[0], "documents": docs[0] if docs else None,
+                "properties": props[0], "digests": digests[0] if digests else None}
+    result = {"dump": dumps[0], "documents": docs[0] if docs else None,
+              "properties": props[0], "digests": digests[0] if digests else None,
+              "dumps": dumps, "document_parts": docs, "extras": extras}
+    if embedded:
+        result["embedded_documents"] = embedded
+        result["document_context"] = root
+    return result
+
+
+def input_manifest_roles(document, names):
+    """Versioned explicit roles/order for an otherwise ambiguous native tar."""
+    if not isinstance(document, dict) or type(document.get("format")) is not int or document["format"] != 1:
+        raise ValueError("o19-inputs.json must have format 1")
+    dumps = document.get("dumps")
+    docs = document.get("documents", [])
+    props = document.get("properties")
+    digests = document.get("digests")
+    if not isinstance(dumps, list) or not dumps or not isinstance(docs, list) or not isinstance(props, str):
+        raise ValueError("o19-inputs.json requires dumps[], properties and optionally documents[]/digests")
+    selected = dumps + docs + [props] + ([digests] if digests else [])
+    if any(not isinstance(name, str) or name not in names for name in selected):
+        raise ValueError("o19-inputs.json names a missing or invalid archive member")
+    if len(set(selected)) != len(selected):
+        raise ValueError("o19-inputs.json assigns one file more than one role")
+    if any(not name.endswith((".sql", ".sql.gz")) for name in dumps) or any(not name.endswith((".tar", ".tar.gz")) for name in docs):
+        raise ValueError("o19-inputs.json dump/document roles have incorrect file types")
+    if not props.endswith(".properties") or (digests and not digests.endswith(".json")):
+        raise ValueError("o19-inputs.json properties/digests roles have incorrect file types")
+    return {"dump": dumps[0], "dumps": dumps, "properties": props,
+            "documents": docs[0] if docs else None, "document_parts": docs,
+            "digests": digests, "extras": [name for name in names if name not in selected]}
 
 
 #: what reading a clinic archive raises that does NOT descend from
@@ -557,9 +554,22 @@ def _open_bundle(bundle: str, tar_path: str, workdir: str, encrypted: bool,
         die("cannot read the bundle's contents ({0}) — the archive is "
             "corrupt or truncated".format(exc))
     try:
-        names = validate_tar_members(
-            [(kind, name) for kind, name, _ in entries], allow_dirs=False)
-        members = classify_members(names)
+        validate_tar_members(
+            [(kind, name) for kind, name, _ in entries], allow_dirs=True)
+        descriptors = [name for kind, name, _ in entries
+                       if kind == TAR_TYPE_FILE and os.path.basename(name) == "o19-inputs.json"]
+        if len(descriptors) > 1:
+            raise ValueError("expected at most one o19-inputs.json descriptor")
+        if descriptors:
+            with tarfile.open(tar_path, mode="r:*") as archive:
+                descriptor = archive.getmember(descriptors[0])
+                if descriptor.size > 1 << 20:
+                    raise ValueError("o19-inputs.json exceeds 1 MiB")
+                with archive.extractfile(descriptor) as content:
+                    document = json.load(content)
+            members = input_manifest_roles(document, [name for kind, name, _ in entries if kind == TAR_TYPE_FILE])
+        else:
+            members = classify_members([name for kind, name, _ in entries if kind == TAR_TYPE_FILE])
     except ValueError as exc:
         die(str(exc))
     # the headers know the expanded size: refused before extraction fills
@@ -577,9 +587,14 @@ def _open_bundle(bundle: str, tar_path: str, workdir: str, encrypted: bool,
     # from a clinic-authored archive
     # "--" ends option parsing: member names are positional data, never
     # options (validate_tar_members refuses dash-prefixed names as well)
+    selected = set()
+    for value in members.values():
+        if isinstance(value, list):
+            selected.update(value)
+    selected.update(members[role] for role in ("dump", "documents", "properties", "digests") if members[role])
     cp = run(["tar", extract_flags, tar_path, "-C", workdir,
               "--no-same-owner", "--no-same-permissions", "--"]
-             + [m for m in members.values() if m])
+             + sorted(selected))
     if cp.returncode != 0:
         die("bundle extraction failed")
 
@@ -596,4 +611,28 @@ def _open_bundle(bundle: str, tar_path: str, workdir: str, encrypted: bool,
                 .format(name))
         os.chmod(path, 0o600)
         result[role] = path
+    for role in ("dumps", "document_parts", "extras"):
+        if role in members:
+            paths = [os.path.join(workdir, _strip_dot_slash(name)) for name in members[role]]
+            for path in paths:
+                if not os.path.isfile(path) or os.path.islink(path):
+                    die("bundle member did not extract as a plain file: {0}".format(path))
+                os.chmod(path, 0o600)
+            result[role] = paths
+    if members.get("embedded_documents"):
+        documents_path = os.path.join(workdir, ".native-documents.tar")
+        context = members["document_context"]
+        required = sum(size for kind, name, size in entries if name in members["embedded_documents"])
+        if shutil.disk_usage(workdir).free < required + (1 << 20):
+            die("insufficient disk to prepare the native documents archive")
+        fd = os.open(documents_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as document_file, tarfile.open(fileobj=document_file, mode="w") as archive:
+            os.fchmod(document_file.fileno(), 0o600)
+            for name in members["embedded_documents"]:
+                # A backup may itself be inside another directory. The
+                # documents phase expects exactly one context directory.
+                relative = os.path.relpath(_strip_dot_slash(name), context)
+                archive.add(os.path.join(workdir, _strip_dot_slash(name)),
+                            arcname=os.path.join(os.path.basename(context), relative), recursive=False)
+        result["documents"] = documents_path
     return result
