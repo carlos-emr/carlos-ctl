@@ -119,6 +119,21 @@ class TestCompleteBackupSet(unittest.TestCase):
         self.assertIn(b"*/;\nSET SESSION UNIQUE_CHECKS=1, SQL_NOTES=1, note_verbosity='all';", restored)
         self.assertIn(b"INSERT INTO a VALUES ('UNIQUE_CHECKS=0');", restored)
 
+    def test_system_sql_mode_assignments_cannot_change_dump_quoting(self):
+        for target in (b"sql_mode", b"@@sql_mode", b"@@SESSION.sql_mode", b"SESSION sql_mode",
+                       b"@@`sql_mode`", b"@@SESSION.`sql_mode`"):
+            for mode in (b"NO_BACKSLASH_ESCAPES", b"ANSI_QUOTES"):
+                with self.subTest(target=target, mode=mode):
+                    source = b"SET " + target + b"='" + mode + b"'; SELECT 'ordinary text';"
+                    with self.assertRaisesRegex(ValueError, "dump changes SQL quoting modes"):
+                        b"".join(o19sources.restore_chunks(io.BytesIO(source)))
+        # Saving a value in a user variable does not change session quoting.
+        for target in (b"@sql_mode", b"@session.sql_mode", b"@clinic.session.sql_mode", b"@`sql_mode`"):
+            with self.subTest(user_variable=target):
+                source = b"SET " + target + b"='ANSI_QUOTES'; SET @@sql_mode='NO_AUTO_VALUE_ON_ZERO';"
+                self.assertIn(source.split(b";")[0] + b";",
+                              b"".join(o19sources.restore_chunks(io.BytesIO(source))))
+
     def test_dump_set_controls_cannot_suppress_note_diagnostics(self):
         source = b"/*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */;\nINSERT INTO a VALUES ('SQL_NOTES=0');\n"
         restored = b"".join(o19sources.restore_chunks(io.BytesIO(source)))

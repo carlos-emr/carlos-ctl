@@ -154,12 +154,20 @@ def session_assignments(tokens):
     keys = {b"SQL_MODE", b"TIME_ZONE", b"CHARACTER_SET_CLIENT", b"COLLATION_CONNECTION", b"OLD_MODE"}
     for index, (kind, value) in enumerate(tokens):
         value = value.upper()
-        if kind != "word":
+        if kind not in ("word", "identifier"):
             continue
         if value == b"NAMES":
             result["NAMES"] = tokens[index + 1:]
         elif value in keys and index + 1 < len(tokens) and tokens[index + 1] == ("symbol", b"="):
-            if index and tokens[index - 1] == ("symbol", b"@"):
+            # A system variable may be quoted or scoped (@@SESSION.sql_mode).
+            # User variable names may also contain dots (@session.sql_mode).
+            # Find the start of a qualified name before distinguishing @/@@.
+            start = index
+            while (start > 1 and tokens[start - 1] == ("symbol", b".")
+                   and tokens[start - 2][0] in ("word", "identifier")):
+                start -= 2
+            if (start and tokens[start - 1] == ("symbol", b"@")
+                    and not (start > 1 and tokens[start - 2] == ("symbol", b"@"))):
                 continue
             end = index + 2
             while end < len(tokens) and tokens[end] not in (("symbol", b","), ("symbol", b";")):

@@ -495,6 +495,26 @@ class TestOpenBundleEndToEnd(unittest.TestCase):
                         with open(opened["digests"], "rb") as content:
                             self.assertEqual(content.read(), digest)
 
+    def test_legacy_digest_discovery_does_not_parse_oversized_metadata(self):
+        digest = b'{"digest_format":3,"tables":{},"errors":{}}'
+        metadata = json.dumps({"unrelated": "x" * 2048}).encode()
+        contents = {"o19.sql": b"-- Dump completed\n", "oscar.properties": b"billregion=ON\n",
+                    "clinic-content.json": digest, "large-metadata.json": metadata}
+        bundle = os.path.join(self.work, "large-json.tar")
+        with tarfile.open(bundle, "w") as archive:
+            for name, data in contents.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        destination = os.path.join(self.work, "large-json")
+        with mock.patch.object(o19bundle, "DIGEST_DISCOVERY_MAX_BYTES", 512), \
+                mock.patch.object(o19bundle.json, "load", wraps=json.load) as load:
+            opened = o19bundle.open_bundle(bundle, destination)
+        self.assertEqual(load.call_count, 1)
+        self.assertEqual(os.path.basename(opened["digests"]), "clinic-content.json")
+        with open(os.path.join(destination, "large-metadata.json"), "rb") as content:
+            self.assertEqual(content.read(), metadata)
+
     def test_native_documents_capacity_includes_headers_pax_and_padding(self):
         documents = {"oscar/document/{0:03d}.pdf".format(number): b"x" for number in range(40)}
         documents["oscar/document/" + "long-" * 30 + "santé.pdf"] = b"tiny PAX document"

@@ -27,6 +27,9 @@ from typing import Dict, List, Optional, Tuple
 from .util import die, log, run
 
 GZIP_MAGIC = b"\x1f\x8b"
+# Bound format discovery of unrelated backup metadata. Real ON/BC digest
+# documents are below 1 MiB; allow substantial clinic-specific schema growth.
+DIGEST_DISCOVERY_MAX_BYTES = 64 << 20
 # A tar header is 512 bytes; ustar/gnu archives carry "ustar" at offset 257,
 # a v7 tar does not — so validity is decided by the header CHECKSUM (bytes
 # 148..155, octal sum of the header with the checksum field as spaces),
@@ -607,8 +610,10 @@ def _open_bundle(bundle: str, tar_path: str, workdir: str, encrypted: bool,
             # backup metadata and stored clinical JSON as ordinary files.
             digest_documents = []
             with tarfile.open(tar_path, mode="r:*") as archive:
-                for kind, name, _ in entries:
+                for kind, name, size in entries:
                     if kind != TAR_TYPE_FILE or not name.lower().endswith(".json") or _document_tree_member(name):
+                        continue
+                    if size > DIGEST_DISCOVERY_MAX_BYTES:
                         continue
                     with archive.extractfile(name) as content:
                         try:
