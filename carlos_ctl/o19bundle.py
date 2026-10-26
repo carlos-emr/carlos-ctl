@@ -91,6 +91,10 @@ def _strip_dot_slash(name: str) -> str:
     return name
 
 
+_DOCUMENT_DIRECTORIES = {"document", "eform", "form", "hrm", "billing", "measurementmap",
+                         "intake", "tickler", "image", "document_cache", "incoming", "outgoing", "templates"}
+
+
 def _document_tree_member(name: str) -> bool:
     """A stored clinical file keeps its role regardless of its extension.
 
@@ -98,10 +102,8 @@ def _document_tree_member(name: str) -> bool:
     patient's uploaded tar, saved SQL report, or JSON named like an import
     descriptor must not become an importer control file.
     """
-    directories = {"document", "eform", "form", "hrm", "billing", "measurementmap",
-                   "intake", "tickler", "image", "document_cache", "incoming", "outgoing", "templates"}
-    return bool(directories.intersection(part.lower() for part in
-                                        _strip_dot_slash(name).split("/")[:-1]))
+    return bool(_DOCUMENT_DIRECTORIES.intersection(part.lower() for part in
+                                                   _strip_dot_slash(name).split("/")[:-1]))
 
 
 def classify_members(names: List[str], digest_documents: Optional[List[str]] = None) -> Dict[str, object]:
@@ -151,6 +153,14 @@ def classify_members(names: List[str], digest_documents: Optional[List[str]] = N
                 continue
             relative = clean[len(root) + 1:]
             if "/" in relative or not relative.endswith((".war", ".sh", ".log", ".json")):
+                embedded.append(name)
+    else:
+        # A native tar made from inside the OSCAR context has no enclosing
+        # directory. Known document trees remain documents; root metadata and
+        # unrelated subdirectories stay as extras.
+        for name in extras:
+            clean = _strip_dot_slash(name)
+            if "/" in clean and clean.split("/", 1)[0].lower() in _DOCUMENT_DIRECTORIES:
                 embedded.append(name)
     if docs and embedded and not descriptors:
         raise ValueError("bundle mixes embedded documents and documents archives; select an explicit document backup set")
@@ -318,6 +328,12 @@ def entries_size(entries: List[Tuple[str, str, int]]) -> int:
                if kind == TAR_TYPE_FILE)
 
 
+def _native_document_arcname(name: str, context: str) -> str:
+    """Keep relative document paths under one original or synthetic context."""
+    relative = os.path.relpath(_strip_dot_slash(name), context or ".")
+    return os.path.join(os.path.basename(context) or "oscar", relative)
+
+
 def native_documents_size(workdir: str, names: List[str], context: str) -> int:
     """Exact uncompressed tar footprint, including PAX headers and padding.
 
@@ -328,9 +344,8 @@ def native_documents_size(workdir: str, names: List[str], context: str) -> int:
     required = 0
     with tarfile.open(fileobj=io.BytesIO(), mode="w") as probe:
         for name in names:
-            relative = os.path.relpath(_strip_dot_slash(name), context)
             member = probe.gettarinfo(os.path.join(workdir, _strip_dot_slash(name)),
-                                      arcname=os.path.join(os.path.basename(context), relative))
+                                      arcname=_native_document_arcname(name, context))
             required += len(member.tobuf(probe.format, probe.encoding, probe.errors))
             required += (member.size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE * tarfile.BLOCKSIZE
     required += 2 * tarfile.BLOCKSIZE
@@ -684,10 +699,9 @@ def _open_bundle(bundle: str, tar_path: str, workdir: str, encrypted: bool,
         with os.fdopen(fd, "wb") as document_file, tarfile.open(fileobj=document_file, mode="w") as archive:
             os.fchmod(document_file.fileno(), 0o600)
             for name in members["embedded_documents"]:
-                # A backup may itself be inside another directory. The
-                # documents phase expects exactly one context directory.
-                relative = os.path.relpath(_strip_dot_slash(name), context)
+                # P5 expects one context, including for a tar made from
+                # inside the OSCAR context rather than its parent.
                 archive.add(os.path.join(workdir, _strip_dot_slash(name)),
-                            arcname=os.path.join(os.path.basename(context), relative), recursive=False)
+                            arcname=_native_document_arcname(name, context), recursive=False)
         result["documents"] = documents_path
     return result

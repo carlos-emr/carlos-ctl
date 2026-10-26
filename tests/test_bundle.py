@@ -85,6 +85,14 @@ class TestClassifyMembers(unittest.TestCase):
         self.assertEqual(roles["document_parts"], [])
         self.assertCountEqual(roles["embedded_documents"], documents)
 
+    def test_root_level_native_documents_do_not_absorb_unrelated_metadata(self):
+        documents = ["document/a.pdf", "eform/saved.json"]
+        extras = ["notes.txt", "metadata.json", "metadata/unrelated.json"]
+        roles = o19bundle.classify_members(["OscarBackup.sql", "oscar.properties"] + documents + extras)
+        self.assertCountEqual(roles["embedded_documents"], documents)
+        self.assertEqual(roles["document_context"], "")
+        self.assertTrue(set(extras) <= set(roles["extras"]))
+
     def test_explicit_roles_can_select_files_inside_document_named_directories(self):
         names = ["billing/main.sql", "billing/documents.tar", "billing/oscar.properties"]
         roles = o19bundle.input_manifest_roles({"format": 1, "dumps": names[:1],
@@ -468,6 +476,51 @@ class TestOpenBundleEndToEnd(unittest.TestCase):
             for name, data in documents.items():
                 with archive.extractfile(name) as member:
                     self.assertEqual(member.read(), data)
+
+    def test_root_level_native_documents_use_one_synthetic_context(self):
+        from carlos_ctl import o19docs
+        documents = {"document/a.pdf": b"synthetic scan", "eform/santé.json": b'{"saved": true}',
+                     "document/upload.tar.gz": b"a stored attachment"}
+        metadata = {"metadata.json": b'{"backup": true}', "metadata/report.txt": b"backup information"}
+        for index, prefix in enumerate(("", "./")):
+            with self.subTest(prefix=prefix):
+                contents = {"OscarBackup.sql": b"-- Dump completed\n", "oscar.properties": b"billregion=ON\n",
+                            **documents, **metadata}
+                bundle = os.path.join(self.work, "root-native-{0}.tar.gz".format(index))
+                with tarfile.open(bundle, "w:gz") as archive:
+                    for name, data in contents.items():
+                        member = tarfile.TarInfo(prefix + name)
+                        member.size = len(data)
+                        archive.addfile(member, io.BytesIO(data))
+                destination = os.path.join(self.work, "root-native-{0}".format(index))
+                opened = o19bundle.open_bundle(bundle, destination)
+                entries = o19bundle.read_tar_entries(opened["documents"], False)
+                self.assertEqual(o19docs.detect_context_dir([(kind, name) for kind, name, _ in entries]), "oscar")
+                with tarfile.open(opened["documents"]) as archive:
+                    self.assertCountEqual(archive.getnames(), ["oscar/" + name for name in documents])
+                    for name, data in documents.items():
+                        with archive.extractfile("oscar/" + name) as member:
+                            self.assertEqual(member.read(), data)
+                self.assertEqual(o19bundle.native_documents_size(destination, [prefix + name for name in documents], ""),
+                                 os.path.getsize(opened["documents"]))
+                for name, data in metadata.items():
+                    with open(os.path.join(destination, name), "rb") as content:
+                        self.assertEqual(content.read(), data)
+
+    def test_root_level_embedded_documents_and_document_archive_are_ambiguous(self):
+        for index, prefix in enumerate(("", "./")):
+            with self.subTest(prefix=prefix):
+                bundle = os.path.join(self.work, "mixed-root-{0}.tar".format(index))
+                contents = {"OscarBackup.sql": b"-- Dump completed\n", "oscar.properties": b"billregion=ON\n",
+                            "document/a.pdf": b"synthetic scan", "documents.tar": b"separate document backup"}
+                with tarfile.open(bundle, "w") as archive:
+                    for name, data in contents.items():
+                        member = tarfile.TarInfo(prefix + name)
+                        member.size = len(data)
+                        archive.addfile(member, io.BytesIO(data))
+                with mock.patch.object(o19bundle, "die", side_effect=ValueError) as die, self.assertRaises(ValueError):
+                    o19bundle.open_bundle(bundle, os.path.join(self.work, "mixed-root-{0}".format(index)))
+                self.assertIn("mixes embedded documents", die.call_args[0][0])
 
     def test_legacy_digest_filename_uses_format_without_guessing_metadata(self):
         digest = json.dumps({"digest_format": 3, "tables": {"a": {"columns": [["id", "int"]],
