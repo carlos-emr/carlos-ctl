@@ -150,10 +150,10 @@ def statement_session_assignments(statement, offset, mode_captures=None):
 
 
 def restore_chunks(stream, spool_dir=None):
-    """Restore original SQL with uniqueness and diagnostics kept enabled.
+    """Restore original SQL with uniqueness, zero keys and diagnostics preserved.
 
     mysqldump itself sets UNIQUE_CHECKS=0, overriding --init-command. Append
-    a separate control statement after session SET statements; never edit a
+    separate control statements after session SET statements; never edit a
     literal, INSERT or source file. Large statements remain disk-spooled.
     """
     mode_captures = set()
@@ -168,6 +168,11 @@ def restore_chunks(stream, spool_dir=None):
             # SQL_NOTES=0 suppresses Notes even when note_verbosity is 'all'.
             # Both controls are needed on the packaged MariaDB floor (11.4).
             yield b"\nSET SESSION UNIQUE_CHECKS=1, SQL_NOTES=1, note_verbosity='all';\n"
+            # A validated literal/saved SQL_MODE can still clear the zero-key
+            # protection supplied by --init-command. Add back only that flag,
+            # retaining every other mode the original statement selected.
+            yield (b"SET SESSION sql_mode=CONCAT_WS(',', NULLIF(@@SESSION.sql_mode,''), "
+                   b"'NO_AUTO_VALUE_ON_ZERO');\n")
 
 
 def session_assignments(tokens, mode_captures=None):

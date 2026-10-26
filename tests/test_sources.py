@@ -142,6 +142,19 @@ class TestCompleteBackupSet(unittest.TestCase):
         self.assertIn(b"SQL_NOTES=0 */;\nSET SESSION UNIQUE_CHECKS=1, SQL_NOTES=1, note_verbosity='all';", restored)
         self.assertIn(b"INSERT INTO a VALUES ('SQL_NOTES=0');", restored)
 
+    def test_every_set_reasserts_zero_key_protection_without_editing_dump_values(self):
+        statements = (b"SET SQL_MODE='';\n",
+                      b"INSERT INTO a VALUES (0,'SQL_MODE=empty');\n",
+                      b"SET SQL_MODE='STRICT_TRANS_TABLES';\n")
+        restored = b"".join(o19sources.restore_chunks(io.BytesIO(b"".join(statements))))
+        control = (b"SET SESSION sql_mode=CONCAT_WS(',', NULLIF(@@SESSION.sql_mode,''), "
+                   b"'NO_AUTO_VALUE_ON_ZERO');\n")
+        self.assertEqual(restored.count(control), 2)
+        for statement in statements:
+            self.assertIn(statement, restored)
+        self.assertLess(restored.index(control), restored.index(statements[1]))
+        self.assertTrue(restored.rstrip().endswith(control.rstrip()))
+
     def test_standard_dump_mode_capture_and_footer_remain_supported(self):
         for capture in (b"@@SQL_MODE", b"@@SESSION.sql_mode", b"@@SESSION.`sql_mode`"):
             with self.subTest(capture=capture):
@@ -193,7 +206,9 @@ class TestCompleteBackupSet(unittest.TestCase):
                   + b"',@@SESSION.sql_mode='NO_AUTO_VALUE_ON_ZERO';")
         restored = b"".join(o19sources.restore_chunks(io.BytesIO(source)))
         self.assertEqual(restored, source +
-                         b"\nSET SESSION UNIQUE_CHECKS=1, SQL_NOTES=1, note_verbosity='all';\n")
+                         b"\nSET SESSION UNIQUE_CHECKS=1, SQL_NOTES=1, note_verbosity='all';\n"
+                         b"SET SESSION sql_mode=CONCAT_WS(',', NULLIF(@@SESSION.sql_mode,''), "
+                         b"'NO_AUTO_VALUE_ON_ZERO');\n")
 
     def test_oversized_system_mode_literal_cannot_hide_quoting_changes(self):
         for mode in (b"NO_BACKSLASH_ESCAPES", b"ANSI_QUOTES"):
