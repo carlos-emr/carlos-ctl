@@ -140,6 +140,53 @@ class TestCompleteBackupSet(unittest.TestCase):
         self.assertIn(b"SQL_NOTES=0 */;\nSET SESSION UNIQUE_CHECKS=1, SQL_NOTES=1, note_verbosity='all';", restored)
         self.assertIn(b"INSERT INTO a VALUES ('SQL_NOTES=0');", restored)
 
+    def test_quoting_mode_assignments_after_large_set_prefix_are_refused(self):
+        for padding in (33000, (1 << 20) - 20):
+            for mode in (b"NO_BACKSLASH_ESCAPES", b"ANSI_QUOTES"):
+                with self.subTest(padding=padding, mode=mode):
+                    source = (b"SET @padding='" + b"x" * padding
+                              + b"',@@SESSION.sql_mode='" + mode + b"';\n")
+                    # Validation must finish before any bytes of this SET are
+                    # sent to MariaDB, even when its tokens cross a read boundary.
+                    with self.assertRaisesRegex(ValueError, "dump changes SQL quoting modes"):
+                        next(o19sources.restore_chunks(io.BytesIO(source)))
+                    path = self.root / "long-set.sql"
+                    path.write_bytes(source + b"-- Dump completed\n")
+                    with self.assertRaisesRegex(ValueError, "dump changes SQL quoting modes"):
+                        o19sources.inventory(str(path))
+
+    def test_large_safe_set_is_restored_without_changing_its_bytes(self):
+        source = (b"SET @padding='" + b"x" * (1 << 20)
+                  + b"',@@SESSION.sql_mode='NO_AUTO_VALUE_ON_ZERO';")
+        restored = b"".join(o19sources.restore_chunks(io.BytesIO(source)))
+        self.assertEqual(restored, source +
+                         b"\nSET SESSION UNIQUE_CHECKS=1, SQL_NOTES=1, note_verbosity='all';\n")
+
+    def test_oversized_system_mode_literal_cannot_hide_quoting_changes(self):
+        for mode in (b"NO_BACKSLASH_ESCAPES", b"ANSI_QUOTES"):
+            with self.subTest(mode=mode):
+                source = b"SET @@sql_mode='" + b"NO_AUTO_VALUE_ON_ZERO," * 60 + mode + b"';"
+                with self.assertRaisesRegex(ValueError, "SQL_MODE literal exceeds"):
+                    next(o19sources.restore_chunks(io.BytesIO(source)))
+                path = self.root / "long-mode.sql"
+                path.write_bytes(source + b"\n-- Dump completed\n")
+                with self.assertRaisesRegex(ValueError, "SQL_MODE literal exceeds"):
+                    o19sources.inventory(str(path))
+
+    def test_set_metadata_has_a_finite_token_budget(self):
+        source = b"SET " + b",".join([b"@x=1"] * o19sources.SET_TOKEN_LIMIT) + b";"
+        with self.assertRaisesRegex(ValueError, "too many metadata tokens"):
+            next(o19sources.restore_chunks(io.BytesIO(source)))
+
+    def test_late_set_assignment_is_part_of_table_fingerprint(self):
+        paths = [self.dump("first.sql"), self.dump("second.sql")]
+        for path, zone in zip(paths, (b"+00:00", b"-05:00")):
+            original = Path(path).read_bytes()
+            Path(path).write_bytes(b"SET @padding='" + b"x" * 33000
+                                   + b"',TIME_ZONE='" + zone + b"';\n" + original)
+        with self.assertRaisesRegex(ValueError, "overlapping table"):
+            o19sources.prepare_dump_set(paths, self.work)
+
     def documents(self, filename, files):
         path = self.root / filename
         with tarfile.open(path, "w:gz") as archive:

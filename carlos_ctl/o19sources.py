@@ -24,6 +24,7 @@ FORMAT = 1
 TRAILER = b"-- Dump completed"
 COMBINED_TRAILER = b"\n-- Dump completed (complete OSCAR dump set)\n"
 STATEMENT_SPOOL_LIMIT = 1 << 20
+SET_TOKEN_LIMIT = 65536
 
 
 def snapshot_file(path, destination):
@@ -127,6 +128,24 @@ def statement_info(statement):
     return verb, None, offset
 
 
+def statement_session_assignments(statement, offset):
+    """Scan every SET assignment, including those after a large prefix.
+
+    Keep quote state across reads and finalize only at the statement's EOF.
+    INSERT payloads never enter this metadata scan and remain disk-spooled.
+    """
+    statement.seek(offset)
+    lexer = o19sql.Lexer(mark_truncated=True)
+    tokens = []
+    while True:
+        chunk = statement.read(65536)
+        tokens.extend(lexer.feed(chunk, final=not chunk))
+        if len(tokens) > SET_TOKEN_LIMIT:
+            raise ValueError("SET statement has too many metadata tokens; export with ordinary mysqldump session settings")
+        if not chunk:
+            return session_assignments(tokens)
+
+
 def restore_chunks(stream, spool_dir=None):
     """Restore original SQL with uniqueness and diagnostics kept enabled.
 
@@ -137,8 +156,7 @@ def restore_chunks(stream, spool_dir=None):
     for statement in statements(stream, spool_dir):
         verb, _, offset = statement_info(statement)
         if verb == "SET":
-            statement.seek(offset)
-            session_assignments(o19sql.Lexer().feed(statement.read(32768), final=True))
+            statement_session_assignments(statement, offset)
         statement.seek(0)
         for chunk in iter(lambda: statement.read(1 << 20), b""):
             yield chunk
@@ -173,6 +191,8 @@ def session_assignments(tokens):
             while end < len(tokens) and tokens[end] not in (("symbol", b","), ("symbol", b";")):
                 end += 1
             assigned = tokens[index + 2:end]
+            if value == b"SQL_MODE" and any(kind == "truncated_string" for kind, _ in assigned):
+                raise ValueError("dump SQL_MODE literal exceeds the metadata limit; export with ordinary mysqldump quoting")
             if value == b"SQL_MODE" and any(kind == "string" and (
                     b"NO_BACKSLASH_ESCAPES" in item.upper() or b"ANSI_QUOTES" in item.upper()) for kind, item in assigned):
                 raise ValueError("dump changes SQL quoting modes; export with ordinary mysqldump quoting (no ANSI_QUOTES or NO_BACKSLASH_ESCAPES)")
@@ -190,10 +210,7 @@ def inventory(path):
         for statement in statements(stream, os.path.dirname(path)):
             verb, table, offset = statement_info(statement)
             if verb == "SET":
-                statement.seek(offset)
-                value = statement.read(32768)
-                tokens = o19sql.Lexer().feed(value, final=True)
-                session.update(session_assignments(tokens))
+                session.update(statement_session_assignments(statement, offset))
             # Ignore comments surrounding statements, locks, and key-disable
             # wrappers. Compare the actual CREATE and INSERT/REPLACE bytes.
             wrapper = False

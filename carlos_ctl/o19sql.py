@@ -18,10 +18,12 @@ QUOTED_SPECIAL = {quote: re.compile(rb"[\\" + bytes([quote]) + rb"]")
 
 
 class Lexer:
-    def __init__(self):
+    def __init__(self, mark_truncated=False):
         self.pending = b""
         self.state = "sql"
         self.value = b""
+        self.value_truncated = False
+        self.mark_truncated = mark_truncated
         self.quote = 0
         self.executable = False
         self.received = 0
@@ -42,6 +44,8 @@ class Lexer:
 
         def remember(value):
             if self.data_tokens < 8:
+                if len(self.value) + len(value) > 1024:
+                    self.value_truncated = True
                 self.value += value[:max(0, 1024 - len(self.value))]
 
         def emit(kind, value):
@@ -108,7 +112,10 @@ class Lexer:
                     remember(data[i:i + 1])
                     i += 2
                 else:
-                    emit("identifier" if self.quote == 96 else "string", self.value)
+                    kind = "identifier" if self.quote == 96 else "string"
+                    if self.mark_truncated and self.value_truncated:
+                        kind = "truncated_" + kind
+                    emit(kind, self.value)
                     self.value = b""
                     self.state = "sql"
                     i += 1
@@ -155,11 +162,13 @@ class Lexer:
                 self.quote = c
                 self.state = "quoted"
                 self.value = b""
+                self.value_truncated = False
                 i += 1
             elif (65 <= c <= 90) or (97 <= c <= 122) or (48 <= c <= 57) or c in (95, 36):
                 if self.first_token_position is None:
                     self.first_token_position = origin + i
                 self.state = "word"
+                self.value_truncated = False
             elif c <= 32:
                 match = SPACE.match(data, i)
                 i = match.end() if match else i + 1
