@@ -2969,7 +2969,7 @@ def run_cleanup(ctx) -> None:
     for host in STAGING_ACCOUNT_HOSTS:
         ctx["query"]("DROP USER IF EXISTS '{0}'@'{1}'".format(
             STAGING_USER, host))
-    for name in ("bundle", "bundle-assess"):
+    for name in ("bundle", "bundle-assess", "bundle-sources", "bundle-assess-sources"):
         bundle_dir = os.path.join(ctx["state_dir"], name)
         if os.path.isdir(bundle_dir):
             shutil.rmtree(bundle_dir)
@@ -3075,6 +3075,7 @@ RUN_FILES = ("report.txt", "import-report.txt", "import-report.json",
              CONTENT_DETAILS, VERIFY_PROBLEMS, "preflight.txt",
              "preflight.json", "etl-progress.json",
              "content-transfer.json", "o19-digests.json",
+             "source-set.json", "staging-diagnostics.txt",
              "o19-derived-carlos.properties",
              "o19-derived-carlos.properties.dry-run",
              # the CSV rendering of this run's archive schema: clinic

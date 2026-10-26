@@ -1299,12 +1299,24 @@ class TestCleanupEndToEnd(unittest.TestCase):
             self.assertIn(key, ctx)
 
     def test_a_verified_run_cleans_up_without_raising(self):
+        sources = [os.path.join(self.state_dir, name) for name in
+                   ("bundle", "bundle-assess", "bundle-sources", "bundle-assess-sources")]
+        for directory in sources:
+            os.makedirs(os.path.join(directory, "input-sha"))
+            Path(directory, "input-sha", "source.properties").write_text("synthetic credential")
+        export = Path(self.state_dir, "o19-archive-export")
+        export.mkdir()
+        (export / "kept.csv").write_text("preserved clinic records")
         o19import.save_state(self.state_dir,
                              {"phases": {"verify": {"status": "done"}}})
         ctx = self.ctx()
         o19import.run_cleanup(ctx)
         self.assertTrue(any("DROP DATABASE" in q for q in self.queries),
                         self.queries)
+        self.assertTrue(all(not os.path.exists(directory) for directory in sources))
+        kept = list(Path(self.state_dir).glob("o19-archive-export*/kept.csv"))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_text(), "preserved clinic records")
 
     def test_the_staging_schema_is_measured_before_it_is_dropped(self):
         """The whole point of the gate: the parity runs first, or the
