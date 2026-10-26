@@ -14,6 +14,7 @@ refused, and extracted clinic files remain private.
 """
 
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -87,7 +88,20 @@ def _strip_dot_slash(name: str) -> str:
     return name
 
 
-def classify_members(names: List[str]) -> Dict[str, object]:
+def _document_tree_member(name: str) -> bool:
+    """A stored clinical file keeps its role regardless of its extension.
+
+    Native backups include these OSCAR document directories directly. A
+    patient's uploaded tar, saved SQL report, or JSON named like an import
+    descriptor must not become an importer control file.
+    """
+    directories = {"document", "eform", "form", "hrm", "billing", "measurementmap",
+                   "intake", "tickler", "image", "document_cache", "incoming", "outgoing", "templates"}
+    return bool(directories.intersection(part.lower() for part in
+                                        _strip_dot_slash(name).split("/")[:-1]))
+
+
+def classify_members(names: List[str], digest_documents: Optional[List[str]] = None) -> Dict[str, object]:
     """Recognize both migration bundles and native OSCAR full backups.
 
     Multiple EMR SQL parts are a set, verified before staging by o19sources.
@@ -100,15 +114,14 @@ def classify_members(names: List[str]) -> Dict[str, object]:
         clean = _strip_dot_slash(raw)
         if clean.startswith(("/", "-")) or ".." in clean.split("/"):
             raise ValueError("invalid bundle member path: {0}".format(raw))
-    document_subdirs = {"document", "eform", "hrm", "image", "templates"}
-    sql = [name for name in files if name.endswith((".sql", ".sql.gz"))
-           and not document_subdirs.intersection(_strip_dot_slash(name).split("/")[:-1])]
+    controls = [name for name in files if not _document_tree_member(name)]
+    sql = [name for name in controls if name.endswith((".sql", ".sql.gz"))]
     auxiliary = [name for name in sql if os.path.basename(name).lower().startswith("drugref")
                  or os.path.basename(name).lower() in ("mysql.sql", "mysql.sql.gz", "sys.sql", "sys.sql.gz")]
     dumps = [name for name in sql if name not in auxiliary]
-    props = [name for name in files if os.path.basename(name).lower() in ("oscar.properties", "carlos.properties")]
+    props = [name for name in controls if os.path.basename(name).lower() in ("oscar.properties", "carlos.properties")]
     if not props:
-        props = [name for name in files if name.endswith(".properties")]
+        props = [name for name in controls if name.endswith(".properties")]
     if props:
         depth = min(_strip_dot_slash(name).count("/") for name in props)
         props = [name for name in props if _strip_dot_slash(name).count("/") == depth]
@@ -116,10 +129,10 @@ def classify_members(names: List[str]) -> Dict[str, object]:
         raise ValueError("bundle contains no EMR *.sql/*.sql.gz dump")
     if len(props) != 1:
         raise ValueError("expected exactly one deployed properties file, found {0}".format(len(props)))
-    docs = [name for name in files if name.endswith((".tar", ".tar.gz"))]
-    digests = [name for name in files if os.path.basename(name).lower() in ("o19-digests.json", "o19_digests.json", "digests.json")
-               or name.lower().endswith(".o19-digests.json")]
-    descriptors = [name for name in files if os.path.basename(name) == "o19-inputs.json"]
+    docs = [name for name in controls if name.endswith((".tar", ".tar.gz"))]
+    digests = [name for name in controls if os.path.basename(name).lower() in ("o19-digests.json", "o19_digests.json", "digests.json")
+               or name.lower().endswith(".o19-digests.json") or name in (digest_documents or [])]
+    descriptors = [name for name in controls if os.path.basename(name) == "o19-inputs.json"]
     if len(descriptors) > 1:
         raise ValueError("expected at most one o19-inputs.json descriptor")
     if len(digests) > 1:
@@ -300,6 +313,25 @@ def entries_size(entries: List[Tuple[str, str, int]]) -> int:
     about what it unpacks to)."""
     return sum(size for kind, _name, size in entries
                if kind == TAR_TYPE_FILE)
+
+
+def native_documents_size(workdir: str, names: List[str], context: str) -> int:
+    """Exact uncompressed tar footprint, including PAX headers and padding.
+
+    Tiny files still need tar headers and 512-byte data blocks; long/Unicode
+    names and fractional mtimes add PAX records. Inspect metadata without
+    writing a document archive before the capacity check.
+    """
+    required = 0
+    with tarfile.open(fileobj=io.BytesIO(), mode="w") as probe:
+        for name in names:
+            relative = os.path.relpath(_strip_dot_slash(name), context)
+            member = probe.gettarinfo(os.path.join(workdir, _strip_dot_slash(name)),
+                                      arcname=os.path.join(os.path.basename(context), relative))
+            required += len(member.tobuf(probe.format, probe.encoding, probe.errors))
+            required += (member.size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE * tarfile.BLOCKSIZE
+    required += 2 * tarfile.BLOCKSIZE
+    return (required + tarfile.RECORDSIZE - 1) // tarfile.RECORDSIZE * tarfile.RECORDSIZE
 
 
 def tar_header_checksum_ok(header: bytes) -> bool:
@@ -557,7 +589,8 @@ def _open_bundle(bundle: str, tar_path: str, workdir: str, encrypted: bool,
         validate_tar_members(
             [(kind, name) for kind, name, _ in entries], allow_dirs=True)
         descriptors = [name for kind, name, _ in entries
-                       if kind == TAR_TYPE_FILE and os.path.basename(name) == "o19-inputs.json"]
+                       if kind == TAR_TYPE_FILE and os.path.basename(name) == "o19-inputs.json"
+                       and not _document_tree_member(name)]
         if len(descriptors) > 1:
             raise ValueError("expected at most one o19-inputs.json descriptor")
         if descriptors:
@@ -569,7 +602,22 @@ def _open_bundle(bundle: str, tar_path: str, workdir: str, encrypted: bool,
                     document = json.load(content)
             members = input_manifest_roles(document, [name for kind, name, _ in entries if kind == TAR_TYPE_FILE])
         else:
-            members = classify_members([name for kind, name, _ in entries if kind == TAR_TYPE_FILE])
+            # Older migration bundles permit any JSON filename for the
+            # content digests. Identify their format, while leaving unrelated
+            # backup metadata and stored clinical JSON as ordinary files.
+            digest_documents = []
+            with tarfile.open(tar_path, mode="r:*") as archive:
+                for kind, name, _ in entries:
+                    if kind != TAR_TYPE_FILE or not name.lower().endswith(".json") or _document_tree_member(name):
+                        continue
+                    with archive.extractfile(name) as content:
+                        try:
+                            document = json.load(content)
+                        except (ValueError, UnicodeError):
+                            continue
+                    if isinstance(document, dict) and "digest_format" in document:
+                        digest_documents.append(name)
+            members = classify_members([name for kind, name, _ in entries if kind == TAR_TYPE_FILE], digest_documents)
     except ValueError as exc:
         die(str(exc))
     # the headers know the expanded size: refused before extraction fills
@@ -585,16 +633,18 @@ def _open_bundle(bundle: str, tar_path: str, workdir: str, encrypted: bool,
     extract_flags = "-xzf" if gzipped else "-xf"
     # ownership/permissions come from the host policy (chmod below), never
     # from a clinic-authored archive
-    # "--" ends option parsing: member names are positional data, never
-    # options (validate_tar_members refuses dash-prefixed names as well)
+    # A native backup can contain hundreds of thousands of document names.
+    # Send them as NUL-delimited data, avoiding argv limits and preserving
+    # spaces/newlines without tar interpreting filenames as options.
     selected = set()
     for value in members.values():
         if isinstance(value, list):
             selected.update(value)
     selected.update(members[role] for role in ("dump", "documents", "properties", "digests") if members[role])
     cp = run(["tar", extract_flags, tar_path, "-C", workdir,
-              "--no-same-owner", "--no-same-permissions", "--"]
-             + sorted(selected))
+              "--no-same-owner", "--no-same-permissions", "--null",
+              "--verbatim-files-from", "--files-from=-"],
+             input=b"".join(os.fsencode(name) + b"\0" for name in sorted(selected)), text=False)
     if cp.returncode != 0:
         die("bundle extraction failed")
 
@@ -622,8 +672,8 @@ def _open_bundle(bundle: str, tar_path: str, workdir: str, encrypted: bool,
     if members.get("embedded_documents"):
         documents_path = os.path.join(workdir, ".native-documents.tar")
         context = members["document_context"]
-        required = sum(size for kind, name, size in entries if name in members["embedded_documents"])
-        if shutil.disk_usage(workdir).free < required + (1 << 20):
+        required = native_documents_size(workdir, members["embedded_documents"], context)
+        if shutil.disk_usage(workdir).free < required:
             die("insufficient disk to prepare the native documents archive")
         fd = os.open(documents_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as document_file, tarfile.open(fileobj=document_file, mode="w") as archive:

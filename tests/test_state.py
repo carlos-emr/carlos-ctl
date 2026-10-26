@@ -2358,6 +2358,28 @@ class TestHeadCollations(unittest.TestCase):
             o19import.head_collations(head),
             ["latin1_swedish_ci", "utf8mb4_uca1400_ai_ci"])
 
+    def test_head_cutoff_does_not_invent_partial_collation_names(self):
+        name = b"utf8_general_ci"
+        declaration = b"CREATE TABLE t(a INT) COLLATE="
+        for split in range(1, len(name) + 1):
+            with self.subTest(split=split):
+                prefix = b" " * (65536 - len(declaration) - split)
+                sql = prefix + declaration + name + b";\n"
+                self.assertEqual(o19import.head_collations(sql), [])
+                scanner = o19import.CollationScanner({name.decode()})
+                self.assertIsNone(scanner.feed(sql[:65536]))
+                self.assertIsNone(scanner.feed(sql[65536:], final=True))
+
+    def test_complete_names_before_head_cutoff_are_still_checked(self):
+        declaration = b"CREATE TABLE t(a INT) COLLATE=utf8_general_ci;\n"
+        self.assertEqual(o19import.head_collations(declaration + b" " * 65536), ["utf8_general_ci"])
+
+    def test_only_sql_notes_control_deprecation_is_exempt_from_warning_refusal(self):
+        notice = "Warning (Code 1287): '@@sql_notes' is deprecated and will be removed in a future release. Please use '@@note_verbosity' instead\n"
+        self.assertEqual(o19import.sql_warning_codes(notice), set())
+        self.assertEqual(o19import.sql_warning_codes(notice.replace("@@sql_notes", "@@unrelated_variable")), {"1287"})
+        self.assertEqual(o19import.sql_warning_codes(notice + "Note (Code 1265): Data truncated\n"), {"1265"})
+
 
 class TestDocumentsSizing(unittest.TestCase):
 

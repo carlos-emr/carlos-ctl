@@ -18,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from carlos_ctl import o19_preflight as pf, o19etl, o19host, o19import
+from carlos_ctl import o19_preflight as pf, o19etl, o19host, o19import, o19sources
 
 
 @unittest.skipUnless(os.environ.get("CARLOS_TEST_MARIADB_SOCKET"),
@@ -46,10 +46,50 @@ class TestO19Compatibility(unittest.TestCase):
                             text=True, capture_output=True, timeout=30, check=True)
         return o19import.batch_rows(cp.stdout)
 
+    def test_plain_and_etl_queries_pin_utc_for_temporal_conversions(self):
+        base = self.base + ["--init-command=SET time_zone='+05:30'"]
+        for query in (o19import.make_query(base[1:]), o19import.make_etl_query(base)):
+            with self.subTest(query=query):
+                self.assertEqual(query("SELECT @@session.time_zone"), [["+00:00"]])
+                query("CREATE TABLE `{0}`.utc_value (value TIMESTAMP)".format(self.dst))
+                try:
+                    query("INSERT INTO `{0}`.utc_value SELECT CAST('2026-01-02 03:04:05' AS DATETIME)".format(self.dst))
+                    self.assertEqual(self.q("SET time_zone='+00:00'; SELECT value FROM `{0}`.utc_value".format(self.dst)),
+                                     [["2026-01-02 03:04:05"]])
+                finally:
+                    query("DROP TABLE `{0}`.utc_value".format(self.dst))
+
+    def test_preservation_stream_pins_utc_and_keeps_statement_timeout(self):
+        base = self.base[1:] + ["--init-command=SET time_zone='+05:30'"]
+        stream = o19import.make_row_stream(base, statement_timeout=12)
+        self.assertEqual(list(stream("SELECT @@session.time_zone, @@session.collation_connection, @@session.max_statement_time")),
+                         [["+00:00", "utf8mb4_general_ci", "12.000000"]])
+        self.q("CREATE TABLE `{0}`.utc_value (value TIMESTAMP); SET time_zone='+00:00'; "
+               "INSERT INTO `{0}`.utc_value VALUES('2026-01-02 03:04:05')".format(self.src))
+        self.assertEqual(list(stream("SELECT value FROM `{0}`.utc_value".format(self.src))),
+                         [["2026-01-02 03:04:05"]])
+
+    def test_dump_cannot_disable_note_diagnostics(self):
+        import io
+        source = b"/*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */; SELECT @@session.sql_notes;"
+        restored = b"".join(o19sources.restore_chunks(io.BytesIO(source))).decode()
+        self.assertEqual(self.q(restored), [["1"]])
+
+    def test_staging_refuses_note_level_decimal_truncation_after_dump_disables_notes(self):
+        path = Path(self.temp.name) / "lossy.sql"
+        path.write_text("SET sql_mode='';\n/*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */;\n"
+                        "CREATE TABLE loss (value DECIMAL(3,0)); INSERT INTO loss VALUES(1.1);\n-- Dump completed\n")
+        _, _, _, refusal = o19import._stream_dump(["cat", str(path)],
+            self.base + list(o19import.CLIENT_COMMON_ARGS) + [self.src],
+            diagnostics_path=str(Path(self.temp.name) / "diagnostics.txt"))
+        self.assertIsNotNone(refusal)
+        self.assertIn("1265", refusal)
+        self.assertNotIn("1287", refusal)
+
     def stage(self, padding):
         self.q("DROP DATABASE IF EXISTS `{0}`".format(o19import.STAGING_SCHEMA))
         self.addCleanup(self.q, "DROP DATABASE IF EXISTS `{0}`".format(o19import.STAGING_SCHEMA))
-        dump = ("SET NAMES utf8mb4;\n" + "-- padding\n" * padding +
+        dump = ("SET NAMES utf8mb4;\n/*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */;\n" + "-- padding\n" * padding +
                 "CREATE TABLE casemgmt_note (note_id INT PRIMARY KEY, locked CHAR(1), password VARCHAR(255), note TEXT) "
                 "ENGINE=MyISAM DEFAULT CHARSET=utf8 COLLATE=utf8_general_ci;\n"
                 "INSERT INTO casemgmt_note VALUES (1,'0','NULL','Readable synthetic café');\n"

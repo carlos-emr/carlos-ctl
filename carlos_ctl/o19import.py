@@ -343,7 +343,7 @@ def make_query(mariadb_args: Optional[List[str]],
 
     def query(sql, db=None):
         argv = list(base) + list(CLIENT_COMMON_ARGS)
-        initial = "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci"
+        initial = "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci; SET SESSION time_zone='+00:00'"
         if statement_timeout:
             initial += "; " + statement_timeout_prelude(statement_timeout)
         argv.append("--init-command=" + initial)
@@ -475,9 +475,10 @@ def make_row_stream(mariadb_args: Optional[List[str]],
 
     def stream(sql, db=None):
         argv = list(base) + list(CLIENT_COMMON_ARGS) + ["--quick"]
+        initial = "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci; SET SESSION time_zone='+00:00'"
         if statement_timeout:
-            argv.append("--init-command="
-                        + statement_timeout_prelude(statement_timeout))
+            initial += "; " + statement_timeout_prelude(statement_timeout)
+        argv.append("--init-command=" + initial)
         if db:
             argv.append(db)
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
@@ -1222,7 +1223,9 @@ def head_collations(head: bytes) -> List[str]:
     `COLLATE=` only where the collation is not the charset default, so
     on an ordinary all-latin1_swedish_ci clinic this finds nothing at
     all -- and a 580-table dump puts most of its DDL far past 64 KiB."""
-    return sorted(ddl_collations(head[:65536]))
+    # An arbitrary prefix may end inside a valid collation name. Leave that
+    # token unfinished; the streaming scanner will inspect its complete name.
+    return sorted(o19sql.Collations().feed(head[:65536], final=len(head) < 65536))
 
 
 class CollationScanner:
@@ -1519,6 +1522,16 @@ def sql_warning_codes(output):
     found = set()
     for match in re.finditer(r"^(Warning|Note)(?:\s+\(Code\s+(\d+)\):|\t(\d+)\t)", output, re.MULTILINE):
         code = match.group(2) or match.group(3)
+        # MariaDB 11.8 deprecates SQL_NOTES, but it still suppresses lossy
+        # Note diagnostics independently of note_verbosity. Source dumps and
+        # our restore controls must set it; this exact compatibility notice
+        # says nothing about converted row values. Other 1287 warnings remain
+        # subject to the normal refusal rule.
+        line_end = output.find("\n", match.end())
+        message = output[match.end():line_end if line_end >= 0 else len(output)].strip()
+        if code == "1287" and message == ("'@@sql_notes' is deprecated and will be removed in a future release. "
+                                         "Please use '@@note_verbosity' instead"):
+            continue
         if match.group(1) == "Warning" or code in lossy:
             found.add(code)
     return found
@@ -1974,7 +1987,7 @@ def make_etl_query(base_argv: List[str],
     reports the collision before the driver checkpoints the copy.
     """
     prelude = ("SET SESSION sql_log_bin=0, FOREIGN_KEY_CHECKS=0, "
-               "UNIQUE_CHECKS=1, sql_mode='', collation_connection='utf8mb4_general_ci'")
+               "UNIQUE_CHECKS=1, sql_mode='', collation_connection='utf8mb4_general_ci', time_zone='+00:00'")
     if statement_timeout:
         prelude += ", " + statement_timeout_prelude(
             statement_timeout).replace("SET SESSION ", "")
@@ -3448,11 +3461,32 @@ def _prepare_input_sets(inputs: Dict, state_dir: str, workdir_name: str) -> Dict
     inputs.update(dump=sql["dump"], documents=docs["documents"],
                   properties=properties_path, properties_sha256=properties_sha,
                   source_parts=sql["parts"], document_sources=docs["parts"],
-                  duplicate_tables=sql["duplicates"])
+                  duplicate_tables=sql["duplicates"], source_snapshot_dir=workdir)
     inputs["sources_sha256"] = hashlib.sha256(json.dumps({
         "format": o19sources.FORMAT, "sql": sql["parts"], "documents": docs["parts"],
         "properties": properties_sha}, sort_keys=True).encode()).hexdigest()
     return inputs
+
+
+def retire_input_snapshots(inputs: Dict, state_dir: str, workdir_name: str) -> None:
+    """Remove obsolete source sets only after their replacement is accepted.
+
+    Real imports call this after the durable ledger write. Assessments have a
+    separate namespace and call it only after all context checks succeed.
+    """
+    root = os.path.join(state_dir, workdir_name + "-sources")
+    current = inputs.get("source_snapshot_dir")
+    if not current or os.path.dirname(current) != root or not os.path.isdir(current):
+        return
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if path == current or not re.fullmatch(r"[0-9a-f]{64}", name) or os.path.islink(path):
+            continue
+        if os.path.isdir(path):
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                warn("cannot retire obsolete input snapshot {0}: {1}".format(path, exc))
 
 
 def bundle_acknowledgements(cli_accept, merged, recorded_digest: Optional[str],
@@ -3854,12 +3888,13 @@ def _make_ctx(args, import_mode: bool,
         die("--fixups-dir is a development seam and needs --dev-target")
     accepted = merged_acknowledgements(args.accept, state,
                                        continues_recorded_run(args))
+    workdir_name = "bundle" if real_run else "bundle-assess"
     inputs = _resolve_inputs(
         args, state_dir, accepted,
         recorded_digest=state.get("inputs", {}).get("bundle_sha256"),
         # an assessment extracts into its own workdir: the real run's
         # members (what --resume continues from) are never replaced
-        workdir_name="bundle" if real_run else "bundle-assess")
+        workdir_name=workdir_name)
     recorded_sources = state.get("inputs", {}).get("sources_sha256")
     if real_run and recorded_sources and recorded_sources != inputs.get("sources_sha256"):
         if not getattr(args, "restage", False) or etl_started(state_dir):
@@ -3960,6 +3995,7 @@ def _make_ctx(args, import_mode: bool,
             "target_contract_sha256": contract_sha,
         })
         save_state(state_dir, state)
+    retire_input_snapshots(inputs, state_dir, workdir_name)
 
     return {
         "state_dir": state_dir,

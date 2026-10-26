@@ -10,16 +10,20 @@ before the live schema is touched. Literals are never rewritten.
 """
 import gzip
 import hashlib
+import io
 import json
 import os
 import shutil
 import tempfile
 import tarfile
+import zlib
 
 from . import o19sql
 
 FORMAT = 1
 TRAILER = b"-- Dump completed"
+COMBINED_TRAILER = b"\n-- Dump completed (complete OSCAR dump set)\n"
+STATEMENT_SPOOL_LIMIT = 1 << 20
 
 
 def snapshot_file(path, destination):
@@ -50,7 +54,7 @@ def statements(stream, spool_dir=None):
     comment fragment is yielded too, so dump completion markers survive.
     """
     lexer = o19sql.Lexer()
-    spool = tempfile.SpooledTemporaryFile(max_size=1 << 20, dir=spool_dir)
+    spool = tempfile.SpooledTemporaryFile(max_size=STATEMENT_SPOOL_LIMIT, dir=spool_dir)
     start = 0
     position = 0
     try:
@@ -64,7 +68,7 @@ def statements(stream, spool_dir=None):
                 spool.seek(0)
                 yield spool
                 spool.close()
-                spool = tempfile.SpooledTemporaryFile(max_size=1 << 20, dir=spool_dir)
+                spool = tempfile.SpooledTemporaryFile(max_size=STATEMENT_SPOOL_LIMIT, dir=spool_dir)
                 start = boundary
                 offset = take
             spool.write(chunk[offset:])
@@ -124,7 +128,7 @@ def statement_info(statement):
 
 
 def restore_chunks(stream, spool_dir=None):
-    """Restore original SQL with uniqueness enforced after dump SET controls.
+    """Restore original SQL with uniqueness and diagnostics kept enabled.
 
     mysqldump itself sets UNIQUE_CHECKS=0, overriding --init-command. Append
     a separate control statement after session SET statements; never edit a
@@ -139,7 +143,9 @@ def restore_chunks(stream, spool_dir=None):
         for chunk in iter(lambda: statement.read(1 << 20), b""):
             yield chunk
         if verb == "SET":
-            yield b"\nSET SESSION UNIQUE_CHECKS=1;\n"
+            # SQL_NOTES=0 suppresses Notes even when note_verbosity is 'all'.
+            # Both controls are needed on the packaged MariaDB floor (11.4).
+            yield b"\nSET SESSION UNIQUE_CHECKS=1, SQL_NOTES=1, note_verbosity='all';\n"
 
 
 def session_assignments(tokens):
@@ -207,12 +213,47 @@ def inventory(path):
     return {table: digest.hexdigest() for table, digest in sorted(tables.items())}
 
 
+def preparation_footprint(path):
+    """Measure combined-output bytes and largest disk spool without writing SQL.
+
+    Count the newline appended after every statement, including its trailing
+    comment fragment. Inventory and combination each keep at most one statement
+    spool at once; only statements exceeding the memory limit consume disk.
+    """
+    lexer = o19sql.Lexer()
+    opener = gzip.open if path.endswith(".gz") else open
+    position = start = count = largest = 0
+    try:
+        with opener(path, "rb") as stream:
+            while True:
+                chunk = stream.read(1 << 20)
+                lexer.feed(chunk, final=not chunk)
+                for boundary in lexer.boundaries:
+                    largest = max(largest, boundary - start)
+                    start = boundary
+                    count += 1
+                position += len(chunk)
+                if not chunk:
+                    if lexer.state not in ("sql", "line") or lexer.executable:
+                        raise ValueError("incomplete SQL statement (unclosed quote or comment)")
+                    if position > start:
+                        largest = max(largest, position - start)
+                        count += 1
+                    break
+    except zlib.error as exc:
+        raise ValueError("corrupt compressed SQL dump") from exc
+    return position + count, largest if largest > STATEMENT_SPOOL_LIMIT else 0
+
+
 def prepare_dump_set(paths, workdir):
     """Snapshot, inventory and combine two or more dumps; return paths/provenance.
 
     A single dump retains the established interface. For multiple dumps the
     output contains one owner for each table, with each part's session prelude
     and epilogue intact. File order and all part digests are bound to the run.
+    Before inventory can spill expanded statements to disk, reserve room for
+    the complete output and its largest statement spool. Identical overlaps
+    may reduce actual output; the budget conservatively includes every part.
     """
     if not paths:
         raise ValueError("no SQL dump selected")
@@ -226,7 +267,22 @@ def prepare_dump_set(paths, workdir):
             raise ValueError("insufficient disk to snapshot the complete SQL dump set")
         snapshot = os.path.join(workdir, "part-{0:03d}.sql{1}".format(number, ".gz" if path.endswith(".gz") else ""))
         digest = snapshot_file(path, snapshot)
-        tables = inventory(snapshot) if len(paths) > 1 else {}
+        parts.append({"name": os.path.basename(path), "sha256": digest,
+                      "snapshot": snapshot})
+    if len(paths) == 1:
+        return {"dump": parts[0]["snapshot"], "parts": [
+            {"name": parts[0]["name"], "sha256": parts[0]["sha256"]}], "duplicates": []}
+    footprints = [preparation_footprint(part["snapshot"]) for part in parts]
+    output_bytes = sum(output for output, _ in footprints) + len(COMBINED_TRAILER)
+    spool_bytes = max(spool for _, spool in footprints)
+    required = output_bytes + spool_bytes
+    # These snapshots already consume space: the current free-space figure
+    # accounts for them, as well as any output retained from an earlier run.
+    if shutil.disk_usage(workdir).free < required:
+        raise ValueError("insufficient disk to prepare the expanded SQL dump set and temporary statement spool")
+    for number, part in enumerate(parts):
+        tables = inventory(part["snapshot"])
+        part["tables"] = tables
         for table, fingerprint in tables.items():
             if table in owners:
                 previous, previous_fingerprint = owners[table]
@@ -236,11 +292,15 @@ def prepare_dump_set(paths, workdir):
                 duplicates.append({"table": table, "part": number, "owner": previous})
             else:
                 owners[table] = number, fingerprint
-        parts.append({"name": os.path.basename(path), "sha256": digest,
-                      "snapshot": snapshot, "tables": tables})
-    if len(paths) == 1:
-        return {"dump": parts[0]["snapshot"], "parts": [
-            {"name": parts[0]["name"], "sha256": parts[0]["sha256"]}], "duplicates": []}
+    provenance = {"format": FORMAT, "parts": [
+        {key: value for key, value in part.items() if key != "snapshot"} for part in parts],
+        "duplicates": duplicates}
+    provenance_text = json.dumps(provenance, sort_keys=True, indent=2)
+    # Provenance is written after the combined file, when its spool is gone.
+    # Recheck current capacity now that its exact size and table set are known.
+    required = output_bytes + max(spool_bytes, len(provenance_text.encode("utf-8")))
+    if shutil.disk_usage(workdir).free < required:
+        raise ValueError("insufficient disk to prepare the expanded SQL dump set and provenance")
     dest_path = os.path.join(workdir, "combined.sql")
     incoming = dest_path + ".incoming"
     fd = os.open(incoming, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -257,20 +317,30 @@ def prepare_dump_set(paths, workdir):
                         statement.seek(0)
                         shutil.copyfileobj(statement, dest, 1 << 20)
                         dest.write(b"\n")
-            dest.write(b"\n-- Dump completed (complete OSCAR dump set)\n")
+            dest.write(COMBINED_TRAILER)
             dest.flush()
             os.fsync(dest.fileno())
         os.replace(incoming, dest_path)
     finally:
         if os.path.exists(incoming):
             os.unlink(incoming)
-    provenance = {"format": FORMAT, "parts": [
-        {key: value for key, value in part.items() if key != "snapshot"} for part in parts],
-        "duplicates": duplicates}
     with open(os.path.join(workdir, "sources.json"), "w", encoding="utf-8") as document:
         os.fchmod(document.fileno(), 0o600)
-        json.dump(provenance, document, sort_keys=True, indent=2)
+        document.write(provenance_text)
     return {"dump": dest_path, "parts": provenance["parts"], "duplicates": duplicates}
+
+
+def prepared_document_member(member, name):
+    """Apply the output path and ownership consistently to tar metadata."""
+    member.name = name
+    # A parsed PAX path overrides TarInfo.name when serialized. Recompute it
+    # from the normalized name, including an incremental backup's context.
+    member.pax_headers = dict(member.pax_headers)
+    member.pax_headers.pop("path", None)
+    member.uid = member.gid = 0
+    member.uname = member.gname = ""
+    member.mode = 0o600
+    return member
 
 
 def prepare_documents(paths, workdir):
@@ -322,7 +392,20 @@ def prepare_documents(paths, workdir):
         for kind, name, size in entries:
             if kind == o19bundle.TAR_TYPE_FILE:
                 owners[os.path.join(prefix, os.path.normpath(name))] = number, size
-    required = sum(size for _, size in owners.values()) + len(owners) * 1024 + 10240
+    # PAX headers for Unicode/long paths or source metadata can exceed the
+    # ordinary header allowance. Measure exactly what the writer will emit.
+    required = 0
+    with tarfile.open(fileobj=io.BytesIO(), mode="w") as probe:
+        for number, path in enumerate(paths):
+            with tarfile.open(path, mode="r|*") as source:
+                for member in source:
+                    key = os.path.join(prefixes[number], os.path.normpath(member.name))
+                    if member.isfile() and owners.get(key, (None,))[0] == number:
+                        member = prepared_document_member(member, key)
+                        required += len(member.tobuf(probe.format, probe.encoding, probe.errors))
+                        required += (member.size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE * tarfile.BLOCKSIZE
+    required += 2 * tarfile.BLOCKSIZE
+    required = (required + tarfile.RECORDSIZE - 1) // tarfile.RECORDSIZE * tarfile.RECORDSIZE
     if shutil.disk_usage(workdir).free < required:
         raise ValueError("insufficient disk to prepare the complete documents backup set")
     output = os.path.join(workdir, "documents.tar")
@@ -336,10 +419,7 @@ def prepare_documents(paths, workdir):
                     for member in source:
                         key = os.path.join(prefixes[number], os.path.normpath(member.name))
                         if member.isfile() and owners.get(key, (None,))[0] == number:
-                            member.name = key
-                            member.uid = member.gid = 0
-                            member.uname = member.gname = ""
-                            member.mode = 0o600
+                            member = prepared_document_member(member, key)
                             with source.extractfile(member) as content:
                                 combined.addfile(member, content)
             dest.flush()

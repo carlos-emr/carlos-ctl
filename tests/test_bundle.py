@@ -9,8 +9,11 @@ Run (from the repository root):
 """
 
 import os
+import io
+import json
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -70,6 +73,24 @@ class TestClassifyMembers(unittest.TestCase):
     def test_nested_backup_members_are_recognized(self):
         roles = o19bundle.classify_members(["sub/o19.sql.gz", "oscar.properties"])
         self.assertEqual(roles["dump"], "sub/o19.sql.gz")
+
+    def test_native_document_extensions_do_not_assign_import_roles(self):
+        documents = ["oscar/document/upload.tar.gz", "oscar/document/digests.json",
+                     "oscar/eform/o19-inputs.json", "oscar/billing/report.sql",
+                     "oscar/measurementMap/lookup.sql.gz", "oscar/form/oscar.properties"]
+        roles = o19bundle.classify_members(["oscar/OscarBackup.sql", "oscar/oscar.properties"] + documents)
+        self.assertEqual(roles["dumps"], ["oscar/OscarBackup.sql"])
+        self.assertEqual(roles["properties"], "oscar/oscar.properties")
+        self.assertIsNone(roles["digests"])
+        self.assertEqual(roles["document_parts"], [])
+        self.assertCountEqual(roles["embedded_documents"], documents)
+
+    def test_explicit_roles_can_select_files_inside_document_named_directories(self):
+        names = ["billing/main.sql", "billing/documents.tar", "billing/oscar.properties"]
+        roles = o19bundle.input_manifest_roles({"format": 1, "dumps": names[:1],
+                                               "documents": names[1:2], "properties": names[2]}, names)
+        self.assertEqual(roles["dumps"], names[:1])
+        self.assertEqual(roles["document_parts"], names[1:2])
 
     def test_traversal_member_is_refused(self):
         with self.assertRaises(ValueError):
@@ -420,6 +441,84 @@ class TestOpenBundleEndToEnd(unittest.TestCase):
                 self.assertEqual(len(res["bundle_sha256"]), 64)
                 with open(res["dump"]) as fh:
                     self.assertIn("Dump completed", fh.read())
+
+    def test_native_documents_named_like_controls_are_preserved_byte_for_byte(self):
+        documents = {"oscar/document/upload.tar.gz": b"an uploaded archive, not a backup",
+                     "oscar/document/scan with\nnewline.pdf": b"a filename containing whitespace",
+                     "oscar/document/digests.json": b'{"patient": "document"}',
+                     "oscar/eform/o19-inputs.json": b"saved document, not a descriptor",
+                     "oscar/billing/report.sql": b"SELECT 'clinical report';",
+                     "oscar/measurementMap/lookup.sql.gz": b"saved attachment",
+                     "oscar/form/oscar.properties": b"saved properties attachment"}
+        contents = {"oscar/OscarBackup.sql": b"-- database fixture\n-- Dump completed\n",
+                    "oscar/oscar.properties": b"billregion=ON\n", **documents}
+        bundle = os.path.join(self.work, "native.tar.gz")
+        with tarfile.open(bundle, "w:gz") as archive:
+            for name, data in contents.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        opened = o19bundle.open_bundle(bundle, os.path.join(self.work, "native"))
+        self.assertEqual(len(opened["dumps"]), 1)
+        self.assertIsNone(opened["digests"])
+        with open(opened["properties"], "rb") as properties:
+            self.assertEqual(properties.read(), contents["oscar/oscar.properties"])
+        with tarfile.open(opened["documents"]) as archive:
+            self.assertCountEqual(archive.getnames(), documents)
+            for name, data in documents.items():
+                with archive.extractfile(name) as member:
+                    self.assertEqual(member.read(), data)
+
+    def test_legacy_digest_filename_uses_format_without_guessing_metadata(self):
+        digest = json.dumps({"digest_format": 3, "tables": {"a": {"columns": [["id", "int"]],
+                            "rows": 0, "total": "0", "parity": "0", "unhashed": 0}}, "errors": {}}).encode()
+        cases = [({"clinic-content.json": digest, "metadata.json": b'{"metadata": true}'}, "clinic-content.json"),
+                 ({"metadata.json": b'{"metadata": true}', "invalid.json": b"unrelated text"}, None),
+                 ({"first.json": digest, "second.json": digest}, "ambiguous")]
+        for index, (extras, expected) in enumerate(cases):
+            with self.subTest(expected=expected):
+                bundle = os.path.join(self.work, "legacy-{0}.tar".format(index))
+                contents = {"o19.sql": b"-- Dump completed\n", "oscar.properties": b"billregion=ON\n", **extras}
+                with tarfile.open(bundle, "w") as archive:
+                    for name, data in contents.items():
+                        member = tarfile.TarInfo(name)
+                        member.size = len(data)
+                        archive.addfile(member, io.BytesIO(data))
+                destination = os.path.join(self.work, "legacy-{0}".format(index))
+                if expected == "ambiguous":
+                    with self.assertRaises(SystemExit):
+                        o19bundle.open_bundle(bundle, destination)
+                else:
+                    opened = o19bundle.open_bundle(bundle, destination)
+                    self.assertEqual(os.path.basename(opened["digests"]) if opened["digests"] else None, expected)
+                    if expected:
+                        with open(opened["digests"], "rb") as content:
+                            self.assertEqual(content.read(), digest)
+
+    def test_native_documents_capacity_includes_headers_pax_and_padding(self):
+        documents = {"oscar/document/{0:03d}.pdf".format(number): b"x" for number in range(40)}
+        documents["oscar/document/" + "long-" * 30 + "santé.pdf"] = b"tiny PAX document"
+        contents = {"oscar/OscarBackup.sql": b"-- Dump completed\n", "oscar/oscar.properties": b"billregion=ON\n", **documents}
+        bundle = os.path.join(self.work, "tiny-documents.tar")
+        with tarfile.open(bundle, "w") as archive:
+            for name, data in contents.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        baseline_dir = os.path.join(self.work, "tiny-baseline")
+        baseline = o19bundle.open_bundle(bundle, baseline_dir)
+        archive_bytes = os.path.getsize(baseline["documents"])
+        self.assertGreater(archive_bytes, sum(map(len, documents.values())) * 100)
+        self.assertEqual(o19bundle.native_documents_size(baseline_dir, list(documents), "oscar"), archive_bytes)
+
+        refused_dir = os.path.join(self.work, "tiny-refused")
+        with mock.patch.object(o19bundle.shutil, "disk_usage", return_value=mock.Mock(free=archive_bytes - 1)), \
+                self.assertRaises(SystemExit):
+            o19bundle.open_bundle(bundle, refused_dir)
+        self.assertFalse(os.path.exists(os.path.join(refused_dir, ".native-documents.tar")))
+        with mock.patch.object(o19bundle.shutil, "disk_usage", return_value=mock.Mock(free=archive_bytes)):
+            accepted = o19bundle.open_bundle(bundle, os.path.join(self.work, "tiny-accepted"))
+        self.assertEqual(os.path.getsize(accepted["documents"]), archive_bytes)
 
     def test_the_decrypted_bundle_is_never_world_readable(self):
         """The decrypted tar is the clinic's WHOLE database in clear, and
