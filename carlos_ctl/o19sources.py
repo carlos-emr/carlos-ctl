@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import tempfile
 import tarfile
@@ -25,6 +26,8 @@ TRAILER = b"-- Dump completed"
 COMBINED_TRAILER = b"\n-- Dump completed (complete OSCAR dump set)\n"
 STATEMENT_SPOOL_LIMIT = 1 << 20
 SET_TOKEN_LIMIT = 65536
+QUOTING_MODES = re.compile(
+    rb"\b(?:ANSI_QUOTES|NO_BACKSLASH_ESCAPES|ANSI|DB2|MAXDB|MSSQL|ORACLE|POSTGRESQL)\b", re.I)
 
 
 def snapshot_file(path, destination):
@@ -128,7 +131,7 @@ def statement_info(statement):
     return verb, None, offset
 
 
-def statement_session_assignments(statement, offset):
+def statement_session_assignments(statement, offset, mode_captures=None):
     """Scan every SET assignment, including those after a large prefix.
 
     Keep quote state across reads and finalize only at the statement's EOF.
@@ -143,7 +146,7 @@ def statement_session_assignments(statement, offset):
         if len(tokens) > SET_TOKEN_LIMIT:
             raise ValueError("SET statement has too many metadata tokens; export with ordinary mysqldump session settings")
         if not chunk:
-            return session_assignments(tokens)
+            return session_assignments(tokens, mode_captures)
 
 
 def restore_chunks(stream, spool_dir=None):
@@ -153,10 +156,11 @@ def restore_chunks(stream, spool_dir=None):
     a separate control statement after session SET statements; never edit a
     literal, INSERT or source file. Large statements remain disk-spooled.
     """
+    mode_captures = set()
     for statement in statements(stream, spool_dir):
         verb, _, offset = statement_info(statement)
         if verb == "SET":
-            statement_session_assignments(statement, offset)
+            statement_session_assignments(statement, offset, mode_captures)
         statement.seek(0)
         for chunk in iter(lambda: statement.read(1 << 20), b""):
             yield chunk
@@ -166,17 +170,26 @@ def restore_chunks(stream, spool_dir=None):
             yield b"\nSET SESSION UNIQUE_CHECKS=1, SQL_NOTES=1, note_verbosity='all';\n"
 
 
-def session_assignments(tokens):
+def session_assignments(tokens, mode_captures=None):
     """Relevant literal interpretation controls, excluding @OLD_* captures."""
     result = {}
-    keys = {b"SQL_MODE", b"TIME_ZONE", b"CHARACTER_SET_CLIENT", b"COLLATION_CONNECTION", b"OLD_MODE"}
+    if mode_captures is None:
+        mode_captures = set()
+    keys = {b"SQL_MODE", b"TIME_ZONE", b"CHARACTER_SET_CLIENT", b"COLLATION_CONNECTION", b"OLD_MODE", b"OLD_SQL_MODE"}
     for index, (kind, value) in enumerate(tokens):
         value = value.upper()
-        if kind not in ("word", "identifier"):
+        if kind not in ("word", "identifier") and not (
+                kind == "string" and value == b"OLD_SQL_MODE" and index
+                and tokens[index - 1] == ("symbol", b"@")):
             continue
         if value == b"NAMES":
             result["NAMES"] = tokens[index + 1:]
-        elif value in keys and index + 1 < len(tokens) and tokens[index + 1] == ("symbol", b"="):
+        elif value in keys and index + 1 < len(tokens):
+            equals = index + 1
+            if tokens[equals] == ("symbol", b":"):
+                equals += 1
+            if equals >= len(tokens) or tokens[equals] != ("symbol", b"="):
+                continue
             # A system variable may be quoted or scoped (@@SESSION.sql_mode).
             # User variable names may also contain dots (@session.sql_mode).
             # Find the start of a qualified name before distinguishing @/@@.
@@ -184,18 +197,44 @@ def session_assignments(tokens):
             while (start > 1 and tokens[start - 1] == ("symbol", b".")
                    and tokens[start - 2][0] in ("word", "identifier")):
                 start -= 2
-            if (start and tokens[start - 1] == ("symbol", b"@")
-                    and not (start > 1 and tokens[start - 2] == ("symbol", b"@"))):
-                continue
-            end = index + 2
+            user_variable = (start and tokens[start - 1] == ("symbol", b"@")
+                             and not (start > 1 and tokens[start - 2] == ("symbol", b"@")))
+            end = equals + 1
             while end < len(tokens) and tokens[end] not in (("symbol", b","), ("symbol", b";")):
                 end += 1
-            assigned = tokens[index + 2:end]
+            assigned = tokens[equals + 1:end]
+            upper_assigned = [(kind, item.upper()) for kind, item in assigned]
+            if user_variable:
+                if value == b"OLD_SQL_MODE":
+                    # mysqldump saves the current ordinary session mode and
+                    # restores it in its footer. No other expression is safe
+                    # to infer without evaluating arbitrary SQL.
+                    capture = [("symbol", b"@"), ("symbol", b"@"), ("word", b"SQL_MODE")]
+                    scoped = capture[:2] + [("word", b"SESSION"), ("symbol", b".")] + capture[2:]
+                    normalized = [("word" if kind == "identifier" else kind, item)
+                                  for kind, item in upper_assigned]
+                    if normalized not in (capture, scoped) or start != index:
+                        raise ValueError("dump overwrites saved SQL_MODE; export with ordinary mysqldump session settings")
+                    mode_captures.add(b"OLD_SQL_MODE")
+                continue
             if value == b"SQL_MODE" and any(kind == "truncated_string" for kind, _ in assigned):
                 raise ValueError("dump SQL_MODE literal exceeds the metadata limit; export with ordinary mysqldump quoting")
-            if value == b"SQL_MODE" and any(kind == "string" and (
-                    b"NO_BACKSLASH_ESCAPES" in item.upper() or b"ANSI_QUOTES" in item.upper()) for kind, item in assigned):
+            if value == b"SQL_MODE" and any(kind in ("string", "word") and QUOTING_MODES.search(item)
+                                            for kind, item in assigned):
                 raise ValueError("dump changes SQL quoting modes; export with ordinary mysqldump quoting (no ANSI_QUOTES or NO_BACKSLASH_ESCAPES)")
+            if value == b"SQL_MODE":
+                literal = (len(assigned) == 1 and assigned[0][0] in ("string", "word"))
+                if literal and assigned[0][0] == "word":
+                    item = upper_assigned[0][1]
+                    literal = (item == b"0" or (re.fullmatch(rb"[A-Z_][A-Z0-9_]*", item)
+                                               and item not in (b"DEFAULT", b"NULL")))
+                saved = (len(upper_assigned) == 2 and upper_assigned[0] == ("symbol", b"@")
+                         and upper_assigned[1][0] in ("word", "identifier", "string")
+                         and upper_assigned[1][1] == b"OLD_SQL_MODE" and b"OLD_SQL_MODE" in mode_captures)
+                if not literal and not saved:
+                    raise ValueError("unsupported SQL_MODE expression; export with ordinary mysqldump session settings")
+            if value == b"OLD_SQL_MODE":
+                raise ValueError("unsupported saved SQL_MODE assignment; export with ordinary mysqldump session settings")
             result[value.decode("ascii")] = assigned
     return result
 
@@ -206,11 +245,12 @@ def inventory(path):
     opener = gzip.open if path.endswith(".gz") else open
     tail = b""
     session = {}
+    mode_captures = set()
     with opener(path, "rb") as stream:
         for statement in statements(stream, os.path.dirname(path)):
             verb, table, offset = statement_info(statement)
             if verb == "SET":
-                session.update(statement_session_assignments(statement, offset))
+                session.update(statement_session_assignments(statement, offset, mode_captures))
             # Ignore comments surrounding statements, locks, and key-disable
             # wrappers. Compare the actual CREATE and INSERT/REPLACE bytes.
             wrapper = False
