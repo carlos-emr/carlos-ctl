@@ -155,7 +155,9 @@ def _package_versions():
 def _check_import_state() -> bool:
     """Explain the shared import guard before probing an intentionally stopped app."""
     if not os.path.exists(provision.O19_GUARD):
-        return False
+        _bad(f"OSCAR 19 import guard is missing: {provision.O19_GUARD}; "
+             f"reinstall carlos-emr: {REINSTALL_HINT}")
+        return True
     try:
         verdict = run([provision.O19_GUARD], capture_output=True)
     except OSError as exc:

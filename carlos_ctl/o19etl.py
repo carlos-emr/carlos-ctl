@@ -1246,6 +1246,39 @@ def numeric_capacity_precheck_sql(table: str, entry: dict, src_schema: str,
     return out
 
 
+def temporal_capacity_precheck_sql(table: str, entry: dict, src_schema: str,
+                                  dst_cols: Dict[str, dict], repaired=None,
+                                  archive_schema=None, window=None):
+    """Count temporal values the target cannot store without losing information.
+
+    Fractional seconds and a DATETIME's non-midnight time can disappear without
+    an INSERT warning. Compare the declared expression to the target conversion
+    before writing, rather than normalizing both sides to that narrower type.
+    TIMESTAMP also has a server-version-dependent range, unlike DATETIME;
+    UNIX_TIMESTAMP tests that server's range without hard-coding a 2038 limit.
+    """
+    out = []
+    for name in entry.get("cols", []):
+        info = dst_cols.get(name)
+        if not info or info["type"] not in ("date", "datetime", "timestamp", "time"):
+            continue
+        ctype = info.get("column_type", info["type"]).lower()
+        if not re.fullmatch(r"(?:date|datetime|timestamp|time)(?:\([0-6]\))?", ctype):
+            raise ValueError("invalid target temporal type metadata")
+        ctype = re.sub(r"^timestamp", "datetime", ctype)
+        expr = written_expr(entry, name, dst_cols, repaired, archive_schema)
+        predicates = ["NOT ({0} <=> CAST({0} AS {1}))".format(expr, ctype)]
+        if info["type"] == "timestamp":
+            value = "CAST({0} AS DATETIME(6))".format(expr)
+            predicates.append("({0} <> CAST('0000-00-00 00:00:00' AS DATETIME(6)) AND UNIX_TIMESTAMP({0}) IS NULL)".format(value))
+        clause = "{0} IS NOT NULL AND ({1})".format(expr, " OR ".join(predicates))
+        if window:
+            clause += " AND s.{0} > {1} AND s.{0} <= {2}".format(ident(entry["chunk_by"]), *window)
+        out.append((name, "SELECT COUNT(*) FROM {0}.{1} s WHERE {2}".format(
+            ident(src_schema), ident(table), clause)))
+    return out
+
+
 def idmap_statements(table: str, entry: dict, src_schema: str,
                      dst_schema: str, archive_schema: str,
                      dst_cols: Optional[Dict[str, dict]] = None) -> List[str]:
@@ -2643,6 +2676,12 @@ def etl_precheck_problems(ctx, plain, query, src_schema: str,
             if n:
                 problems.append("{0}.{1}: {2} value(s) exceed the target numeric range, scale or precision — refusing a lossy conversion"
                                 .format(table, col, n))
+        for col, sql in temporal_capacity_precheck_sql(
+                table, entry, src, dst_info[table], repairs.get(table)):
+            n = int(query(sql)[0][0])
+            if n:
+                problems.append("{0}.{1}: {2} value(s) exceed the target temporal range or precision — refusing a lossy conversion"
+                                .format(table, col, n))
     # the roles post-step's own preconditions, predicted from staging (the
     # tables involved are id-intact copies): refuse here, before the first
     # write, rather than after the whole copy
@@ -3125,11 +3164,16 @@ def etl_copy_table(run: 'EtlRun', table: str, entry: dict, tstate: dict,
         run.copy_primary_keys = primary_key_columns(plain, dst)
     key = run.copy_primary_keys.get(table) or []
     pairable = bool(key) and all(column in entry["cols"] and column in dcols for column in key)
+    if (not pairable and not entry.get("replace_seed")
+            and table not in seed_group and not tstate.get("started")):
+        before = int(plain("SELECT COUNT(*) FROM `{0}`.`{1}`".format(dst, table))[0][0])
+        if before:
+            # A refusal must not grant the retry permission to delete these
+            # rows. Check before either branch persists its started marker.
+            raise QueryError("{0}: keyless target already holds rows without a declared replacement policy; refusing before copy".format(table))
 
     def insert_and_verify(window=None):
         before = None if pairable else int(plain("SELECT COUNT(*) FROM `{0}`.`{1}`".format(dst, table))[0][0])
-        if not pairable and not window and before:
-            raise QueryError("{0}: keyless target already holds rows without a declared replacement policy; refusing before copy".format(table))
         query(copy_statement(table, entry, src, dst, dcols, repaired, window, arch))
         if pairable:
             n = int(plain(copy_value_mismatch_sql(table, entry, src, dst, dcols, key,
@@ -4089,6 +4133,14 @@ def copy_multiset_parity(query, table, entry, src, dst, dcols, repaired=None,
     hashes. Normalize numeric scale to the target's declared type on both sides;
     text retains every converted byte. SQL collations never decide hash equality.
     """
+    failures = []
+    for column, sql in temporal_capacity_precheck_sql(
+            table, entry, src, dcols, repaired, archive_schema, window):
+        count = int(query(sql)[0][0])
+        if count:
+            failures.append("{0}.{1}: {2} value(s) cannot be represented by the target temporal type".format(table, column, count))
+    if failures:
+        return failures
     columns = entry["cols"]
     types = {column: dcols[column]["type"] for column in columns}
     expected = {}
@@ -4101,8 +4153,9 @@ def copy_multiset_parity(query, table, entry, src, dst, dcols, repaired=None,
             source = target_key_expr(source, info)
             stored = target_key_expr(stored, info)
         elif info["type"] in ("date", "datetime", "timestamp", "time"):
-            ctype = info.get("column_type", info["type"])
-            ctype = re.sub(r"^timestamp", "datetime", ctype, flags=re.I)
+            # Keep all source fractional seconds visible to the witness.
+            # Both DATE and TIMESTAMP have a lossless DATETIME(6) rendering.
+            ctype = "TIME(6)" if info["type"] == "time" else "DATETIME(6)"
             source = "CAST({0} AS {1})".format(source, ctype)
             stored = "CAST({0} AS {1})".format(stored, ctype)
         expected[column], actual[column] = source, stored

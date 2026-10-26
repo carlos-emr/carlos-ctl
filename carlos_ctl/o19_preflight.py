@@ -3263,7 +3263,7 @@ def check_properties(c, properties, locked_notes):
                 "CARLOS has no LDAP authentication: staff could not log in "
                 "after cutover. Provision local credentials first. No "
                 "--accept flag exists for this."))
-        # B4: encrypted casemgmt notes — judged on the rows below, not on
+        # B4: locked casemgmt notes — judged on the rows, not on
         # the property: casemgmt.note.password.enabled=true is the stock
         # O19 default and says nothing about whether a note was ever locked
         if properties.get("casemgmt.note.password.enabled", "") \
@@ -3271,9 +3271,9 @@ def check_properties(c, properties, locked_notes):
             findings.append(finding(
                 "notes-password-enabled", ADVISORY,
                 "casemgmt.note.password.enabled is set (the stock O19 "
-                "default) but no note carries a password",
-                "Nothing is encrypted; CARLOS has no reader for that key "
-                "and the props phase drops it."))
+                "default) but no note is locked",
+                "No locked notes were found. The props phase drops this "
+                "OSCAR setting because CARLOS does not use it."))
         dropped = {}
         exact = set(DROPPED_PROP_KEYS)
         for key in sorted(properties):
