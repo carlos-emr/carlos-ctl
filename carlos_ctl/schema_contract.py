@@ -10,13 +10,14 @@ import hashlib
 import json
 from pathlib import Path
 
-FORMAT = 1
+FORMAT = 2
 
 FIELDS = {
     "defaults": ("SCHEMATA", ["SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME"], "1=1"),
     "tables": ("TABLES", ["TABLE_NAME", "ENGINE", "ROW_FORMAT", "TABLE_COLLATION"], "TABLE_TYPE = 'BASE TABLE'"),
     "columns": ("COLUMNS", ["TABLE_NAME", "COLUMN_NAME", "COLUMN_TYPE", "IS_NULLABLE", "COLUMN_DEFAULT",
-                            "EXTRA", "CHARACTER_SET_NAME", "COLLATION_NAME", "GENERATION_EXPRESSION"], "1=1"),
+                            "EXTRA", "CHARACTER_SET_NAME", "COLLATION_NAME", "GENERATION_EXPRESSION",
+                            "ORDINAL_POSITION"], "1=1"),
     "indexes": ("STATISTICS", ["TABLE_NAME", "INDEX_NAME", "NON_UNIQUE", "SEQ_IN_INDEX", "COLUMN_NAME",
                                "COLLATION", "SUB_PART", "INDEX_TYPE", "IGNORED"], "1=1"),
     "keys": ("KEY_COLUMN_USAGE", ["TABLE_NAME", "CONSTRAINT_NAME", "ORDINAL_POSITION", "COLUMN_NAME",

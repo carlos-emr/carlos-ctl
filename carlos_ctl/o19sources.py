@@ -378,18 +378,16 @@ def prepare_documents(paths, workdir):
     owners = {}
     context = None
     prefixes = []
-    document_directories = {"document", "eform", "form", "hrm", "billing", "measurementMap",
-                            "intake", "tickler", "image", "document_cache", "incoming", "outgoing"}
     required = 0
     for number, path in enumerate(paths):
         entries = o19bundle.read_tar_entries(path, path.endswith(".gz"))
         o19bundle.validate_tar_members([(kind, name) for kind, name, _ in entries], allow_dirs=True)
         # Native incremental backups are made from INSIDE oscar/, unlike
         # full document backups. Recognize their known context subdirectories.
-        tops = {os.path.normpath(name).split("/")[0] for kind, name, _ in entries
+        tops = {os.path.normpath(name).split("/")[0].lower() for kind, name, _ in entries
                 if kind == o19bundle.TAR_TYPE_FILE}
         prefix = ""
-        if context and tops and tops <= document_directories:
+        if context and tops and tops <= o19bundle._DOCUMENT_DIRECTORIES:
             prefix = context
         else:
             current = o19docs.detect_context_dir([(kind, name) for kind, name, _ in entries])

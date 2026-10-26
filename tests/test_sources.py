@@ -166,6 +166,26 @@ class TestCompleteBackupSet(unittest.TestCase):
             self.assertEqual(archive.getnames(), ["oscar/document/a.pdf"])
             self.assertEqual(archive.extractfile("oscar/document/a.pdf").read(), b"new")
 
+    def test_incremental_native_directories_share_case_insensitive_recognition(self):
+        for index, directory in enumerate(("templates", "TEMPLATES", "measurementmap", "measurementMap")):
+            with self.subTest(directory=directory):
+                full = self.documents("full-{0}.tar.gz".format(index), {
+                    "oscar/{0}/changed.html".format(directory): b"old",
+                    "oscar/document/retained.pdf": b"retained"})
+                newer = self.documents("incremental-{0}.tar.gz".format(index), {
+                    "./{0}/changed.html".format(directory): b"replacement",
+                    "./{0}/added.html".format(directory): b"new"})
+                result = o19sources.prepare_documents([full, newer],
+                    str(self.root / "prepared-{0}".format(index)))
+                expected = {"oscar/{0}/changed.html".format(directory): b"replacement",
+                            "oscar/{0}/added.html".format(directory): b"new",
+                            "oscar/document/retained.pdf": b"retained"}
+                with tarfile.open(result["documents"]) as archive:
+                    self.assertCountEqual(archive.getnames(), expected)
+                    for name, content in expected.items():
+                        with archive.extractfile(name) as member:
+                            self.assertEqual(member.read(), content)
+
     def test_pax_incremental_document_names_keep_the_full_context(self):
         full = self.documents("full.tar.gz", {"oscar/document/santé.pdf": b"old"})
         newer = self.documents("incremental.tar.gz", {"./document/santé.pdf": b"new"})

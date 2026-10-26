@@ -16,6 +16,7 @@ class TestContractBinding(unittest.TestCase):
     @requires_carlos_src
     def test_exporter_and_importer_share_the_complete_metadata_protocol(self):
         exporter = runpy.run_path(carlos_path("scripts", "schema-contract.py"))
+        self.assertEqual(exporter["FORMAT"], schema_contract.FORMAT)
         self.assertEqual(exporter["FIELDS"], schema_contract.FIELDS)
         for province in ("on", "bc"):
             document = json.loads(Path(carlos_path("database", "mysql", "schema-contract", province + ".json")).read_text())
@@ -32,12 +33,21 @@ class TestContractBinding(unittest.TestCase):
             migration = root / "migration/common/V1__baseline.sql"
             migration.write_text("CREATE TABLE sample (id INT);")
             (root / "contracts").mkdir()
-            document = {"format": 1, "province": "on", "schema": {kind: [] for kind in schema_contract.FIELDS},
+            document = {"format": schema_contract.FORMAT, "province": "on", "schema": {kind: [] for kind in schema_contract.FIELDS},
                         "migration_sha256": schema_contract.migration_digest(root / "migration", "on")}
             (root / "contracts/on.json").write_text(json.dumps(document))
             self.assertEqual(schema_contract.load(root, "on"), document)
             migration.write_text("CREATE TABLE sample (id BIGINT);")
             with self.assertRaisesRegex(ValueError, "migration files"):
+                schema_contract.load(root, "on")
+
+    def test_contract_rejects_the_previous_column_protocol(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            (root / "contracts").mkdir()
+            document = {"format": 1, "province": "on", "schema": {kind: [] for kind in schema_contract.FIELDS}}
+            (root / "contracts/on.json").write_text(json.dumps(document))
+            with self.assertRaisesRegex(ValueError, "unsupported"):
                 schema_contract.load(root, "on")
 
 
@@ -64,6 +74,14 @@ class TestPhysicalSchemaMariaDB(unittest.TestCase):
         self.query("ALTER TABLE `{0}`.child DROP INDEX label_idx, ADD INDEX label_idx(parent_id)".format(self.schema))
         differences = schema_contract.differences(self.expected, schema_contract.capture(self.query, self.schema))
         self.assertTrue(any("indexes:" in line and "label_idx" in line for line in differences))
+
+    def test_column_reordering_is_detected_without_definition_changes(self):
+        self.query("ALTER TABLE `{0}`.child MODIFY label VARCHAR(30) DEFAULT 'NULL' AFTER id".format(self.schema))
+        actual = schema_contract.capture(self.query, self.schema)
+        self.assertEqual([row[:-1] for row in self.expected["columns"]],
+                         [row[:-1] for row in actual["columns"]])
+        differences = schema_contract.differences(self.expected, actual)
+        self.assertTrue(any("columns:" in line and "child.label" in line for line in differences))
 
     def test_defaults_and_column_collations_are_exact(self):
         columns = {row[1]: row for row in self.expected["columns"] if row[0] == "child"}
