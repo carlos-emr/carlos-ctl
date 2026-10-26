@@ -5,12 +5,28 @@
 import subprocess
 import sys
 import unittest
+import re
 from unittest import mock
 
 from carlos_ctl import o19etl, o19host, o19import
 
 
 class TestBufferedClientTransport(unittest.TestCase):
+
+    def test_should_preserve_explicit_zero_ids_in_the_non_strict_etl_session(self):
+        result = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(o19import, "run_sql_client", return_value=result) as client:
+            o19import.make_etl_query(["mariadb"], statement_timeout=17)("SELECT 1")
+        argv = client.call_args.args[0]
+        prelude = next(arg.split("=", 1)[1] for arg in argv
+                       if arg.startswith("--init-command="))
+        mode = re.search(r"\bsql_mode='([^']*)'", prelude)
+        self.assertIsNotNone(mode)
+        # Preserve literal AUTO_INCREMENT zero keys without strict/coercion or
+        # quoting modes that change the import's existing SQL semantics.
+        self.assertEqual(mode.group(1).split(","), ["NO_AUTO_VALUE_ON_ZERO"])
+        self.assertIn("UNIQUE_CHECKS=1", prelude)
+        self.assertIn("max_statement_time=17", prelude)
 
     def _base(self, output, rc=0, error=b""):
         # A real child emits MariaDB batch bytes, including literal CR.
