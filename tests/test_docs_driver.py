@@ -253,12 +253,15 @@ class TestTheHappyPath(DocsDriverBase):
         self.assertIn("Eyeform.csv: 1 row(s)", self.report())
 
     def test_the_export_files_are_not_world_readable(self):
-        # archived clinical rows: 0640 under a 0750 directory
+        # Archived clinical rows: 0640 under a directory no broader than 0750.
+        # A restrictive host umask can remove the directory's group bits.
         db = FakeDb(documents=[["1", "a.pdf"], ["2", "b.pdf"]],
                     archive={"Eyeform": (["id"], [["7"]])})
         self.run_docs(db=db)
         out = os.path.join(self.state_dir, "o19-archive-export")
-        self.assertEqual(os.stat(out).st_mode & 0o777, 0o750)
+        directory_mode = os.stat(out).st_mode & 0o777
+        self.assertEqual(directory_mode & 0o700, 0o700)
+        self.assertEqual(directory_mode & ~0o750, 0)
         self.assertEqual(
             os.stat(os.path.join(out, "Eyeform.csv")).st_mode & 0o777, 0o640)
 
