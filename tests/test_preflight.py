@@ -494,6 +494,10 @@ class TestVerdicts(unittest.TestCase):
         carried = [f for f in report["findings"] if f["id"] == "B9-credentials-carried"]
         self.assertEqual(len(carried), 1)
         self.assertEqual(carried[0]["data"], {"ServiceAccessToken": 3})
+        self.assertEqual(carried[0]["severity"], pf.BLOCKER)
+        self.assertEqual(carried[0]["accept"], "carry-credentials")
+        self.assertEqual(report["verdict"], "go-with-acknowledgements")
+        self.assertIn("carry-credentials", report["required_accepts"])
         report = pf.run_checks(FakeDb(base_tables(ServiceAccessToken=3)),
                                properties=clean_props(), accepted=["carry-credentials"])
         self.assertEqual(report["verdict"], "go")

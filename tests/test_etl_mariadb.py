@@ -353,10 +353,16 @@ class TestOAuthGrantMariaDB(unittest.TestCase):
         self.copy("ServiceClient")
         self.copy("ServiceAccessToken")
         self.run.progress["tables"]["ServiceAccessToken"].pop("done")
+        # An interrupted destination must be repaired, not merely left alone.
+        self.plain("DELETE FROM `{0}`.ServiceAccessToken WHERE id=2".format(self.dst))
+        self.plain("UPDATE `{0}`.ServiceAccessToken SET tokenSecret='damaged',issued=1 WHERE id=1".format(self.dst))
         self.copy("ServiceAccessToken")
         self.assertEqual(self.plain("SELECT COUNT(*) FROM `{0}`.ServiceAccessToken".format(self.dst)), [["3"]])
         self.assertEqual(self.plain("SELECT issued,lifetime FROM `{0}`.ServiceAccessToken WHERE id=1".format(self.dst)),
                          [["1550000000", "-1"]])
+        fields = "id,clientId,HEX(tokenId),HEX(tokenSecret),issued,lifetime,providerNo,HEX(scopes)"
+        self.assertEqual(self.plain("SELECT {0} FROM `{1}`.ServiceAccessToken ORDER BY id".format(fields,self.src)),
+                         self.plain("SELECT {0} FROM `{1}`.ServiceAccessToken ORDER BY id".format(fields,self.dst)))
 
     def test_should_use_minus_one_only_when_the_old_source_column_is_absent(self):
         self.plain("ALTER TABLE `{0}`.ServiceClient DROP COLUMN lifetime".format(self.src))
