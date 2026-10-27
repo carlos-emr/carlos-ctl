@@ -378,11 +378,47 @@ class TestOAuthGrantMariaDB(unittest.TestCase):
         from carlos_ctl import o19_preflight as pf
         checks = []
         # The subquery runs in the staged database, just as standalone preflight does.
-        def staged_count(table, where):
-            return int(self.plain("USE `{0}`; SELECT COUNT(*) FROM `{1}` WHERE {2}".format(self.src,table,where))[0][0])
+        def staged_count(table, where=None):
+            return int(self.plain("USE `{0}`; SELECT COUNT(*) FROM `{1}` WHERE {2}".format(self.src,table,where or "1=1"))[0][0])
         self.plain("INSERT INTO `{0}`.ServiceAccessToken SELECT 4,clientId,UPPER(tokenId),tokenSecret,issued,lifetime,providerNo,scopes,dateCreated "
                    "FROM `{0}`.ServiceAccessToken WHERE id=1".format(self.src))
         pf.check_oauth_grants(SimpleNamespace(tables={"ServiceClient":"ServiceClient", "ServiceAccessToken":"ServiceAccessToken"},
                                              count_live=staged_count, findings=checks))
         self.assertTrue(any(f["id"] == "oauth-ambiguous-ServiceAccessToken" for f in checks))
+        self.assertNotIn("fixture-o19-token", str(checks))
+
+    def test_should_block_an_orphaned_grant_before_a_migration_admin_reuses_its_provider_number(self):
+        from carlos_ctl import o19_preflight as pf
+        for schema in (self.src, self.dst):
+            self.plain("CREATE TABLE `{0}`.provider (provider_no VARCHAR(25) PRIMARY KEY)".format(schema))
+        self.plain("INSERT INTO `{0}`.provider VALUES ('42')".format(self.src))
+        next_admin = self.plain("SELECT MAX(CAST(provider_no AS SIGNED))+1 FROM `{0}`.provider".format(self.src))[0][0]
+        self.assertEqual(next_admin, "43")
+        self.plain("INSERT INTO `{0}`.provider VALUES ('43')".format(self.dst))
+        self.plain("UPDATE `{0}`.ServiceAccessToken SET providerNo='43'".format(self.src))
+        checks = []
+        def staged_count(table, where=None):
+            return int(self.plain("USE `{0}`; SELECT COUNT(*) FROM `{1}` WHERE {2}".format(self.src,table,where or "1=1"))[0][0])
+        pf.check_oauth_grants(SimpleNamespace(
+            tables={"ServiceClient":"ServiceClient", "ServiceAccessToken":"ServiceAccessToken", "provider":"provider"},
+            count_live=staged_count, findings=checks))
+        orphan = next(f for f in checks if f["id"] == "oauth-orphan-provider")
+        self.assertEqual(orphan["severity"], pf.BLOCKER)
+        self.assertNotIn("accept", orphan)
+        self.assertEqual(orphan["data"], {"rows": 3})
+        self.assertNotIn("fixture-o19-token", str(checks))
+
+    def test_should_report_null_issuance_and_lifetime_without_rewriting_credentials(self):
+        from carlos_ctl import o19_preflight as pf
+        self.plain("UPDATE `{0}`.ServiceAccessToken SET issued=NULL WHERE id=1".format(self.src))
+        self.plain("UPDATE `{0}`.ServiceAccessToken SET lifetime=NULL WHERE id=2".format(self.src))
+        checks = []
+        def staged_count(table, where=None):
+            return int(self.plain("USE `{0}`; SELECT COUNT(*) FROM `{1}` WHERE {2}".format(self.src,table,where or "1=1"))[0][0])
+        pf.check_oauth_grants(SimpleNamespace(
+            tables={"ServiceClient":"ServiceClient", "ServiceAccessToken":"ServiceAccessToken"},
+            count_live=staged_count, findings=checks))
+        malformed = next(f for f in checks if f["id"] == "oauth-invalid-token-metadata")
+        self.assertEqual(malformed["severity"], pf.ADVISORY)
+        self.assertEqual(malformed["data"], {"rows": 2})
         self.assertNotIn("fixture-o19-token", str(checks))

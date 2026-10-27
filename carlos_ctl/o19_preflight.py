@@ -2600,7 +2600,7 @@ def check_carried_credentials(c):
 
 
 def check_oauth_grants(c):
-    """Report unusable grants; refuse ambiguous credential identifiers.
+    """Refuse ambiguous or orphaned grants; report malformed credentials.
 
     Queries and reports contain counts only, never keys, token IDs or secrets.
     The comparison uses the target collation so a source's case variants cannot
@@ -2633,7 +2633,8 @@ def check_oauth_grants(c):
                 "integration in the source; do not invent replacement credentials.",
                 data={"table": table, "rows": invalid}))
     if "ServiceAccessToken" in c.tables:
-        invalid = c.count_live("ServiceAccessToken", "`issued` <= 0 OR `lifetime` < -1")
+        invalid = c.count_live("ServiceAccessToken",
+            "`issued` IS NULL OR `lifetime` IS NULL OR `issued` <= 0 OR `lifetime` < -1")
         if invalid:
             c.findings.append(finding(
                 "oauth-invalid-token-metadata", ADVISORY,
@@ -2645,18 +2646,21 @@ def check_oauth_grants(c):
         for parent, field, parent_field in (("ServiceClient", "clientId", "id"),
                                              ("provider", "providerNo", "provider_no")):
             if parent not in c.tables:
-                continue
-            parent_live = c.tables[parent].replace("`", "``")
-            missing = c.count_live("ServiceAccessToken",
-                "`{0}` IS NULL OR NOT EXISTS (SELECT 1 FROM `{1}` oauth_parent "
-                "WHERE oauth_parent.`{2}` = `{3}`.`{0}`)"
-                .format(field, parent_live, parent_field, live))
+                missing = c.count_live("ServiceAccessToken")
+            else:
+                parent_live = c.tables[parent].replace("`", "``")
+                missing = c.count_live("ServiceAccessToken",
+                    "`{0}` IS NULL OR NOT EXISTS (SELECT 1 FROM `{1}` oauth_parent "
+                    "WHERE oauth_parent.`{2}` = `{3}`.`{0}`)"
+                    .format(field, parent_live, parent_field, live))
             if missing:
                 c.findings.append(finding(
-                    "oauth-orphan-" + parent, ADVISORY,
+                    "oauth-orphan-" + parent, BLOCKER,
                     "{0} OAuth grants refer to a missing {1}".format(missing, parent),
-                    "They are preserved but do not authorize access. Review the source "
-                    "integration; import never assigns a replacement owner.",
+                    "Resolve orphaned grants in the source before import. A target seed "
+                    "or newly created row could reuse a missing owner's identifier and "
+                    "activate the grant for a different identity. No accept flag bypasses "
+                    "this check and no credential values are shown.",
                     data={"rows": missing}))
 
 

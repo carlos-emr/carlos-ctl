@@ -1,5 +1,9 @@
 carlos-ctl (1.2.1~dev1) resolute; urgency=medium
 
+  * Preserve OSCAR 19 OAuth access tokens and legacy lifetime settings; include
+    grants in credential preflight and reject ambiguous identifiers or orphaned
+    grants before target identities can reuse their owner identifiers.
+    Report missing issuance/expiry metadata without inventing replacement values.
   * Fix OSCAR 19 collation aliases and note-lock classification. Compare
     converted text exactly, including trailing spaces, and use target
     comparison rules for source keys and merge mappings.
@@ -19,8 +23,6 @@ carlos-ctl (1.2.1~dev1) resolute; urgency=medium
 
 carlos-ctl (1.2.0~dev1) resolute; urgency=medium
 
-  * Preserve OSCAR 19 OAuth access tokens and legacy lifetime settings; include
-    grants in credential preflight and reject ambiguous identifiers.
   * db-users creates carlos_report, the read-only account carlos-emr's
     Query by Example now runs as (carlos-emr/carlos#3372), records it as
     db_reporting_username/db_reporting_password in carlos.properties, and
