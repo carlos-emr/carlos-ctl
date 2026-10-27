@@ -64,7 +64,8 @@ Description: administration command for the CARLOS EMR Debian deployment
  carlos-ctl administers a CARLOS EMR host installed from the carlos-emr
  package: the deployment check, service lifecycle, schema migration and
  database accounts, certificates, the ModSecurity front door, backups and
- restore drills, and the experimental OSCAR 19 clinic import.
+ restore drills, OntarioMD CDS patient-data import through the shared CARLOS
+ engine, and the experimental OSCAR 19 clinic import.
  .
  The carlos-emr maintainer scripts call the same verbs an administrator does,
  so provisioning logic exists in exactly one place. carlos-emr depends on

@@ -176,6 +176,92 @@ name back to it:
 sudo carlos-ctl destroy-data --confirm <server-name>
 ```
 
+## CDS import
+
+`carlos-ctl cds-import` runs the same CARLOS CDS import engine as the existing
+Administration → Data Management → Demographic Import web workflow. It accepts
+an XML file, ZIP or directory within the application's approved source root.
+It does not reinterpret source records, choose a target patient, or maintain
+its own success counters. A compatible CARLOS engine is required; a bounded
+capability handshake refuses older/unsupported application combinations before
+clinical execution. Java 25 is required, and the Java process runs as `carlos`.
+
+Prepare an access-controlled, immutable source and a verified database/document
+backup according to the migration runbook. Configure the approved source
+namespace/profile, the operator's delegation and the migration window in CARLOS;
+the command does not establish those approvals by itself. Start with a dry run:
+
+```bash
+sudo carlos-ctl cds-import --input /var/lib/carlos-emr/import/batch.zip \
+  --provider 999998 --source-namespace clinic-source --source-profile omd-5.2 \
+  --program 1 --facility 1 --dry-run
+```
+
+After resolving preflight findings, invoke with the same reviewed source/options
+without `--dry-run`. Namespace and profile are required for a new import; the
+namespace identifies the approved vendor/instance rather than an arbitrary
+new label to bypass prior-import protection. The engine independently checks
+the invoking OS operator, active provider, privileges and program/facility
+delegation. `sudo` does not grant clinical attribution by itself.
+
+| Option | Meaning |
+|---|---|
+| `--input PATH` | Source XML, ZIP or directory; paths with spaces/metacharacters remain literal arguments |
+| `--provider ID` | Explicit active CARLOS provider key (for example `999998` or `T099`) with approved operator delegation |
+| `--source-namespace KEY`, `--source-profile KEY` | Registered source instance and supported contract; required for a new import |
+| `--program ID`, `--facility ID` | Explicit target context where required by the deployment |
+| `--dry-run` | Read-only clinical preflight; administrative staging/run evidence may be written |
+| `--merge-existing` | Opt in to a proven unique eligible HIN + exact DOB match; default off |
+| `--no-match-providers` | Preserve historical source provider identity without name matching |
+| `--synthetic`, `--course ID`, `--timeshift DAYS` | Approved synthetic/anonymized workflow; course/nonzero shift require synthetic mode, which cannot merge real charts |
+| `--status RUN_ID`, `--resume RUN_ID`, `--cancel RUN_ID`, `--report RUN_ID` | Mutually exclusive existing-run operations, always with `--provider ID`; source/import options cannot be replaced |
+
+The foreground import command streams the engine's safe progress and waits for
+its outcome. It does not capture batch output in memory. The engine retains
+durable per-patient/category receipts, warnings, failed/not-started/uncertain
+work, checkpoints and protected event/error/completeness files. A heartbeat,
+parsed-byte count or command acknowledgement is not proof of clinical completion.
+
+```bash
+sudo carlos-ctl cds-import --status RUN_ID --provider 999998
+sudo carlos-ctl cds-import --report RUN_ID --provider 999998
+sudo carlos-ctl cds-import --resume RUN_ID --provider 999998
+```
+
+Exit `0` means a clean complete import, verified no-op or valid dry run. For
+`--status`/`--report`, it means that query succeeded: inspect the returned run
+outcome to determine clinical completeness. Exit `1` means invalid arguments;
+`2` configuration/runtime/protocol failure; `3` authorization denied; `4`
+refused, busy, failed, partial, uncertain or otherwise incomplete import.
+An interrupted process may exit `130` or the conventional signal status.
+A first termination signal is relayed to the engine; a second terminates its
+process group. Inspect the durable run after either interruption.
+A nonzero result can coexist with committed clinical data. Never automatically
+resubmit a failed input; inspect and resume/reconcile the recorded run.
+Report-delivery or cleanup failure is separate from the actual clinical commit
+outcome and must not be treated as proof of rollback.
+
+Only `/etc/carlos-emr/carlos.properties` is selected by this host adapter; no
+credential is placed in argv. The root wrapper records the verified invoking
+OS/SUDO identity and creates a root-owned, service-readable attestation under
+`/run/carlos-cds-delegations/`. It binds the exact request arguments, operator,
+provider/operation, nonce and five-minute expiry. CARLOS independently verifies
+the file's trusted ownership/permissions, request digest and explicit
+operator/provider delegation; exporting an operator name alone is insufficient.
+The root supervisor drops the engine to the service account, relays signals,
+inherits console streams without capturing batch output, and removes only its
+own ticket after execution. Root-owned expiry cleanup retires orphaned tickets
+after abnormal wrapper termination. Inherited JVM-option/classpath overrides
+are removed. A bounded 128 MiB probe obtains the launch budget from Java's
+actual production-properties loader, including its escaping/separator rules;
+Python never independently parses or guesses the effective heap. Configure
+`cds.import.cliHeapMiB` in that production file (default 512, integer 128–16384).
+This is a process budget, not a guarantee that arbitrary input fits: validation,
+payload handling, persistence and reporting must remain bounded by the engine.
+Shared admission must reserve this heap plus process overhead across browser
+and CLI workers. Do not use a larger heap as a substitute for investigating a
+failed import or recovering its durable state.
+
 ## Where the rest lives
 
 - `man carlos-ctl` — the same verbs with full detail, `FILES`, and exit

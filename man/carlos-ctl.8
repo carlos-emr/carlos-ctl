@@ -361,6 +361,68 @@ configured.
 .TP
 .B rotate
 Rotate every generated database password and restart the application.
+.SS CDS patient-data import
+.TP
+.B cds-import --input PATH --provider ID --source-namespace KEY --source-profile KEY
+Import OntarioMD CDS XML, ZIP or directory data through the same durable
+CARLOS engine as the existing browser workflow. Merge is off by default;
+.B --merge-existing
+opts in to a proven unique eligible HIN and exact date-of-birth match.
+.B --dry-run
+performs clinical preflight without clinical writes. The production engine
+independently checks the allowed source root, registered namespace/profile,
+active provider, privileges, explicit OS-operator delegation, migration window
+and shared resource admission. Host root alone does not establish clinical
+authority.
+.IP
+Optional
+.B --program ID
+and
+.B --facility ID
+select approved target context;
+.B --no-match-providers
+retains historical source identities without name matching.
+.B --synthetic
+selects approved synthetic/anonymized data; it is required for
+.B --course ID
+or a nonzero
+.B --timeshift DAYS
+and cannot be combined with real-chart merge. Unknown, duplicate,
+abbreviated and conflicting arguments are refused.
+.IP
+Existing-run operations are
+.BR "--status RUN_ID" ,
+.BR "--resume RUN_ID" ,
+.BR "--cancel RUN_ID" ,
+or
+.BR "--report RUN_ID" ,
+always with
+.BR "--provider ID" .
+They use the run's recorded source/options and cannot replace those options.
+An interrupted/failed command can already have committed clinical units:
+inspect its durable outcome and resume/reconcile the same run instead of
+resubmitting the input.
+.IP
+The wrapper verifies a bounded version/capability handshake before execution,
+requires Java 25 and runs the engine as the carlos service account with the
+production properties file. A short-lived root-owned attestation binds the
+exact request, verified operator, provider/operation and nonce. CARLOS checks
+its ownership, permissions, digest, expiry and explicit delegation again;
+an operator-name environment variable alone is not authority. The root
+supervisor relays signals and removes its own attestation after execution;
+root-owned expiry cleanup retires leftovers from abnormal termination.
+Its heap is configured by
+.B cds.import.cliHeapMiB
+(default 512 MiB, integer 128 through 16384). This is a configurable process
+budget, not a guarantee that arbitrary input fits the heap. The engine must
+bound parsing/payloads, persistence and reporting and reserve resources across
+web and CLI workers.
+.IP
+The foreground command streams safe progress without accumulating batch output.
+Patient-level diagnostics, event/error logs and completeness receipts remain
+protected. Parsed bytes or a heartbeat do not establish clinical completion;
+inspect the recorded per-patient/category outcomes, outstanding review,
+attachments/contacts/routing/audit and report-delivery state.
 .SS Decommissioning
 .TP
 .BI "destroy-data --confirm " server-name
@@ -776,7 +838,18 @@ exits non\-zero when any check fails.
 .B o19-preflight
 reports its verdict as its status: 0 go, 1 go with acknowledgements, 2
 no\-go, and 3 when the tool itself failed \(em so 1 and 2 are answers, not
-errors. Every other command, including
+errors.
+.B cds-import
+uses 0 for a clean complete import, verified no-op or valid dry run; 1 for
+arguments; 2 for configuration/runtime/protocol failure; 3 for denied authority;
+4 for refused/busy/failed/partial/uncertain or incomplete import. An interrupted
+process may use 130 or the conventional signal status. For
+.B --status
+or
+.BR --report ,
+0 means the query succeeded, not that the recorded import is complete.
+Nonzero does not prove rollback; use durable recovery rather than resubmission.
+Every other command, including
 .BR import-o19 ,
 exits 0 on success and non\-zero on error.
 .SH SEE ALSO

@@ -1,3 +1,16 @@
+carlos-ctl (1.2.0~dev1) resolute; urgency=medium
+
+  * Add cds-import as the host adapter for the shared CARLOS web/CLI CDS
+    import engine, including opt-in merge, explicit source contract and
+    delegation, durable status/resume/cancel/report operations, bounded
+    protocol negotiation and signal/exit propagation.
+  * Require the supported Java 25 runtime, drop to the carlos account,
+    preserve production configuration and keep clinical diagnostics out of
+    wrapper errors. Add argument, capability, resource and real-exec tests.
+  * The dev snapshot version: release builds stamp the tag's version.
+
+ -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Mon, 26 Oct 2026 23:00:00 +0000
+
 carlos-ctl (1.1.2~dev1) resolute; urgency=medium
 
   * import-o19 now takes the database-ownership lock

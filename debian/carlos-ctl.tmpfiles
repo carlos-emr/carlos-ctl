@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# The root adapter creates/validates this directory at invocation, when the
+# application-owned carlos group exists. 'e' only cleans an existing directory;
+# installing the independent CLI package never creates an application identity.
+e /run/carlos-cds-delegations - - - 10m
