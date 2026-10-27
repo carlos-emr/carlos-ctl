@@ -147,8 +147,7 @@ class TestTheDebsOwnAnswers(unittest.TestCase):
         import inspect
         source = inspect.getsource(o19import.run_p1)
         self.assertIn("stage_env = grant_staging_account(", source)
-        self.assertIn("restore_argv,\n                                "
-                      "                  available, stage_env)", source)
+        self.assertIn("available, stage_env,", source)
         # and the grant hands it back rather than discarding it
         self.assertIn("return HOST.stage_credential(",
                       inspect.getsource(o19import.grant_staging_account))

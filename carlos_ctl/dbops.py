@@ -9,8 +9,8 @@ contracts where the concept exists in both deployments:
               no args; args/redirects pass through) — identical semantics to
               the podman tool, minus the container hop.
   db-users    create-or-update the least-privilege accounts. Same name; here
-              the set is carlos/drugref/backup (no exporter — there is no
-              obs pod to feed).
+              the set is carlos/drugref/backup/carlos_report (no exporter —
+              there is no obs pod to feed).
   db-migrate  apply pending Flyway migrations.
   db-dump     consistent dump to stdout.
 
@@ -25,7 +25,7 @@ import os
 import subprocess
 import sys
 
-from . import config, util
+from . import config, reporting, util
 from .util import (
     BACKUP_ENV, CONF_DIR, DRUGREF_PROPERTIES, PROPERTIES, REINSTALL_HINT, SHARE, STATE, WEBAPP,
     die, env_get, genpw, genrandom, log, need_root, prop_escape, prop_get,
@@ -41,6 +41,22 @@ def db_root(args, **kw) -> subprocess.CompletedProcess:
 
 def db_root_ok() -> bool:
     return db_root(["-N", "-B", "-e", "SELECT 1"], capture_output=True).returncode == 0
+
+
+def schema_has_tables(name: str) -> bool:
+    """Whether the schema holds at least one table. When MariaDB cannot say,
+    True after a warning: the one caller only decides whether to refresh the
+    Query by Example grants now, and a refresh that finds nothing to grant is
+    harmless, while a skipped one leaves an upgraded schema ungranted until a
+    migration that may never come."""
+    cp = db_root(["-N", "-B", "-e",
+                  "SELECT COUNT(*) FROM information_schema.TABLES "
+                  f"WHERE TABLE_SCHEMA = '{name}'"], capture_output=True)
+    if cp.returncode != 0:
+        warn(f"could not count the tables of {name} ({util.mariadb_error(cp)}); "
+             "refreshing the Query by Example grants anyway")
+        return True
+    return cp.stdout.strip() not in ("", "0")
 
 
 def require_db_root() -> None:
@@ -266,6 +282,34 @@ def cmd_db_users(argv) -> int:
     for a in argv:
         if a != "--new-passwords":
             die(f"unknown option: {a}")
+    # Reading the recorded passwords, the ALTER USERs and recording the
+    # results are one step. Two runs interleaving (a first-run postinst and a
+    # hand-run rotate, say) could each generate a password and leave the files
+    # recording one generation while MariaDB accepts the other. The
+    # database-ownership lock every provisioning path shares makes them take
+    # turns. A caller that already holds it (a postinst on fd 9,
+    # finish-install in this process) is let through, not refused.
+    held = util.hold_db_ownership_lock("db-users")
+    try:
+        return _provision_accounts(force_new)
+    finally:
+        if held is not None:
+            os.close(held)
+
+
+def _provision_accounts(force_new: bool) -> int:
+    """The body of db-users, run under the database-ownership lock.
+
+    The properties files and backup.env are the record of every credential,
+    and each run sets MariaDB to the passwords they record, generating one
+    only where none is recorded (or for --new-passwords). That is the
+    recovery contract for a run stopped between its SQL and its writes by
+    power loss, a full disk or a kill: MariaDB then accepts a password the
+    files do not record. The next db-users sets it back to what they record
+    (a first run's account gets a fresh password, recorded this time), and
+    until then `check` reports that the recorded reporting password does not
+    log in. The postinst, finish-install and rotate all run db-users, so any
+    of them repairs it."""
     s = config.load()
 
     # Re-use existing passwords so a reconfigure or upgrade never invalidates
@@ -284,6 +328,7 @@ def cmd_db_users(argv) -> int:
     app_pw = _keep(prop_unescape(prop_get(PROPERTIES, "db_password") or "")) or genpw()
     drugref_pw = _keep(prop_unescape(prop_get(DRUGREF_PROPERTIES, "db_password") or "")) or genpw()
     backup_pw = _keep(env_get(BACKUP_ENV, "CARLOS_BACKUP_DB_PASSWORD") or "") or genpw()
+    report_pw = _keep(prop_unescape(prop_get(PROPERTIES, reporting.PASSWORD_KEY) or "")) or genpw()
     import re as _re
     verify_db = env_get(BACKUP_ENV, "CARLOS_BACKUP_VERIFY_DB") or "carlos_restore_drill"
     # Same rule as the settings loader applies to CARLOS_DB_NAME — one
@@ -315,6 +360,8 @@ def cmd_db_users(argv) -> int:
             die(f"{path} is not writable; refusing to rotate credentials it must record")
 
     prev_app_pw = prop_unescape(prop_get(PROPERTIES, "db_password") or "")
+    prev_report_pw = prop_unescape(prop_get(PROPERTIES, reporting.PASSWORD_KEY) or "")
+    prev_report_user = (prop_get(PROPERTIES, reporting.USERNAME_KEY) or "").strip()
 
     log("provisioning databases and least-privilege accounts")
     sql = f"""
@@ -372,6 +419,10 @@ GRANT RELOAD, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'backup'@'127.0.0.
 GRANT ALL PRIVILEGES ON `{verify_db}`.* TO 'backup'@'localhost';
 GRANT ALL PRIVILEGES ON `{verify_db}`.* TO 'backup'@'127.0.0.1';
 
+-- The account Query by Example runs as (carlos#3372). Created with NO grants:
+-- what it may read is the grant list the deployed WAR ships, applied right
+-- after this batch (and after every migration), never a schema-wide grant.
+{reporting.account_sql(report_pw)}
 -- mysql_secure_installation-equivalent hygiene: drop anonymous accounts
 -- explicitly rather than trusting a packaging default. The `test` database is
 -- deliberately NOT dropped — provisioning stays additive, and a migrated
@@ -385,12 +436,16 @@ FLUSH PRIVILEGES;
 
     prop_set(PROPERTIES, "db_password", prop_escape(app_pw))
     prop_set(PROPERTIES, "db_username", "carlos")
-    if app_pw != prev_app_pw and \
+    prop_set(PROPERTIES, reporting.PASSWORD_KEY, prop_escape(report_pw))
+    prop_set(PROPERTIES, reporting.USERNAME_KEY, reporting.REPORT_USER)
+    if (app_pw != prev_app_pw or report_pw != prev_report_pw
+            or prev_report_user != reporting.REPORT_USER) and \
             run(["systemctl", "is-active", "--quiet", "carlos-emr.service"]).returncode == 0:
         # The running JVM read its properties at deploy time: the account
         # password just changed underneath it (e.g. a placeholder was
         # replaced), and new pool connections will start failing. Silence
-        # here turned a security fix into a slow outage.
+        # here turned a security fix into a slow outage. (A new reporting
+        # credential only closes Query by Example until the restart.)
         warn("the application is RUNNING with the previous database credential —")
         warn("restart it now: carlos-ctl restart")
     if os.path.isfile(DRUGREF_PROPERTIES):
@@ -406,7 +461,13 @@ FLUSH PRIVILEGES;
         # would otherwise have a backup account authorized for one schema
         # while the dump targeted the skeleton default.
         util.env_set(BACKUP_ENV, "CARLOS_BACKUP_DB_NAME", s.db_name)
-    log(f"accounts provisioned: carlos (read/write on {s.db_name}), drugref, backup (read-only)")
+    # On a fresh install the schema is still empty here and db-migrate applies
+    # the list once the tables exist; on an upgrade or a rotation the tables
+    # are already there, so the list is applied now.
+    if schema_has_tables(s.db_name):
+        reporting.sync_grants(s.db_name, db_root)
+    log(f"accounts provisioned: carlos (read/write on {s.db_name}), drugref, backup (read-only), "
+        f"{reporting.REPORT_USER} (Query by Example, read-only)")
     return 0
 
 
@@ -479,7 +540,8 @@ def run_flyway(command: str) -> int:
     # world-readable and this connects to a database holding PHI.
     env.update(
         FLYWAY_URL=f"jdbc:mysql://{s.db_host}:{s.db_port}/{s.db_name}"
-                   "?useSSL=false&allowPublicKeyRetrieval=true",
+                   "?useSSL=false&allowPublicKeyRetrieval=true"
+                   "&characterEncoding=UTF-8&connectionCollation=utf8mb4_general_ci",
         FLYWAY_USER=user,
         FLYWAY_PASSWORD=password,
     )
@@ -489,6 +551,12 @@ def run_flyway(command: str) -> int:
         f"{SHARE}/lib/carlos-flyway-runner.jar:{WEBAPP}/WEB-INF/classes:{WEBAPP}/WEB-INF/lib/*",
         "io.github.carlos_emr.carlos.deb.FlywayRunner", command, s.flyway_locations,
     ], env=env)
+    if cp.returncode == 0 and command == "migrate":
+        # A migration can create a table the grant list calls reportable, and
+        # MariaDB only grants a table that exists. Every path that migrates
+        # (db-migrate, finish-install, the postinst) comes through here. A
+        # failed sync is reported, never turned into a failed migration.
+        reporting.sync_grants(s.db_name, db_root)
     return cp.returncode
 
 
@@ -1334,7 +1402,7 @@ DROP USER IF EXISTS 'drugref'@'localhost';
 DROP USER IF EXISTS 'drugref'@'127.0.0.1';
 DROP USER IF EXISTS 'backup'@'localhost';
 DROP USER IF EXISTS 'backup'@'127.0.0.1';
-""")
+{reporting.drop_sql()}""")
     if cp.returncode != 0:
         # Batch mode aborts at the first failing statement, so a failure
         # here can leave databases AND every later DROP un-executed.

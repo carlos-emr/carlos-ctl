@@ -179,7 +179,7 @@ def is_hexed(coltype: str) -> bool:
     return (coltype or "").lower() in HEXED_TYPES
 
 
-def value_expr(col: str, coltype: str) -> str:
+def value_expr(col: str, coltype: str, expression: Optional[str] = None) -> str:
     """The normalised, unambiguous contribution of one column to a row's
     hash.
 
@@ -195,6 +195,8 @@ def value_expr(col: str, coltype: str) -> str:
     the data differs, which is worse than having no digest at all.
     """
     quoted = "`{0}`".format(col.replace("`", "``"))
+    if expression is not None:
+        quoted = "(" + expression + ")"
     normalised = (coltype or "").lower()
     large = normalised in LARGE_TYPES
     if is_hexed(coltype):
@@ -240,7 +242,8 @@ def value_expr(col: str, coltype: str) -> str:
         quoted, NULL_MARK, piece)
 
 
-def row_hash_expr(columns: Sequence[str], types: Dict[str, str]) -> str:
+def row_hash_expr(columns: Sequence[str], types: Dict[str, str],
+                  expressions: Optional[Dict[str, str]] = None) -> str:
     """SHA-256 of one row, over `columns` in the order given.
 
     The order is part of the digest: two sides must present the same
@@ -255,13 +258,15 @@ def row_hash_expr(columns: Sequence[str], types: Dict[str, str]) -> str:
     # and hash the REST of the row as if the column were not there;
     # CONCAT makes the whole row hash NULL, which the fourth lane of
     # `digest_sql` counts and `compare` reports.
-    parts = (", " + SEP + ", ").join(value_expr(c, types.get(c, ""))
+    parts = (", " + SEP + ", ").join(value_expr(c, types.get(c, ""), (expressions or {}).get(c))
                                      for c in columns)
     return "SHA2(CONCAT({0}), 256)".format(parts)
 
 
 def digest_sql(schema: Optional[str], table: str, columns: Sequence[str],
-               types: Dict[str, str], where: Optional[str] = None) -> str:
+               types: Dict[str, str], where: Optional[str] = None,
+               expressions: Optional[Dict[str, str]] = None,
+               alias: Optional[str] = None) -> str:
     """Two statements: `UTC_SESSION`, then `SELECT rows, total, parity,
     unhashed` for one table.
 
@@ -287,10 +292,12 @@ def digest_sql(schema: Optional[str], table: str, columns: Sequence[str],
     both IGNORE a NULL, so without it a row the server would not render
     simply vanishes from the other two lanes -- and vanishes the same
     way on both sides, which reads as agreement."""
-    h = row_hash_expr(columns, types)
+    h = row_hash_expr(columns, types, expressions)
     ident = "`{0}`".format(table.replace("`", "``"))
     if schema is not None:
         ident = "`{0}`.{1}".format(schema.replace("`", "``"), ident)
+    if alias is not None:
+        ident += " `" + alias.replace("`", "``") + "`"
     clause = " WHERE {0}".format(where) if where else ""
     return (
         UTC_SESSION + ";\n"

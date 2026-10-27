@@ -124,7 +124,7 @@ it. Everything runs with `sudo`.
 | `db-repair` | Fix `flyway_schema_history` after a failed migration |
 | `db-apply-settings` | Restart MariaDB if it is not running the settings in the CARLOS drop-in |
 | `db-dump` | Consistent dump to stdout |
-| `db-users` | (Re)create the databases and least-privilege accounts |
+| `db-users` | (Re)create the databases and least-privilege accounts: `carlos` (application), `drugref`, `backup` (read-only) and `carlos_report`, the read-only account Query by Example runs as. `carlos_report` gets SELECT only on the tables the deployed WAR's grant list (`WEB-INF/classes/db/reporting/carlos_report_grants.sql`) calls reportable; the list is applied again after every `db-migrate`. The list grants every login the account has, so a `carlos_report` login for any host other than localhost and 127.0.0.1 is dropped before it runs |
 | `demo-data` | Load the fictitious demonstration dataset (~3000 `FAKE-` patients, 60 fake specialists) into an **empty**, freshly migrated database — what answering yes to the installer's demonstration-data question runs; refuses on any database holding patients, and the only removal is `destroy-data` |
 
 ### Certificates

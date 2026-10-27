@@ -104,6 +104,144 @@ class TestCopyMariaDB(unittest.TestCase):
         self.assertEqual(self.target_count(), 0)
         self.assertTrue(self.state["done"])
 
+    def test_should_refuse_silent_float_narrowing_before_checkpoint(self):
+        self.plain("ALTER TABLE `{0}`.sample ADD COLUMN dose DOUBLE".format(self.src))
+        self.plain("ALTER TABLE `{0}`.sample ADD COLUMN dose FLOAT".format(self.dst))
+        self.plain("INSERT INTO `{0}`.sample VALUES (1,'first',0.1)".format(self.src))
+        self.entry["cols"].append("dose")
+        self.columns = o19etl.introspect_columns(self.plain, self.dst)["sample"]
+        with self.assertRaisesRegex(o19etl.QueryError, "no completion checkpoint"):
+            self.copy()
+        self.assertFalse(self.state.get("done"))
+
+    def test_should_pair_text_keys_using_target_collation(self):
+        for schema, collation in ((self.src, "utf8mb4_unicode_ci"), (self.dst, "utf8mb4_general_ci")):
+            self.plain("ALTER TABLE `{0}`.sample MODIFY id VARCHAR(20) CHARACTER SET utf8mb4 COLLATE {1} NOT NULL".format(schema, collation))
+        self.seed("('key','first')")
+        self.columns = o19etl.introspect_columns(self.plain, self.dst)["sample"]
+        self.copy()
+        self.assertTrue(self.state["done"])
+
+    def make_keyless(self):
+        self.plain("ALTER TABLE `{0}`.sample DROP PRIMARY KEY".format(self.src))
+        self.plain("ALTER TABLE `{0}`.sample DROP PRIMARY KEY, DROP INDEX uq_name".format(self.dst))
+
+    def test_should_verify_keyless_duplicate_rows_and_trailing_spaces(self):
+        self.make_keyless()
+        self.seed("(1,'note '),(1,'note ')")
+        self.copy()
+        self.assertTrue(self.state["done"])
+        self.plain("UPDATE `{0}`.sample SET name='note'".format(self.dst))
+        failures = o19etl.copy_multiset_parity(self.plain, "sample", self.entry, self.src, self.dst, self.columns)
+        self.assertTrue(any("CONTENT differs" in line for line in failures))
+
+    def test_should_verify_keyless_decimal_values_across_scale_widening(self):
+        self.make_keyless()
+        self.plain("ALTER TABLE `{0}`.sample ADD COLUMN dose DECIMAL(8,2)".format(self.src))
+        self.plain("ALTER TABLE `{0}`.sample ADD COLUMN dose DECIMAL(10,4)".format(self.dst))
+        self.plain("INSERT INTO `{0}`.sample VALUES (1,'first',1.40)".format(self.src))
+        self.entry["cols"].append("dose")
+        self.columns = o19etl.introspect_columns(self.plain, self.dst)["sample"]
+        self.copy()
+        self.assertTrue(self.state["done"])
+
+    def test_should_preserve_populated_keyless_targets_across_repeated_refusals(self):
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                # Reuse the same schema while exercising each branch; neither
+                # refusal may record the marker that permits a retry's delete.
+                if not chunked:
+                    self.make_keyless()
+                    self.seed("(1,'source')")
+                    self.plain("INSERT INTO `{0}`.sample VALUES(99,'existing')".format(self.dst))
+                else:
+                    self.entry["chunk_by"] = "id"
+                for _ in range(2):
+                    with self.assertRaisesRegex(o19etl.QueryError, "without a declared replacement policy"):
+                        self.copy()
+                    self.assertFalse(self.state.get("started", False))
+                    self.assertFalse(self.state.get("done", False))
+                    self.assertEqual(self.plain("SELECT * FROM `{0}`.sample".format(self.dst)), [["99", "existing"]])
+
+    def test_should_allow_declared_keyless_seed_replacement(self):
+        self.make_keyless()
+        self.seed("(1,'source')")
+        self.plain("INSERT INTO `{0}`.sample VALUES(99,'existing')".format(self.dst))
+        self.entry["replace_seed"] = True
+        self.copy()
+        self.assertTrue(self.state["done"])
+        self.assertEqual(self.plain("SELECT * FROM `{0}`.sample".format(self.dst)), [["1", "source"]])
+
+    def temporal_columns(self, source_type, target_type, value):
+        for schema, ctype in ((self.src, source_type), (self.dst, target_type)):
+            self.plain("ALTER TABLE `{0}`.sample ADD COLUMN occurred {1} NULL".format(schema, ctype))
+        self.seed("(1,'first','{0}')".format(value))
+        self.entry["cols"].append("occurred")
+        self.columns = o19etl.introspect_columns(self.plain, self.dst)["sample"]
+        return o19etl.temporal_capacity_precheck_sql(
+            "sample", self.entry, self.src, self.columns)[0][1]
+
+    def test_should_refuse_fractional_datetime_loss_before_a_keyed_copy(self):
+        check = self.temporal_columns("DATETIME(6)", "DATETIME", "2026-10-05 09:36:01.123456")
+        self.assertEqual(self.plain(check), [["1"]])
+        self.assertEqual(self.target_count(), 0)
+        with self.assertRaisesRegex(o19etl.QueryError, "no completion checkpoint"):
+            self.copy()
+        self.assertFalse(self.state.get("done", False))
+
+    def test_should_not_certify_fractional_timestamp_loss_in_keyless_providerstudy(self):
+        # This is a managed keyless table, not an artificial keyless copy.
+        entry = dict(o19etl.o19map_schema.TABLES["providerstudy"])
+        for schema, ctype in ((self.src, "TIMESTAMP(6)"), (self.dst, "TIMESTAMP")):
+            self.plain("CREATE TABLE `{0}`.providerstudy(study_no INT, provider_no VARCHAR(6), "
+                       "creator VARCHAR(6), timestamp {1} NULL)".format(schema, ctype))
+        self.plain("INSERT INTO `{0}`.providerstudy VALUES(1,'1','2','2026-10-05 09:36:01.123456')".format(self.src))
+        columns = o19etl.introspect_columns(self.plain, self.dst)["providerstudy"]
+        check = o19etl.temporal_capacity_precheck_sql("providerstudy", entry, self.src, columns)[0][1]
+        self.assertEqual(self.plain(check), [["1"]])
+        self.assertEqual(self.plain("SELECT COUNT(*) FROM `{0}`.providerstudy".format(self.dst)), [["0"]])
+        with self.assertRaisesRegex(o19etl.QueryError, "target temporal type"):
+            o19etl.etl_copy_table(self.run, "providerstudy", entry, self.state, columns, set())
+        self.assertFalse(self.state.get("done", False))
+        self.assertTrue(o19etl.copy_multiset_parity(self.plain, "providerstudy", entry,
+                                                   self.src, self.dst, columns))
+
+    def test_should_preserve_keyless_fractional_seconds_at_matching_precision(self):
+        self.make_keyless()
+        check = self.temporal_columns("TIMESTAMP(6)", "TIMESTAMP(6)", "2026-10-05 09:36:01.123456")
+        self.assertEqual(self.plain(check), [["0"]])
+        self.copy()
+        self.assertTrue(self.state["done"])
+        self.assertEqual(o19etl.copy_multiset_parity(self.plain, "sample", self.entry,
+                                                    self.src, self.dst, self.columns), [])
+
+    def test_should_detect_time_removed_by_a_date_conversion(self):
+        check = self.temporal_columns("DATETIME(6)", "DATE", "2026-10-05 09:36:01.123456")
+        self.assertEqual(self.plain(check), [["1"]])
+        self.plain("UPDATE `{0}`.sample SET occurred='2026-10-05 00:00:00'".format(self.src))
+        self.assertEqual(self.plain(check), [["0"]])
+        self.copy()
+        self.assertTrue(self.state["done"])
+
+    def test_should_detect_fractional_time_loss_without_limiting_hours_to_a_clock(self):
+        check = self.temporal_columns("TIME(6)", "TIME", "-123:36:01.123456")
+        self.assertEqual(self.plain(check), [["1"]])
+        self.plain("UPDATE `{0}`.sample SET occurred='-123:36:01'".format(self.src))
+        self.assertEqual(self.plain(check), [["0"]])
+        self.copy()
+        self.assertTrue(self.state["done"])
+
+    def test_should_use_the_running_servers_timestamp_range(self):
+        check = self.temporal_columns("DATETIME(6)", "TIMESTAMP(6)", "2107-01-01 00:00:00")
+        self.assertEqual(self.plain(check), [["1"]])
+        # MariaDB 11.5 extended TIMESTAMP beyond 2038; older supported servers
+        # must retain their own bound rather than adopting the newer one.
+        self.plain("UPDATE `{0}`.sample SET occurred='2040-01-01 00:00:00'".format(self.src))
+        supported = self.plain("SELECT UNIX_TIMESTAMP('2040-01-01 00:00:00') IS NOT NULL")[0][0] == "1"
+        self.assertEqual(self.plain(check), [["0" if supported else "1"]])
+        self.plain("UPDATE `{0}`.sample SET occurred='0000-00-00 00:00:00'".format(self.src))
+        self.assertEqual(self.plain(check), [["0"]])
+
     def test_should_preserve_a_completed_window_when_the_next_window_collides(self):
         self.entry["chunk_by"] = "id"
         last = o19etl.CHUNK_ROWS + 2

@@ -9,8 +9,11 @@ Run (from the repository root):
 """
 
 import os
+import io
+import json
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -51,29 +54,51 @@ class TestClassifyMembers(unittest.TestCase):
     def test_two_digest_files_are_ambiguous(self):
         with self.assertRaises(ValueError) as cm:
             o19bundle.classify_members(
-                self.GOOD + ["a.json", "b.json"])
+                self.GOOD + ["a.o19-digests.json", "b.o19-digests.json"])
         self.assertIn("at most one", str(cm.exception))
 
-    def test_two_dumps_are_ambiguous(self):
-        with self.assertRaises(ValueError) as cm:
-            o19bundle.classify_members(self.GOOD + ["extra.sql"])
-        self.assertIn("exactly one", str(cm.exception))
+    def test_multiple_dumps_are_a_set_to_be_verified(self):
+        roles = o19bundle.classify_members(self.GOOD + ["extra.sql"])
+        self.assertEqual(roles["dumps"], ["o19.sql.gz", "extra.sql"])
 
     def test_missing_properties_is_refused(self):
         with self.assertRaises(ValueError):
             o19bundle.classify_members(["o19.sql.gz",
                                         "o19-documents.tar.gz"])
 
-    def test_unknown_member_is_refused(self):
-        with self.assertRaises(ValueError) as cm:
-            o19bundle.classify_members(self.GOOD + ["notes.txt"])
-        self.assertIn("unrecognized", str(cm.exception))
+    def test_unrelated_backup_artifact_is_preserved(self):
+        roles = o19bundle.classify_members(self.GOOD + ["notes.txt"])
+        self.assertIn("notes.txt", roles["extras"])
 
-    def test_pathed_member_is_refused(self):
-        with self.assertRaises(ValueError) as cm:
-            o19bundle.classify_members(["sub/o19.sql.gz",
-                                        "oscar.properties"])
-        self.assertIn("path", str(cm.exception))
+    def test_nested_backup_members_are_recognized(self):
+        roles = o19bundle.classify_members(["sub/o19.sql.gz", "oscar.properties"])
+        self.assertEqual(roles["dump"], "sub/o19.sql.gz")
+
+    def test_native_document_extensions_do_not_assign_import_roles(self):
+        documents = ["oscar/document/upload.tar.gz", "oscar/document/digests.json",
+                     "oscar/eform/o19-inputs.json", "oscar/billing/report.sql",
+                     "oscar/measurementMap/lookup.sql.gz", "oscar/form/oscar.properties"]
+        roles = o19bundle.classify_members(["oscar/OscarBackup.sql", "oscar/oscar.properties"] + documents)
+        self.assertEqual(roles["dumps"], ["oscar/OscarBackup.sql"])
+        self.assertEqual(roles["properties"], "oscar/oscar.properties")
+        self.assertIsNone(roles["digests"])
+        self.assertEqual(roles["document_parts"], [])
+        self.assertCountEqual(roles["embedded_documents"], documents)
+
+    def test_root_level_native_documents_do_not_absorb_unrelated_metadata(self):
+        documents = ["document/a.pdf", "eform/saved.json"]
+        extras = ["notes.txt", "metadata.json", "metadata/unrelated.json"]
+        roles = o19bundle.classify_members(["OscarBackup.sql", "oscar.properties"] + documents + extras)
+        self.assertCountEqual(roles["embedded_documents"], documents)
+        self.assertEqual(roles["document_context"], "")
+        self.assertTrue(set(extras) <= set(roles["extras"]))
+
+    def test_explicit_roles_can_select_files_inside_document_named_directories(self):
+        names = ["billing/main.sql", "billing/documents.tar", "billing/oscar.properties"]
+        roles = o19bundle.input_manifest_roles({"format": 1, "dumps": names[:1],
+                                               "documents": names[1:2], "properties": names[2]}, names)
+        self.assertEqual(roles["dumps"], names[:1])
+        self.assertEqual(roles["document_parts"], names[1:2])
 
     def test_traversal_member_is_refused(self):
         with self.assertRaises(ValueError):
@@ -227,7 +252,7 @@ class TestTarListingAndMemberTypes(unittest.TestCase):
         # the dump and blow up later in sha256_file
         with self.assertRaises(ValueError) as cm:
             o19bundle.classify_members(["o19.sql/", "oscar.properties"])
-        self.assertIn("directory", str(cm.exception))
+        self.assertIn("no EMR", str(cm.exception))
 
 
 class TestTarEntriesFromHeaders(unittest.TestCase):
@@ -266,6 +291,13 @@ class TestTarEntriesFromHeaders(unittest.TestCase):
             o19bundle.validate_tar_members(
                 [(k, n) for k, n, _ in entries], allow_dirs=True)
         self.assertIn("not a plain file", str(cm.exception))
+
+    def test_native_embedded_documents_allow_mixed_cosmetic_prefixes(self):
+        members = o19bundle.classify_members([
+            "./backup/oscar/oscar.properties", "backup/oscar.sql",
+            "backup/oscar/document/report.pdf"])
+        self.assertEqual(members["embedded_documents"], ["backup/oscar/document/report.pdf"])
+        self.assertEqual(members["document_context"], "backup/oscar")
 
     def test_a_dot_built_bundle_extracts(self):
         # `tar -C dir -czf bundle .` is the ordinary way to build one: it
@@ -418,6 +450,149 @@ class TestOpenBundleEndToEnd(unittest.TestCase):
                 with open(res["dump"]) as fh:
                     self.assertIn("Dump completed", fh.read())
 
+    def test_native_documents_named_like_controls_are_preserved_byte_for_byte(self):
+        documents = {"oscar/document/upload.tar.gz": b"an uploaded archive, not a backup",
+                     "oscar/document/scan with\nnewline.pdf": b"a filename containing whitespace",
+                     "oscar/document/digests.json": b'{"patient": "document"}',
+                     "oscar/eform/o19-inputs.json": b"saved document, not a descriptor",
+                     "oscar/billing/report.sql": b"SELECT 'clinical report';",
+                     "oscar/measurementMap/lookup.sql.gz": b"saved attachment",
+                     "oscar/form/oscar.properties": b"saved properties attachment"}
+        contents = {"oscar/OscarBackup.sql": b"-- database fixture\n-- Dump completed\n",
+                    "oscar/oscar.properties": b"billregion=ON\n", **documents}
+        bundle = os.path.join(self.work, "native.tar.gz")
+        with tarfile.open(bundle, "w:gz") as archive:
+            for name, data in contents.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        opened = o19bundle.open_bundle(bundle, os.path.join(self.work, "native"))
+        self.assertEqual(len(opened["dumps"]), 1)
+        self.assertIsNone(opened["digests"])
+        with open(opened["properties"], "rb") as properties:
+            self.assertEqual(properties.read(), contents["oscar/oscar.properties"])
+        with tarfile.open(opened["documents"]) as archive:
+            self.assertCountEqual(archive.getnames(), documents)
+            for name, data in documents.items():
+                with archive.extractfile(name) as member:
+                    self.assertEqual(member.read(), data)
+
+    def test_root_level_native_documents_use_one_synthetic_context(self):
+        from carlos_ctl import o19docs
+        documents = {"document/a.pdf": b"synthetic scan", "eform/santé.json": b'{"saved": true}',
+                     "document/upload.tar.gz": b"a stored attachment"}
+        metadata = {"metadata.json": b'{"backup": true}', "metadata/report.txt": b"backup information"}
+        for index, prefix in enumerate(("", "./")):
+            with self.subTest(prefix=prefix):
+                contents = {"OscarBackup.sql": b"-- Dump completed\n", "oscar.properties": b"billregion=ON\n",
+                            **documents, **metadata}
+                bundle = os.path.join(self.work, "root-native-{0}.tar.gz".format(index))
+                with tarfile.open(bundle, "w:gz") as archive:
+                    for name, data in contents.items():
+                        member = tarfile.TarInfo(prefix + name)
+                        member.size = len(data)
+                        archive.addfile(member, io.BytesIO(data))
+                destination = os.path.join(self.work, "root-native-{0}".format(index))
+                opened = o19bundle.open_bundle(bundle, destination)
+                entries = o19bundle.read_tar_entries(opened["documents"], False)
+                self.assertEqual(o19docs.detect_context_dir([(kind, name) for kind, name, _ in entries]), "oscar")
+                with tarfile.open(opened["documents"]) as archive:
+                    self.assertCountEqual(archive.getnames(), ["oscar/" + name for name in documents])
+                    for name, data in documents.items():
+                        with archive.extractfile("oscar/" + name) as member:
+                            self.assertEqual(member.read(), data)
+                self.assertEqual(o19bundle.native_documents_size(destination, [prefix + name for name in documents], ""),
+                                 os.path.getsize(opened["documents"]))
+                for name, data in metadata.items():
+                    with open(os.path.join(destination, name), "rb") as content:
+                        self.assertEqual(content.read(), data)
+
+    def test_root_level_embedded_documents_and_document_archive_are_ambiguous(self):
+        for index, prefix in enumerate(("", "./")):
+            with self.subTest(prefix=prefix):
+                bundle = os.path.join(self.work, "mixed-root-{0}.tar".format(index))
+                contents = {"OscarBackup.sql": b"-- Dump completed\n", "oscar.properties": b"billregion=ON\n",
+                            "document/a.pdf": b"synthetic scan", "documents.tar": b"separate document backup"}
+                with tarfile.open(bundle, "w") as archive:
+                    for name, data in contents.items():
+                        member = tarfile.TarInfo(prefix + name)
+                        member.size = len(data)
+                        archive.addfile(member, io.BytesIO(data))
+                with mock.patch.object(o19bundle, "die", side_effect=ValueError) as die, self.assertRaises(ValueError):
+                    o19bundle.open_bundle(bundle, os.path.join(self.work, "mixed-root-{0}".format(index)))
+                self.assertIn("mixes embedded documents", die.call_args[0][0])
+
+    def test_legacy_digest_filename_uses_format_without_guessing_metadata(self):
+        digest = json.dumps({"digest_format": 3, "tables": {"a": {"columns": [["id", "int"]],
+                            "rows": 0, "total": "0", "parity": "0", "unhashed": 0}}, "errors": {}}).encode()
+        cases = [({"clinic-content.json": digest, "metadata.json": b'{"metadata": true}'}, "clinic-content.json"),
+                 ({"metadata.json": b'{"metadata": true}', "invalid.json": b"unrelated text"}, None),
+                 ({"first.json": digest, "second.json": digest}, "ambiguous")]
+        for index, (extras, expected) in enumerate(cases):
+            with self.subTest(expected=expected):
+                bundle = os.path.join(self.work, "legacy-{0}.tar".format(index))
+                contents = {"o19.sql": b"-- Dump completed\n", "oscar.properties": b"billregion=ON\n", **extras}
+                with tarfile.open(bundle, "w") as archive:
+                    for name, data in contents.items():
+                        member = tarfile.TarInfo(name)
+                        member.size = len(data)
+                        archive.addfile(member, io.BytesIO(data))
+                destination = os.path.join(self.work, "legacy-{0}".format(index))
+                if expected == "ambiguous":
+                    with self.assertRaises(SystemExit):
+                        o19bundle.open_bundle(bundle, destination)
+                else:
+                    opened = o19bundle.open_bundle(bundle, destination)
+                    self.assertEqual(os.path.basename(opened["digests"]) if opened["digests"] else None, expected)
+                    if expected:
+                        with open(opened["digests"], "rb") as content:
+                            self.assertEqual(content.read(), digest)
+
+    def test_legacy_digest_discovery_does_not_parse_oversized_metadata(self):
+        digest = b'{"digest_format":3,"tables":{},"errors":{}}'
+        metadata = json.dumps({"unrelated": "x" * 2048}).encode()
+        contents = {"o19.sql": b"-- Dump completed\n", "oscar.properties": b"billregion=ON\n",
+                    "clinic-content.json": digest, "large-metadata.json": metadata}
+        bundle = os.path.join(self.work, "large-json.tar")
+        with tarfile.open(bundle, "w") as archive:
+            for name, data in contents.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        destination = os.path.join(self.work, "large-json")
+        with mock.patch.object(o19bundle, "DIGEST_DISCOVERY_MAX_BYTES", 512), \
+                mock.patch.object(o19bundle.json, "load", wraps=json.load) as load:
+            opened = o19bundle.open_bundle(bundle, destination)
+        self.assertEqual(load.call_count, 1)
+        self.assertEqual(os.path.basename(opened["digests"]), "clinic-content.json")
+        with open(os.path.join(destination, "large-metadata.json"), "rb") as content:
+            self.assertEqual(content.read(), metadata)
+
+    def test_native_documents_capacity_includes_headers_pax_and_padding(self):
+        documents = {"oscar/document/{0:03d}.pdf".format(number): b"x" for number in range(40)}
+        documents["oscar/document/" + "long-" * 30 + "santé.pdf"] = b"tiny PAX document"
+        contents = {"oscar/OscarBackup.sql": b"-- Dump completed\n", "oscar/oscar.properties": b"billregion=ON\n", **documents}
+        bundle = os.path.join(self.work, "tiny-documents.tar")
+        with tarfile.open(bundle, "w") as archive:
+            for name, data in contents.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        baseline_dir = os.path.join(self.work, "tiny-baseline")
+        baseline = o19bundle.open_bundle(bundle, baseline_dir)
+        archive_bytes = os.path.getsize(baseline["documents"])
+        self.assertGreater(archive_bytes, sum(map(len, documents.values())) * 100)
+        self.assertEqual(o19bundle.native_documents_size(baseline_dir, list(documents), "oscar"), archive_bytes)
+
+        refused_dir = os.path.join(self.work, "tiny-refused")
+        with mock.patch.object(o19bundle.shutil, "disk_usage", return_value=mock.Mock(free=archive_bytes - 1)), \
+                self.assertRaises(SystemExit):
+            o19bundle.open_bundle(bundle, refused_dir)
+        self.assertFalse(os.path.exists(os.path.join(refused_dir, ".native-documents.tar")))
+        with mock.patch.object(o19bundle.shutil, "disk_usage", return_value=mock.Mock(free=archive_bytes)):
+            accepted = o19bundle.open_bundle(bundle, os.path.join(self.work, "tiny-accepted"))
+        self.assertEqual(os.path.getsize(accepted["documents"]), archive_bytes)
+
     def test_the_decrypted_bundle_is_never_world_readable(self):
         """The decrypted tar is the clinic's WHOLE database in clear, and
         it lives on disk for as long as the extraction takes. Created by
@@ -479,13 +654,13 @@ class TestOpenBundleEndToEnd(unittest.TestCase):
                                   pass_spec="file:" + self.passfile)
 
     def test_refusal_after_decryption_leaves_no_plaintext_behind(self):
-        # two dumps: classified as ambiguous AFTER the decrypt; the
+        # Missing properties is refused AFTER the decrypt; the
         # plaintext tar must not survive the refusal in the workdir
         with open(os.path.join(self.src, "other.sql"), "w") as fh:
             fh.write("-- second dump\n")
         plain = os.path.join(self.work, "two.tar")
         subprocess.check_call(["tar", "-C", self.src, "-cf", plain,
-                               "o19.sql", "other.sql", "oscar.properties"])
+                               "o19.sql", "other.sql"])
         enc = plain + ".enc"
         self._enc(plain, enc)
         dest = tempfile.mkdtemp(dir=self.work)

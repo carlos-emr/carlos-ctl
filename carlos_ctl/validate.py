@@ -5,11 +5,12 @@ check: prove the DEPLOYED system end to end, probing live behaviour rather
 than trusting configuration files to describe it."""
 
 import os
+import json
 from typing import Optional
 import re
 import time
 
-from . import config, dbops, provision, util
+from . import config, dbops, provision, reporting, util
 from .util import (
     BACKUP_ENV, CHROMIUM_DIR, CONF_DIR, GREEN, LIB, PROPERTIES, RED, RENDER_BROWSER_ENV, RESET,
     REINSTALL_HINT, YELLOW, need_root, out, package_ships, render_payload_installed, run,
@@ -151,6 +152,35 @@ def _package_versions():
     return lines
 
 
+def _check_import_state() -> bool:
+    """Explain the shared import guard before probing an intentionally stopped app."""
+    if not os.path.exists(provision.O19_GUARD):
+        _bad(f"OSCAR 19 import guard is missing: {provision.O19_GUARD}; "
+             f"reinstall carlos-emr: {REINSTALL_HINT}")
+        return True
+    try:
+        verdict = run([provision.O19_GUARD], capture_output=True)
+    except OSError as exc:
+        _bad(f"cannot inspect the OSCAR import guard: {exc}")
+        return True
+    if verdict.returncode == 0:
+        return False
+    print("OSCAR 19 import")
+    _note("an unfinished import holds the application offline; deployment health checks are deferred")
+    workspace = os.path.join(util.STATE, "o19-import")
+    try:
+        with open(os.path.join(workspace, "state.json"), encoding="utf-8") as document:
+            state = json.load(document)
+        phases = state.get("phases", {})
+        completed = sorted(name for name, value in phases.items() if value.get("status") == "done")
+        _note("completed phases: " + (", ".join(completed) or "none"))
+    except (OSError, ValueError, AttributeError) as exc:
+        _note(f"the import ledger could not be read ({exc}); inspect the private workspace before recovery")
+    _note(f"inspect {workspace}/report.txt; continue with the original import command and --resume")
+    _note("before the data copy starts, import-o19 --cleanup can retire an abandoned assessment; after copying starts, use the recorded recovery procedure")
+    return True
+
+
 def cmd_check(argv) -> int:
     global _failures
     _failures = 0
@@ -181,6 +211,8 @@ def cmd_check(argv) -> int:
     for line in _package_versions():
         print(f"  {line}")
     print()
+    if _check_import_state():
+        return 1
 
     # First, because it explains most of what follows: the installer records
     # this marker when a provisioning step did not run, and an install that
@@ -560,6 +592,11 @@ def cmd_check(argv) -> int:
             _bad("flyway_schema_history is empty or missing — the application's boot-time "
                  "schema gate will fail ('carlos-ctl finish-install' on an install that "
                  "never provisioned, 'carlos-ctl db-info' otherwise)")
+        # The Query by Example reporting account (carlos-emr/carlos#3372): it
+        # must exist, be named in carlos.properties, and hold SELECT on exactly
+        # the reportable tables of the deployed WAR's grant list.
+        for verdict, message in reporting.check_lines(s.db_name, dbops.db_root, db_port=s.db_port):
+            {"ok": _ok, "note": _note}.get(verdict, _bad)(message)
     else:
         _bad("cannot reach MariaDB as root over the unix socket")
 

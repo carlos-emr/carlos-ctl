@@ -12911,7 +12911,8 @@
    "signedOff",
    "signedOffTimestamp",
    "viewed",
-   "filed"
+   "filed",
+   "mrpDemographicNo"
   ],
   "HRMProviderConfidentialityStatement": [
    "providerNo",
@@ -13103,7 +13104,8 @@
    "passwordUpdateDate",
    "pinUpdateDate",
    "lastUpdateUser",
-   "lastUpdateDate"
+   "lastUpdateDate",
+   "usingMfa"
   ],
   "ServiceClient": [
    "id",
@@ -13872,7 +13874,8 @@
    "docType",
    "deleted",
    "attachDate",
-   "providerNo"
+   "providerNo",
+   "lab_type"
   ],
   "consultationRequestExt": [
    "id",
@@ -13953,7 +13956,8 @@
    "doctype",
    "deleted",
    "attach_date",
-   "provider_no"
+   "provider_no",
+   "lab_type"
   ],
   "criteria": [
    "CRITERIA_ID",
@@ -14229,7 +14233,8 @@
    "key_val",
    "value",
    "date_time",
-   "hidden"
+   "hidden",
+   "dashboard_single_value_key"
   ],
   "demographicExtArchive": [
    "id",
@@ -22317,7 +22322,8 @@
    "comment",
    "timestamp",
    "lab_type",
-   "id"
+   "id",
+   "mrpDemographicNo"
   ],
   "providerLabRoutingFavorites": [
    "id",
@@ -22921,7 +22927,7 @@
   "ctl_frequency": 20,
   "ctl_specialinstructions": 26,
   "default_role_access": 982,
-  "encounterForm": 99,
+  "encounterForm": 98,
   "encountertemplate": 186,
   "frm_labreq_preset": 193,
   "groups_tbl": 1,
@@ -24604,6 +24610,9 @@
   "patientLabRouting": [
    "lab_no"
   ],
+  "pharmacyInfo": [
+   "uid"
+  ],
   "prescribe": [
    "demographic_no"
   ],
@@ -24731,7 +24740,7 @@
  },
  "PROFILES": {
   "bc": {
-   "SCHEMA_MAP_VERSION": "o19map-3+f2e0d233",
+   "SCHEMA_MAP_VERSION": "o19map-3+a3deefa1",
    "O19_PROFILE": "bc",
    "TABLES": {
     "AppDefinition": {
@@ -41908,7 +41917,11 @@
      ]
     },
     "wcb_bp_code": {
-     "class": "copy",
+     "class": "merge",
+     "merge_keys": [
+      "code"
+     ],
+     "surrogate_pk": "wcb_bp_code_no",
      "cols": [
       "wcb_bp_code_no",
       "level1",
@@ -41919,7 +41932,11 @@
      ]
     },
     "wcb_noi_code": {
-     "class": "copy",
+     "class": "merge",
+     "merge_keys": [
+      "code"
+     ],
+     "surrogate_pk": "wcb_noi_code_no",
      "cols": [
       "wcb_noi_code_no",
       "level1",
@@ -41930,7 +41947,10 @@
      ]
     },
     "wcb_side": {
-     "class": "copy",
+     "class": "merge",
+     "merge_keys": [
+      "sidetype"
+     ],
      "cols": [
       "sidetype",
       "sidedesc",
@@ -42922,7 +42942,8 @@
      "signedOff",
      "signedOffTimestamp",
      "viewed",
-     "filed"
+     "filed",
+     "mrpDemographicNo"
     ],
     "HRMProviderConfidentialityStatement": [
      "providerNo",
@@ -43114,7 +43135,8 @@
      "passwordUpdateDate",
      "pinUpdateDate",
      "lastUpdateUser",
-     "lastUpdateDate"
+     "lastUpdateDate",
+     "usingMfa"
     ],
     "ServiceClient": [
      "id",
@@ -43836,7 +43858,8 @@
      "docType",
      "deleted",
      "attachDate",
-     "providerNo"
+     "providerNo",
+     "lab_type"
     ],
     "consultationRequestExt": [
      "id",
@@ -43917,7 +43940,8 @@
      "doctype",
      "deleted",
      "attach_date",
-     "provider_no"
+     "provider_no",
+     "lab_type"
     ],
     "criteria": [
      "CRITERIA_ID",
@@ -44205,7 +44229,8 @@
      "key_val",
      "value",
      "date_time",
-     "hidden"
+     "hidden",
+     "dashboard_single_value_key"
     ],
     "demographicExtArchive": [
      "id",
@@ -56430,7 +56455,8 @@
      "comment",
      "timestamp",
      "lab_type",
-     "id"
+     "id",
+     "mrpDemographicNo"
     ],
     "providerLabRoutingFavorites": [
      "id",
@@ -57285,7 +57311,7 @@
     "ctl_frequency": 20,
     "ctl_specialinstructions": 26,
     "default_role_access": 982,
-    "encounterForm": 55,
+    "encounterForm": 54,
     "encountertemplate": 186,
     "groups_tbl": 1,
     "issue": 71,
@@ -58803,6 +58829,9 @@
     "patientLabRouting": [
      "lab_no"
     ],
+    "pharmacyInfo": [
+     "uid"
+    ],
     "prescribe": [
      "demographic_no"
     ],
@@ -58935,9 +58964,7 @@
      "ID",
      "billing_no",
      "demographic_no",
-     "formNeeded",
-     "provider_no",
-     "w_duration"
+     "provider_no"
     ]
    },
    "PRISTINE_TOLERATED_TABLES": [
