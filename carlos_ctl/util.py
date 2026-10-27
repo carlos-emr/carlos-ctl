@@ -85,6 +85,69 @@ STATE = "/var/lib/carlos-emr"
 DB_OWNERSHIP_LOCK = os.path.join(STATE, ".finish-install.lock")
 
 
+def hold_db_ownership_lock(verb: str) -> Optional[int]:
+    """Hold the database-ownership lock for the rest of `verb`, or confirm
+    that this process already holds it.
+
+    flock locks belong to the open file description, so whoever already holds
+    the lock is found by a descriptor on the lock file, and locking that same
+    description again succeeds at once. That covers the postinsts, whose fd 9
+    a `carlos-ctl` they run inherits across exec, and finish-install, which
+    calls verbs in its own process. Opening the file afresh instead would
+    contend with them like a stranger and refuse. Only when no descriptor of
+    this process refers to the file is it opened here. That lock is
+    non-blocking like finish-install's, so another run owning the database is
+    a refusal, never a wait.
+
+    Returns the descriptor opened here, for the caller to close when the verb
+    ends. Returns None when a holder's descriptor was reused: closing or
+    unlocking that one would release the holder's lock under it."""
+    import fcntl
+
+    try:
+        target = os.stat(DB_OWNERSHIP_LOCK)
+    except OSError:
+        target = None
+    if target is not None:
+        for fd in _open_descriptors():
+            try:
+                st = os.fstat(fd)
+                if (st.st_dev, st.st_ino) != (target.st_dev, target.st_ino):
+                    continue
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue
+            return None
+    try:
+        os.makedirs(os.path.dirname(DB_OWNERSHIP_LOCK), exist_ok=True)
+        # no O_TRUNC and nothing written, as import-o19 opens it: the postinsts
+        # open it with `>`, and its contents mean nothing to anyone
+        fd = os.open(DB_OWNERSHIP_LOCK, os.O_WRONLY | os.O_CREAT, 0o644)
+    except OSError as exc:
+        die(f"could not open {DB_OWNERSHIP_LOCK} ({exc}); {verb} cannot exclude a "
+            "concurrent configure, boot repair or OSCAR 19 import, so it will not start. "
+            "Nothing has been changed.")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        die("another CARLOS run owns the database right now: an apt transaction "
+            "configuring carlos-emr, the boot-time carlos-emr-provision.service, "
+            "finish-install, an OSCAR 19 import ('carlos-ctl import-o19'), or "
+            f"another db-users or rotate. Nothing has been changed. Wait for it to "
+            f"finish, then run 'carlos-ctl {verb}' again.")
+    return fd
+
+
+def _open_descriptors() -> List[int]:
+    """This process's open file descriptors (Linux), lowest first; empty
+    where /proc is not mounted, which only means none is reused."""
+    try:
+        return sorted(int(name) for name in os.listdir("/proc/self/fd"))
+    except (OSError, ValueError):
+        return []
+
+
 def carlos_emr_installed() -> bool:
     """Whether the carlos-emr package's payload is on this host.
 

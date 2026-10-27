@@ -84,6 +84,11 @@ class Host(object):
         """The patient document tree the documents phase restores into."""
         return DOCUMENTS_ROOT
 
+    def schema_contract(self, province: str) -> Dict:
+        """The packaged app's canonical physical schema for this province."""
+        from .schema_contract import load
+        return load("/usr/share/carlos-emr/schema", province)
+
     def db_ownership_lock_path(self) -> Optional[str]:
         """The lock every provisioning path on this host takes before it
         mutates the database, or None when there is none to share.

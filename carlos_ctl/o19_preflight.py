@@ -71,7 +71,7 @@ import subprocess
 import sys
 
 # === BEGIN GENERATED DATA (generate_manifests.py) ===
-SCHEMA_MAP_VERSION = 'o19map-4+9e7bc615'
+SCHEMA_MAP_VERSION = 'o19map-5+9e7bc615'
 O19_PROFILE = 'on'
 SUPPORTED_PROVINCES = ['on', 'bc']
 REQUIRED_TABLES = [
@@ -918,7 +918,7 @@ LEGACY_PREVENTION_TYPES = [
     'fIPV',
 ]
 PROFILE_BC = {
-    'SCHEMA_MAP_VERSION': 'o19map-4+3ef1edf2',
+    'SCHEMA_MAP_VERSION': 'o19map-5+ccf44f43',
     'O19_PROFILE': 'bc',
     'PATIENT_DATA_TABLES': [
         'DrugDispensing',
@@ -1588,9 +1588,9 @@ PROFILE_BC = {
         'waitingList': 'copy',
         'waitingListName': 'copy',
         'wcb': 'copy',
-        'wcb_bp_code': 'copy',
-        'wcb_noi_code': 'copy',
-        'wcb_side': 'copy',
+        'wcb_bp_code': 'merge',
+        'wcb_noi_code': 'merge',
+        'wcb_side': 'merge',
         'workflow': 'copy',
     },
     'B3_FLAGGED_COLUMNS': {
@@ -2661,7 +2661,7 @@ def check_oauth_grants(c):
 
 
 def check_locked_notes(c):
-    """B4: password-protected (encrypted) casemgmt notes.
+    """B4: persistently locked casemgmt notes.
 
     Returns the row count, which check_properties needs: the stock O19
     default casemgmt.note.password.enabled=true says nothing on its
@@ -2671,20 +2671,23 @@ def check_locked_notes(c):
     count_live = c.count_live
     findings = c.findings
     tables = c.tables
-    # --- B4: password-protected (encrypted) casemgmt notes ---------------
-    # judged on the data: a note with a password is stored encrypted and
-    # the key handling is outside the standard import path
+    # Upstream gates access with locked and a literal password comparison;
+    # the note itself is ordinary text. Unlocked rows can retain a placeholder
+    # password such as 'NULL'. Conversely, 'NULL' is a valid literal password
+    # on a locked row, and a locked row with a missing password is inconsistent
+    # protection state, not permission to expose it.
     locked_notes = 0
     if "casemgmt_note" in tables:
         locked_notes = count_live(
-            "casemgmt_note", "password IS NOT NULL AND password <> ''")
+            "casemgmt_note", "locked = '1'")
     if locked_notes:
         findings.append(finding(
             "B4-encrypted-notes", BLOCKER,
-            "{0} password-protected (encrypted) casemgmt note(s)"
+            "{0} locked casemgmt note(s)"
             .format(locked_notes),
-            "Key handling for encrypted notes is outside the standard "
-            "import path. No --accept flag exists for this."))
+            "OSCAR note access restrictions need a supported CARLOS mapping "
+            "before these notes can be imported. A password value alone "
+            "does not establish encryption. No --accept flag exists for this."))
     return locked_notes
 
 
@@ -3321,7 +3324,7 @@ def check_properties(c, properties, locked_notes):
                 "CARLOS has no LDAP authentication: staff could not log in "
                 "after cutover. Provision local credentials first. No "
                 "--accept flag exists for this."))
-        # B4: encrypted casemgmt notes — judged on the rows below, not on
+        # B4: locked casemgmt notes — judged on the rows, not on
         # the property: casemgmt.note.password.enabled=true is the stock
         # O19 default and says nothing about whether a note was ever locked
         if properties.get("casemgmt.note.password.enabled", "") \
@@ -3329,9 +3332,9 @@ def check_properties(c, properties, locked_notes):
             findings.append(finding(
                 "notes-password-enabled", ADVISORY,
                 "casemgmt.note.password.enabled is set (the stock O19 "
-                "default) but no note carries a password",
-                "Nothing is encrypted; CARLOS has no reader for that key "
-                "and the props phase drops it."))
+                "default) but no note is locked",
+                "No locked notes were found. The props phase drops this "
+                "OSCAR setting because CARLOS does not use it."))
         dropped = {}
         exact = set(DROPPED_PROP_KEYS)
         for key in sorted(properties):

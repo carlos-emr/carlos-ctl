@@ -1,3 +1,22 @@
+carlos-ctl (1.2.1~dev1) resolute; urgency=medium
+
+  * Fix OSCAR 19 collation aliases and note-lock classification. Compare
+    converted text exactly, including trailing spaces, and use target
+    comparison rules for source keys and merge mappings.
+  * Support complete SQL backup sets and native nested OSCAR archives,
+    verify overlaps, and restore ordered full/incremental document sets.
+    Bind private input snapshots and the ETL contract to resume state.
+  * Guard acknowledged charset repairs before speculative conversions,
+    preserving correct accents and supplementary Unicode without warnings.
+  * Refuse conversion warnings and value mismatches before checkpoints.
+    Verify the packaged physical schema, all declared foreign keys and
+    optimizer statistics before completing an import.
+  * Retire source-set provenance and diagnostics with the completed run,
+    and remove its immutable raw input copies during verified cleanup.
+  * Explain an active import immediately in deployment checks.
+
+ -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Mon, 26 Oct 2026 03:30:00 +0000
+
 carlos-ctl (1.2.0~dev1) resolute; urgency=medium
 
   * Preserve OSCAR 19 OAuth access tokens and legacy lifetime settings; include
@@ -24,7 +43,23 @@ carlos-ctl (1.2.0~dev1) resolute; urgency=medium
     (with a warning) rather than skipping them, asks for a restart when it
     corrects the recorded reporting username, and an unreadable or
     non-UTF-8 grant list is reported instead of raising.
+  * Before applying the grant list (in db-users and after db-migrate), drop
+    any carlos_report login for a host other than localhost and 127.0.0.1,
+    because the list grants every login the account has. An operator's
+    carlos_report@'%' would otherwise get the clinical tables behind a
+    password carlos-ctl does not manage. If such a login cannot be dropped,
+    the list is not applied.
   * destroy-data drops carlos_report with the other accounts.
+  * db-users holds the database-ownership lock that finish-install,
+    import-o19 and both postinsts share, from before it reads the recorded
+    passwords until it has written them, so two runs (a first-run postinst
+    and a hand-run rotate, say) can no longer leave carlos.properties
+    recording one password while MariaDB accepts another. A caller already
+    holding the lock (a postinst on fd 9, finish-install in-process) is let
+    through; while another run holds it, db-users refuses and changes
+    nothing. A run stopped between its ALTER USERs and its writes is
+    repaired by the next db-users, which sets MariaDB back to the recorded
+    passwords.
 
  -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Thu, 22 Oct 2026 12:00:00 +0000
 

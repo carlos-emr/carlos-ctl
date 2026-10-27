@@ -1299,12 +1299,24 @@ class TestCleanupEndToEnd(unittest.TestCase):
             self.assertIn(key, ctx)
 
     def test_a_verified_run_cleans_up_without_raising(self):
+        sources = [os.path.join(self.state_dir, name) for name in
+                   ("bundle", "bundle-assess", "bundle-sources", "bundle-assess-sources")]
+        for directory in sources:
+            os.makedirs(os.path.join(directory, "input-sha"))
+            Path(directory, "input-sha", "source.properties").write_text("synthetic credential")
+        export = Path(self.state_dir, "o19-archive-export")
+        export.mkdir()
+        (export / "kept.csv").write_text("preserved clinic records")
         o19import.save_state(self.state_dir,
                              {"phases": {"verify": {"status": "done"}}})
         ctx = self.ctx()
         o19import.run_cleanup(ctx)
         self.assertTrue(any("DROP DATABASE" in q for q in self.queries),
                         self.queries)
+        self.assertTrue(all(not os.path.exists(directory) for directory in sources))
+        kept = list(Path(self.state_dir).glob("o19-archive-export*/kept.csv"))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_text(), "preserved clinic records")
 
     def test_the_staging_schema_is_measured_before_it_is_dropped(self):
         """The whole point of the gate: the parity runs first, or the
@@ -1954,7 +1966,7 @@ class TestStagingRestore(unittest.TestCase):
              b"use the inhaler twice daily');\n"]))
 
     def test_a_line_longer_than_the_carry_bound_stays_mid_line(self):
-        filler = b"x" * (o19import.DUMP_CARRY_MAX * 2)
+        filler = b"x" * ((1 << 16) * 2)
         big = b"INSERT INTO n VALUES ('" + filler + b" use it');\n"
         half = len(big) // 2
         self.assertIsNone(self._scan([big[:half], big[half:]]))
@@ -2235,6 +2247,9 @@ class TestBundleDigest(unittest.TestCase):
                                  "properties": None, "bundle_sha256": "x"})
         self.addCleanup(setattr, o19import.o19bundle, "open_bundle",
                         real_open)
+        prepare = mock.patch.object(o19import, "_prepare_input_sets", side_effect=lambda inputs, *_: inputs)
+        prepare.start()
+        self.addCleanup(prepare.stop)
         args = argparse.Namespace(
             bundle=bundle, bundle_pass=None, bundle_sha256=None,
             bundle_cipher="aes-256-cbc", bundle_openssl_opt=[],
@@ -2342,6 +2357,28 @@ class TestHeadCollations(unittest.TestCase):
         self.assertEqual(
             o19import.head_collations(head),
             ["latin1_swedish_ci", "utf8mb4_uca1400_ai_ci"])
+
+    def test_head_cutoff_does_not_invent_partial_collation_names(self):
+        name = b"utf8_general_ci"
+        declaration = b"CREATE TABLE t(a INT) COLLATE="
+        for split in range(1, len(name) + 1):
+            with self.subTest(split=split):
+                prefix = b" " * (65536 - len(declaration) - split)
+                sql = prefix + declaration + name + b";\n"
+                self.assertEqual(o19import.head_collations(sql), [])
+                scanner = o19import.CollationScanner({name.decode()})
+                self.assertIsNone(scanner.feed(sql[:65536]))
+                self.assertIsNone(scanner.feed(sql[65536:], final=True))
+
+    def test_complete_names_before_head_cutoff_are_still_checked(self):
+        declaration = b"CREATE TABLE t(a INT) COLLATE=utf8_general_ci;\n"
+        self.assertEqual(o19import.head_collations(declaration + b" " * 65536), ["utf8_general_ci"])
+
+    def test_only_sql_notes_control_deprecation_is_exempt_from_warning_refusal(self):
+        notice = "Warning (Code 1287): '@@sql_notes' is deprecated and will be removed in a future release. Please use '@@note_verbosity' instead\n"
+        self.assertEqual(o19import.sql_warning_codes(notice), set())
+        self.assertEqual(o19import.sql_warning_codes(notice.replace("@@sql_notes", "@@unrelated_variable")), {"1287"})
+        self.assertEqual(o19import.sql_warning_codes(notice + "Note (Code 1265): Data truncated\n"), {"1265"})
 
 
 class TestDocumentsSizing(unittest.TestCase):
@@ -3584,7 +3621,8 @@ class TestArgumentRefusals(unittest.TestCase):
     def test_the_loose_files_resolve_when_they_are_all_there(self):
         inputs = self.resolve(dump=self.dump, properties=self.props,
                               skip_documents=True)
-        self.assertEqual(inputs["dump"], self.dump)
+        self.assertEqual(Path(inputs["dump"]).read_bytes(), Path(self.dump).read_bytes())
+        self.assertNotEqual(inputs["dump"], self.dump)
         self.assertIsNone(inputs["bundle_sha256"])
 
 

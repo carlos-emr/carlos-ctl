@@ -7,8 +7,41 @@ import os
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from carlos_ctl import validate
+
+
+class TestImportStatus(unittest.TestCase):
+    def test_missing_guard_reports_failure_before_deployment_probes(self):
+        output = io.StringIO()
+        with patch.object(validate, "need_root"), \
+                patch.object(validate.config, "load", return_value=SimpleNamespace(server_name="review.invalid")), \
+                patch.object(validate, "_package_versions", return_value=[]), \
+                patch.object(validate.os.path, "exists", return_value=False), \
+                patch.object(validate, "run") as run, \
+                patch.object(validate.time, "sleep") as sleep, \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(validate.cmd_check([]), 1)
+            self.assertEqual(validate._failures, 1)
+            run.assert_not_called()
+            sleep.assert_not_called()
+        self.assertIn("import guard is missing", output.getvalue())
+        self.assertIn(validate.provision.O19_GUARD, output.getvalue())
+        self.assertIn("reinstall carlos-emr", output.getvalue())
+
+    def test_active_import_does_not_wait_for_application_start(self):
+        with patch.object(validate, "need_root"), patch.object(validate.config, "load", return_value=SimpleNamespace(server_name="review.invalid")), \
+                patch.object(validate, "_package_versions", return_value=[]), \
+                patch.object(validate, "_check_import_state", return_value=True), \
+                patch.object(validate.time, "sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(validate.cmd_check([]), 1)
+            sleep.assert_not_called()
+
+    def test_shared_guard_controls_the_status(self):
+        with patch.object(validate.os.path, "exists", return_value=True), \
+                patch.object(validate, "run", return_value=subprocess.CompletedProcess([], 0)):
+            self.assertFalse(validate._check_import_state())
 
 
 class TestProcessOwnership(unittest.TestCase):

@@ -18,7 +18,9 @@ exists, minus hidden columns). This module owns the rest:
   * ``account_sql``   the CREATE/ALTER USER statements db-users runs;
   * ``sync_grants``   apply the deployed WAR's list, after db-users and after
                       every successful migration (a migration can add a
-                      reportable table, which is only granted once it exists);
+                      reportable table, which is only granted once it exists),
+                      first dropping any login other than ``REPORT_HOSTS``:
+                      the list grants every login the account has;
   * ``check_lines``   what ``carlos-ctl check`` reports about the account.
 
 A grant sync that fails never fails the verb that ran it: the clinical
@@ -107,15 +109,6 @@ def read_grant_list(path: Optional[str] = None) -> Optional[GrantList]:
     return None
 
 
-def _account_exists(db_root) -> Optional[bool]:
-    cp = db_root(["-N", "-B", "-e",
-                  "SELECT COUNT(*) FROM mysql.global_priv "
-                  f"WHERE User = '{REPORT_USER}'"], capture_output=True)
-    if cp.returncode != 0:
-        return None
-    return cp.stdout.strip() not in ("", "0")
-
-
 def sync_grants(db_name: str, db_root) -> bool:
     """Rebuild the account's grants from the deployed WAR's list. Returns
     True when applied. Never raises or dies: every reason it could not run
@@ -125,12 +118,12 @@ def sync_grants(db_name: str, db_root) -> bool:
         log("the deployed carlos-emr ships no Query by Example grant list "
             f"({GRANTS_SQL}); the reporting account was left as it is")
         return False
-    exists = _account_exists(db_root)
-    if exists is None:
+    hosts = _account_hosts(db_root)
+    if hosts is None:
         warn(f"could not check whether the {REPORT_USER} account exists; its "
              "Query by Example grants were not refreshed (carlos-ctl check)")
         return False
-    if not exists:
+    if not hosts:
         log(f"the {REPORT_USER} account does not exist yet ('carlos-ctl db-users' "
             "creates it); Query by Example stays closed until it does")
         return False
@@ -141,6 +134,8 @@ def sync_grants(db_name: str, db_root) -> bool:
         reason = e.strerror if isinstance(e, OSError) else "not valid UTF-8"
         warn(f"cannot read {GRANTS_SQL} ({reason}); the Query by Example "
              "grants were not refreshed (reinstall carlos-emr)")
+        return False
+    if not _drop_stray_hosts(db_root, hosts):
         return False
     # The script selects nothing itself: the schema is the default database.
     cp = db_root([db_name], input=script, capture_output=True)
@@ -171,6 +166,39 @@ def _account_hosts(db_root) -> Optional[set]:
     if cp.returncode != 0:
         return None
     return {line.strip() for line in cp.stdout.splitlines() if line.strip()}
+
+
+def _drop_stray_hosts(db_root, hosts: set) -> bool:
+    """Drop every login of the account other than REPORT_HOSTS, before the
+    grant list runs. The list grants each login the account has, so a stray
+    one (an operator's carlos_report@'%', say) would be handed the same
+    clinical tables, behind a password carlos-ctl neither sets nor records.
+    carlos-ctl creates no other login, and check calls one drift.
+
+    Returns False, having said why, when a stray could not be removed or is
+    still there afterwards (a host name the client printed escaped): the
+    list must not run then."""
+    approved = set(REPORT_HOSTS)
+    stray = sorted(hosts - approved)
+    for host in stray:
+        cp = db_root(["-e", f"DROP USER IF EXISTS '{REPORT_USER}'@'{util.sql_escape(host)}'"],
+                     capture_output=True)
+        if cp.returncode != 0:
+            warn(f"could not drop the {REPORT_USER} login for host '{host}' "
+                 f"({util.mariadb_error(cp)}); the Query by Example grants were not "
+                 "refreshed (carlos-ctl check)")
+            return False
+        warn(f"dropped the {REPORT_USER} login for host '{host}': Query by Example's "
+             f"account logs in only from {' and '.join(REPORT_HOSTS)}, and the grant "
+             "list would have given that login the same tables")
+    if stray:
+        left = _account_hosts(db_root)
+        if left is None or left - approved:
+            warn(f"the {REPORT_USER} account still has a login other than "
+                 f"{' and '.join(REPORT_HOSTS)}; the Query by Example grants were not "
+                 "refreshed (carlos-ctl check)")
+            return False
+    return True
 
 
 def _granted_tables(db_root) -> Optional[List[Tuple[str, str, str, str]]]:
@@ -311,8 +339,9 @@ def check_lines(db_name: str, db_root, login=None, *,
     stray = sorted(hosts - set(REPORT_HOSTS))
     if stray:
         out.append(("bad", f"the {REPORT_USER} account also exists for host(s) "
-                           + ", ".join(stray) + ", which carlos-ctl never creates; drop them "
-                           f"(DROP USER '{REPORT_USER}'@'<host>')"))
+                           + ", ".join(stray) + ", which carlos-ctl never creates; "
+                           "'carlos-ctl db-users' drops them before it applies the grant "
+                           f"list (or DROP USER '{REPORT_USER}'@'<host>')"))
 
     extra = _count(db_root,
                    "SELECT (SELECT COUNT(*) FROM mysql.global_priv "

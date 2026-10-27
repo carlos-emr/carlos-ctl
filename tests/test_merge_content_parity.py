@@ -80,9 +80,8 @@ class TestTheSeedStatement(unittest.TestCase):
     def test_a_character_column_is_compared_under_a_binary_collation(self):
         """The target's own collation folds accents and case, so a plain
         `<=>` would call 'Santé' and 'Sante' the same seed row."""
-        self.assertIn("CONVERT(d.`status` USING utf8mb4) COLLATE "
-                      "utf8mb4_bin <=> CONVERT(p.`status` USING utf8mb4) "
-                      "COLLATE utf8mb4_bin", self.sql())
+        self.assertIn("BINARY CONVERT(d.`status` USING utf8mb4) <=> "
+                      "BINARY CONVERT(p.`status` USING utf8mb4)", self.sql())
 
     def test_a_number_is_compared_by_value_not_rendered(self):
         sql = o19etl.merge_seed_change_sql(
