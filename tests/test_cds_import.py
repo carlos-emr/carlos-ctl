@@ -74,6 +74,15 @@ class TestArguments(unittest.TestCase):
                 self.assertEqual(cdsimport.engine_arguments(args), [
                     "--operation", operation, "--provider", "4", "--run", "run-123"])
 
+    def test_submission_lookup_is_a_read_only_status_with_no_import_options(self):
+        args = cdsimport.parse_args(["--status-submission", "submission-123", "--provider", "T099"])
+        self.assertEqual(cdsimport.engine_arguments(args), [
+            "--operation", "status", "--provider", "T099", "--submission-key", "submission-123"])
+        for extra in (["--input", "/allowed/new.xml"], ["--resume", "run-1"],
+                      ["--status", "run-1"], ["--status-submission", "different"]):
+            with self.subTest(extra=extra), self.assertRaises(cdsimport.CdsCommandError):
+                cdsimport.parse_args(["--status-submission", "submission-123", "--provider", "4", *extra])
+
     def test_synthetic_course_and_shift_are_explicit_and_repeatable(self):
         argv = IMPORT + ["--synthetic", "--course", "9", "--timeshift", "-365"]
         first = cdsimport.engine_arguments(cdsimport.parse_args(argv))
@@ -200,6 +209,21 @@ class TestIdentityAndRuntime(unittest.TestCase):
                 mock.patch.object(cdsimport.util, "prop_get", side_effect=AssertionError):
             self.assertEqual(cdsimport.cmd_cds_import(IMPORT), 4)
         self.assertEqual(execute.call_args.args[0][5], "-Xmx768m")
+
+    def test_submission_lookup_requires_capability_before_ticket_or_execution(self):
+        for feature, expected in ((None, 2), (False, 2), (1, 2), (True, 0)):
+            with self.subTest(feature=feature), \
+                    mock.patch.object(cdsimport.os, "geteuid", return_value=0), \
+                    mock.patch.object(cdsimport, "_operator", return_value=("root", 0)), \
+                    mock.patch.object(cdsimport, "_java_command", return_value=["/java"]), \
+                    mock.patch.object(cdsimport, "_probe", return_value={**CAPS, "submissionLookup": feature}), \
+                    mock.patch.object(cdsimport, "_create_ticket", return_value=SimpleNamespace(path="/ticket", remove=lambda: True)) as ticket, \
+                    mock.patch.object(cdsimport, "_run_engine", return_value=0) as execute, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cdsimport.cmd_cds_import([
+                    "--status-submission", "submission-123", "--provider", "4"]), expected)
+                self.assertEqual(ticket.called, feature is True)
+                self.assertEqual(execute.called, feature is True)
 
     def test_missing_application_is_runtime_exit_two_from_dispatcher(self):
         with mock.patch.object(util, "carlos_emr_installed", return_value=False), \

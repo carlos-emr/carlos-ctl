@@ -214,6 +214,7 @@ delegation. `sudo` does not grant clinical attribution by itself.
 | `--merge-existing` | Opt in to a proven unique eligible HIN + exact DOB match; default off |
 | `--no-match-providers` | Preserve historical source provider identity without name matching |
 | `--synthetic`, `--course ID`, `--timeshift DAYS` | Approved synthetic/anonymized workflow; course/nonzero shift require synthetic mode, which cannot merge real charts |
+| `--status-submission KEY` | Read-only recovery after acceptance output loss; same verified OS operator and selected provider; unknown outcome remains uncertain, never resubmits |
 | `--status RUN_ID`, `--resume RUN_ID`, `--cancel RUN_ID`, `--report RUN_ID` | Mutually exclusive existing-run operations, always with `--provider ID`; source/import options cannot be replaced |
 
 The foreground import command streams the engine's safe progress and waits for

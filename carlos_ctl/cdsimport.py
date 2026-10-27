@@ -133,6 +133,8 @@ def parser() -> argparse.ArgumentParser:
     for operation in ("status", "resume", "cancel", "report"):
         modes.add_argument("--" + operation, action=_Once, type=_identifier,
                            metavar="RUN_ID", help=operation + " an existing durable run")
+    modes.add_argument("--status-submission", action=_Once, type=_identifier, metavar="KEY",
+                       help="recover a run handle from its printed submission key without resubmitting")
     return ap
 
 
@@ -140,11 +142,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     ap = parser()
     args = ap.parse_args(list(argv))
     selected = [name for name in OPERATIONS - {"import"} if getattr(args, name)]
-    args.operation = selected[0] if selected else "import"
-    args.run_id = getattr(args, args.operation) if selected else None
+    args.operation = "status" if args.status_submission else (selected[0] if selected else "import")
+    args.run_id = getattr(args, selected[0]) if selected else None
     provided = getattr(args, "_provided", set())
     if args.operation != "import":
-        if provided - {"provider", args.operation}:
+        if provided - {"provider", "status_submission" if args.status_submission else args.operation}:
             ap.error("existing jobs cannot change input or options")
         return args
     if not args.input or not args.source_namespace or not args.source_profile:
@@ -163,6 +165,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def engine_arguments(args: argparse.Namespace) -> List[str]:
     result = ["--operation", args.operation, "--provider", args.provider]
+    if args.status_submission:
+        return result + ["--submission-key", args.status_submission]
     if args.operation != "import":
         return result + ["--run", args.run_id]
     result += ["--input", args.input, "--source-namespace", args.source_namespace,
@@ -503,6 +507,8 @@ def cmd_cds_import(argv: Sequence[str]) -> int:
         command = _java_command()
         env = _environment(operator, uid)
         capabilities = _probe(command, env)
+        if args.status_submission and capabilities.get("submissionLookup") is not True:
+            raise CdsCommandError("CDS_HANDSHAKE: deploy a matching CARLOS release with submission lookup", 2)
         # Java's real Properties loader selects the server launch budget. Do not
         # duplicate its escaping/separator/continuation semantics in Python.
         command = ["-Xmx" + str(capabilities["cliHeapMiB"]) + "m"
