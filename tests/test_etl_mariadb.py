@@ -104,6 +104,32 @@ class TestCopyMariaDB(unittest.TestCase):
         self.assertEqual(self.target_count(), 0)
         self.assertTrue(self.state["done"])
 
+    def assert_zero_auto_increment_key_is_preserved(self, chunked):
+        self.plain("ALTER TABLE `{0}`.sample MODIFY id INT NOT NULL AUTO_INCREMENT".format(self.dst))
+        self.seed("(0,'zero'),(7,'seven')")
+        if chunked:
+            self.entry["chunk_by"] = "id"
+        self.columns = o19etl.introspect_columns(self.plain, self.dst)["sample"]
+
+        self.copy()
+
+        self.assertEqual(self.plain("SELECT id,name FROM `{0}`.sample ORDER BY id".format(self.dst)),
+                         [["0", "zero"], ["7", "seven"]])
+        self.assertTrue(self.state["done"])
+        if chunked:
+            self.assertEqual(self.state["done_through"], 7)
+        # NULL remains the request for a fresh identity; only explicit zero
+        # must survive id-intact copying.
+        self.run.query("INSERT INTO `{0}`.sample(id,name) VALUES(NULL,'generated')".format(self.dst))
+        self.assertEqual(self.plain("SELECT id FROM `{0}`.sample WHERE name='generated'".format(self.dst)),
+                         [["8"]])
+
+    def test_should_copy_zero_auto_increment_key_without_renumbering(self):
+        self.assert_zero_auto_increment_key_is_preserved(False)
+
+    def test_should_checkpoint_zero_auto_increment_key_in_a_range_copy(self):
+        self.assert_zero_auto_increment_key_is_preserved(True)
+
     def test_should_refuse_silent_float_narrowing_before_checkpoint(self):
         self.plain("ALTER TABLE `{0}`.sample ADD COLUMN dose DOUBLE".format(self.src))
         self.plain("ALTER TABLE `{0}`.sample ADD COLUMN dose FLOAT".format(self.dst))

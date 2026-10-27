@@ -1308,11 +1308,13 @@ def strip_client_identity(args: List[str]) -> List[str]:
 def staging_init_command(statement_timeout: int = 0) -> str:
     """The session the restore runs under: no binlog (a throwaway
     schema), no constraint checks (a dump arrives in dump order), and
-    permissive SQL so 2006-era statements load. `--statement-timeout`
+    permissive SQL so 2006-era statements load. Preserve explicit zero
+    AUTO_INCREMENT keys even when a dump omits mysqldump's mode header.
+    `--statement-timeout`
     bounds the dump's own statements too -- one crafted INSERT could
     otherwise hold the restore forever."""
     init = ("SET SESSION sql_log_bin=0, FOREIGN_KEY_CHECKS=0, "
-            "UNIQUE_CHECKS=1, sql_mode='', old_mode='" + RESTORE_OLD_MODE + "'")
+            "UNIQUE_CHECKS=1, sql_mode='NO_AUTO_VALUE_ON_ZERO', old_mode='" + RESTORE_OLD_MODE + "'")
     if statement_timeout:
         init += ", max_statement_time={0}".format(int(statement_timeout))
     return init
@@ -1985,9 +1987,13 @@ def make_etl_query(base_argv: List[str],
     INSERT ... SELECT encounters duplicate unique keys with both unique
     and foreign-key checks disabled. Keep unique checks on so the client
     reports the collision before the driver checkpoints the copy.
+
+    Keep literal zero AUTO_INCREMENT keys intact as well: zero is an
+    existing source identity, not a request to allocate a fresh one.
+    This mode leaves the copy non-strict and keeps backslash SQL quoting.
     """
     prelude = ("SET SESSION sql_log_bin=0, FOREIGN_KEY_CHECKS=0, "
-               "UNIQUE_CHECKS=1, sql_mode='', collation_connection='utf8mb4_general_ci', time_zone='+00:00'")
+               "UNIQUE_CHECKS=1, sql_mode='NO_AUTO_VALUE_ON_ZERO', collation_connection='utf8mb4_general_ci', time_zone='+00:00'")
     if statement_timeout:
         prelude += ", " + statement_timeout_prelude(
             statement_timeout).replace("SET SESSION ", "")

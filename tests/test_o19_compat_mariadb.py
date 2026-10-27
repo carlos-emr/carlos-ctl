@@ -86,6 +86,61 @@ class TestO19Compatibility(unittest.TestCase):
         self.assertIn("1265", refusal)
         self.assertNotIn("1287", refusal)
 
+    def test_staging_preserves_zero_auto_increment_keys_with_or_without_a_mode_header(self):
+        headers = ("", "/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;\n")
+        for index, header in enumerate(headers):
+            with self.subTest(mode_header=bool(header)):
+                table = "zero_identity_{0}".format(index)
+                path = Path(self.temp.name) / (table + ".sql")
+                footer = "/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;\n" if header else ""
+                path.write_text(header + "CREATE TABLE {0} (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20));\n"
+                                "INSERT INTO {0} VALUES(0,'zero'),(7,'seven');\n".format(table)
+                                + footer + "-- Dump completed\n")
+                argv = self.base + list(o19import.CLIENT_COMMON_ARGS) + [
+                    "--init-command=" + o19import.staging_init_command(10), self.src]
+                source_rc, client_rc, _, refusal = o19import._stream_dump(["cat", str(path)], argv,
+                    diagnostics_path=str(Path(self.temp.name) / (table + "-diagnostics.txt")))
+                self.assertEqual((source_rc, client_rc), (0, 0))
+                self.assertIsNone(refusal)
+                self.assertEqual(self.q("SELECT id,name FROM `{0}`.`{1}` ORDER BY id".format(self.src, table)),
+                                 [["0", "zero"], ["7", "seven"]])
+
+    def test_dump_mode_changes_and_saved_restoration_keep_zero_keys_and_other_modes(self):
+        cases = (
+            ("SET SQL_MODE='';\n", "", {"NO_AUTO_VALUE_ON_ZERO"}),
+            ("SET SQL_MODE='', @OLD_SQL_MODE=@@SQL_MODE;\n"
+             "SET SQL_MODE='STRICT_TRANS_TABLES,NO_ZERO_DATE';\n",
+             "SET SQL_MODE=@OLD_SQL_MODE;\n",
+             {"NO_AUTO_VALUE_ON_ZERO", "STRICT_TRANS_TABLES", "NO_ZERO_DATE"}),
+        )
+        for index, (header, footer, expected_before) in enumerate(cases):
+            with self.subTest(saved_mode=bool(footer)):
+                tables = ["mode_zero_{0}_{1}".format(index, phase) for phase in ("before", "after")]
+                observations = "mode_values_{0}".format(index)
+                body = header + "CREATE TABLE {0}(phase VARCHAR(10), modes TEXT);\n".format(observations)
+                for phase, table in zip(("before", "after"), tables):
+                    if phase == "after":
+                        body += footer
+                    body += ("CREATE TABLE {0}(id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20));\n"
+                             "INSERT INTO {0} VALUES(0,'zero'),(7,'seven');\n"
+                             "INSERT INTO {1} VALUES('{2}',@@SESSION.sql_mode);\n").format(table, observations, phase)
+                path = Path(self.temp.name) / (observations + ".sql")
+                path.write_text(body + "-- Dump completed\n")
+                argv = self.base + list(o19import.CLIENT_COMMON_ARGS) + [
+                    "--init-command=" + o19import.staging_init_command(10), self.src]
+
+                source_rc, client_rc, _, refusal = o19import._stream_dump(["cat", str(path)], argv,
+                    diagnostics_path=str(Path(self.temp.name) / (observations + "-diagnostics.txt")))
+
+                self.assertEqual((source_rc, client_rc), (0, 0))
+                self.assertIsNone(refusal)
+                for table in tables:
+                    self.assertEqual(self.q("SELECT id,name FROM `{0}`.`{1}` ORDER BY id".format(self.src, table)),
+                                     [["0", "zero"], ["7", "seven"]])
+                observed = dict(self.q("SELECT phase,modes FROM `{0}`.`{1}`".format(self.src, observations)))
+                self.assertEqual(set(observed["before"].split(",")), expected_before)
+                self.assertEqual(set(observed["after"].split(",")), {"NO_AUTO_VALUE_ON_ZERO"})
+
     def stage(self, padding):
         self.q("DROP DATABASE IF EXISTS `{0}`".format(o19import.STAGING_SCHEMA))
         self.addCleanup(self.q, "DROP DATABASE IF EXISTS `{0}`".format(o19import.STAGING_SCHEMA))

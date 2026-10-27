@@ -6,9 +6,10 @@ o19_archive capture of everything CARLOS no longer models.
 
 Statement GENERATION is pure (unit-tested against golden SQL); EXECUTION
 goes through the caller-supplied query callable with a session prelude of
-sql_log_bin=0, FOREIGN_KEY_CHECKS=0, sql_mode='' (the bulk copy is
-deliberately outside the binlog — the pre/post backups bracket it, and P0
-refused replicas).
+sql_log_bin=0, FOREIGN_KEY_CHECKS=0, sql_mode='NO_AUTO_VALUE_ON_ZERO'. The
+copy stays non-strict while preserving explicit zero AUTO_INCREMENT ids.
+It is deliberately outside the binlog — the pre/post backups bracket it,
+and P0 refused replicas.
 
 Sanitizer policy (migration plan §4.3): zero dates NULL out only where the
 target column is nullable; enum values outside the target's set fall to the
@@ -466,7 +467,7 @@ def source_expr(table_entry: dict, target_col: str,
 
 #: The literal a NULL falls to on a NOT NULL target, BY TARGET TYPE.
 #:
-#: MEASURED on MariaDB 10.11 under the ETL's `sql_mode=''`, through
+#: MEASURED on MariaDB 10.11 under non-strict SQL mode, through
 #: INSERT ... SELECT -- the form the copy uses, and the only one that
 #: coerces at all: a literal `VALUES (NULL)` into a NOT NULL column is
 #: ERROR 1048 even in non-strict mode. Two results that reasoning would
@@ -1142,7 +1143,7 @@ NUMERIC_TYPES = ("tinyint", "smallint", "mediumint", "int", "integer",
 STRING_TYPES = ("char", "varchar", "tinytext", "text", "mediumtext",
                 "longtext", "enum")
 #: what the server would accept as a number without coercion; anything
-#: else becomes 0 under sql_mode='' (the ETL executor), silently. The dot
+#: else becomes 0 under the non-strict ETL mode, silently. The dot
 #: is a bracket class: inside a SQL string literal the server consumes a
 #: backslash before the regex engine sees the pattern, so `\.` would
 #: match any character
@@ -1886,7 +1887,7 @@ def archived_column_type(info: dict) -> str:
     utf8mb4 `text` as few as 16383. Measured on MariaDB 10.11, a full
     latin1 TEXT of accented characters copied verbatim into a utf8mb4
     `text` lands truncated to 32767 characters -- with a warning under
-    the ETL's `sql_mode=''`, which is to say silently. Declared in the
+    the non-strict ETL mode, which is to say silently. Declared in the
     source's own charset, the archived column holds the same bytes at
     the same capacity, and the verbatim copy really is verbatim.
 
@@ -2687,7 +2688,8 @@ def etl_precheck_problems(ctx, plain, query, src_schema: str,
     # write, rather than after the whole copy
     # every plain-client statement interpolates values with backslash
     # escaping; a server mode that disables it (or ANSI_QUOTES) would turn
-    # a quoted clinic value into SQL. The ETL executor pins sql_mode='';
+    # a quoted clinic value into SQL. The ETL executor pins only
+    # NO_AUTO_VALUE_ON_ZERO, preserving normal backslash escaping;
     # the plain client runs under the server's own, so it is checked once
     mode = plain("SELECT @@SESSION.sql_mode")[0][0].upper()
     for flag in ("NO_BACKSLASH_ESCAPES", "ANSI_QUOTES"):
