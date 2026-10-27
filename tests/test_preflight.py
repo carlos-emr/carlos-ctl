@@ -481,6 +481,24 @@ class TestVerdicts(unittest.TestCase):
                           "olis-gone", "dropped-columns",
                           "carry-credentials", "charset-repair"})
 
+    def test_ambiguous_oauth_identifiers_are_not_clearable_by_credential_acceptance(self):
+        report = pf.run_checks(FakeDb(base_tables(ServiceAccessToken=2),
+                               where_counts={("ServiceAccessToken", "oauth_duplicates"): 2}),
+                               properties=clean_props(), accepted=["carry-credentials"])
+        self.assertEqual(report["verdict"], "no-go")
+        finding = next(f for f in report["findings"] if f["id"] == "oauth-ambiguous-ServiceAccessToken")
+        self.assertEqual(finding["data"]["rows"], 2)
+
+    def test_access_tokens_share_the_existing_credential_acknowledgement(self):
+        report = pf.run_checks(FakeDb(base_tables(ServiceAccessToken=3)),
+                               properties=clean_props())
+        carried = [f for f in report["findings"] if f["id"] == "B9-credentials-carried"]
+        self.assertEqual(len(carried), 1)
+        self.assertEqual(carried[0]["data"], {"ServiceAccessToken": 3})
+        report = pf.run_checks(FakeDb(base_tables(ServiceAccessToken=3)),
+                               properties=clean_props(), accepted=["carry-credentials"])
+        self.assertEqual(report["verdict"], "go")
+
     def test_live_credentials_are_a_blocker_cleared_by_sign_off(self):
         report = pf.run_checks(FakeDb(base_tables(ServiceClient=2,
                                                   oscarKeys=1)),
