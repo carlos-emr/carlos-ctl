@@ -1056,6 +1056,22 @@ class TestEffectiveEntry(unittest.TestCase):
     ENTRY = {"class": "copy", "cols": ["id", "name", "extra"],
              "fk_remap": {"name": "Parent"}}
 
+    def test_o19_before_configurable_lifetimes_keeps_non_expiring_issuance(self):
+        entry = {"class": "copy", "cols": ["id", "lifetime"]}
+        adjusted, notes = o19etl.effective_entry("ServiceClient", entry, {"id": col()})
+        self.assertEqual(adjusted["cols"], ["id", "lifetime"])
+        self.assertEqual(adjusted["value_exprs"]["lifetime"], "-1")
+        self.assertTrue(any("non-expiring" in note for note in notes))
+        self.assertNotIn("value_exprs", entry)
+
+    def test_o19_configured_lifetime_is_never_replaced_by_a_default(self):
+        entry = {"class": "copy", "cols": ["id", "lifetime"]}
+        adjusted, notes = o19etl.effective_entry("ServiceClient", entry,
+                                               {"id": col(), "LIFETIME": col()})
+        self.assertIs(adjusted, entry)
+        self.assertNotIn("value_exprs", adjusted)
+        self.assertEqual(notes, [])
+
     def test_columns_absent_from_the_dump_are_skipped_with_a_note(self):
         adjusted, notes = o19etl.effective_entry(
             "t", self.ENTRY, {"id": col(), "NAME": col()}, {"t", "Parent"})

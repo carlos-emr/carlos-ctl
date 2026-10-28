@@ -2433,6 +2433,14 @@ def effective_entry(table: str, entry: dict,
     WITH a report line — the target column then takes its default. An
     fk_remap whose PARENT table is absent from the dump is dropped with a
     note (no id map can exist for it) rather than left to fail."""
+    # Early O19 issued access tokens with lifetime -1 before ServiceClient
+    # acquired its configurable lifetime column. Restore THAT behavior only for
+    # an absent column; a present NULL/zero/positive value must not be rewritten.
+    legacy_lifetime = (table == "ServiceClient" and "lifetime" in entry.get("cols", [])
+                       and "lifetime" not in {c.lower() for c in src_cols})
+    if legacy_lifetime:
+        entry = dict(entry)
+        entry["value_exprs"] = dict(entry.get("value_exprs", {}), lifetime="-1")
     have = {c.lower() for c in src_cols}
     renames = entry.get("renames", {})
     ve = entry.get("value_exprs", {})
@@ -2444,6 +2452,9 @@ def effective_entry(table: str, entry: dict,
             skipped.append(c)
     notes = ["{0}.{1} absent from this dump — target default used"
              .format(table, c) for c in skipped]
+    if legacy_lifetime:
+        notes.append("ServiceClient.lifetime absent from this O19 schema — "
+                     "preserving early O19 non-expiring issuance (-1)")
     # a remap only makes sense for a column the copy actually reads from
     # the dump (a skipped or synthesized column has no source id to map)
     remap = {}
@@ -3526,8 +3537,8 @@ def report_etl_findings(run: 'EtlRun') -> None:
     token_tables = [t for t in getattr(o19map_schema, "CREDENTIAL_TABLES",
                                        ()) if t in src_info]
     if token_tables:
-        report("API credentials copied verbatim (sign-off carry-credentials "
-               "recorded when rows were present) — ROTATE/VERIFY before "
+        report("API credentials and access tokens preserved (sign-off carry-credentials "
+               "recorded when rows were present) — verify integrations before "
                "go-live (tokens issued by the OSCAR 19 install keep "
                "working): " + ", ".join(token_tables))
 

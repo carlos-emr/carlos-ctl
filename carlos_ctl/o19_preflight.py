@@ -71,7 +71,7 @@ import subprocess
 import sys
 
 # === BEGIN GENERATED DATA (generate_manifests.py) ===
-SCHEMA_MAP_VERSION = 'o19map-3+6ea61c42'
+SCHEMA_MAP_VERSION = 'o19map-5+9e7bc615'
 O19_PROFILE = 'on'
 SUPPORTED_PROVINCES = ['on', 'bc']
 REQUIRED_TABLES = [
@@ -249,7 +249,7 @@ KNOWN_TABLES = {
     'SecurityArchive': 'copy',
     'SecurityToken': 'archive',
     'SentToPHRTracking': 'archive',
-    'ServiceAccessToken': 'archive',
+    'ServiceAccessToken': 'copy',
     'ServiceClient': 'copy',
     'ServiceRequestToken': 'archive',
     'SystemMessage': 'copy',
@@ -918,7 +918,7 @@ LEGACY_PREVENTION_TYPES = [
     'fIPV',
 ]
 PROFILE_BC = {
-    'SCHEMA_MAP_VERSION': 'o19map-3+a3deefa1',
+    'SCHEMA_MAP_VERSION': 'o19map-5+ccf44f43',
     'O19_PROFILE': 'bc',
     'PATIENT_DATA_TABLES': [
         'DrugDispensing',
@@ -1076,7 +1076,7 @@ PROFILE_BC = {
         'SecurityArchive': 'copy',
         'SecurityToken': 'archive',
         'SentToPHRTracking': 'archive',
-        'ServiceAccessToken': 'archive',
+        'ServiceAccessToken': 'copy',
         'ServiceClient': 'copy',
         'ServiceRequestToken': 'archive',
         'SystemMessage': 'copy',
@@ -1736,7 +1736,7 @@ ACCEPT_IDS = ("archived-forms", "unknown-as-archive", "olis-gone",
               "dropped-columns", "carry-credentials", "charset-repair")
 #: copy-class tables whose rows are live credentials (OAuth consumer
 #: secrets, signing keys); mirrors o19map_schema.CREDENTIAL_TABLES
-CREDENTIAL_TABLES = ("ServiceClient", "oscarKeys", "publicKeys")
+CREDENTIAL_TABLES = ("ServiceClient", "ServiceAccessToken", "oscarKeys", "publicKeys")
 
 # exit code for "the check itself failed" — distinct from every verdict
 EXIT_TOOL_ERROR = 3
@@ -2593,10 +2593,75 @@ def check_carried_credentials(c):
             "B9-credentials-carried", BLOCKER,
             "{0} credential table(s) carry live secrets ({1} row(s))".format(
                 len(carried), sum(carried.values())),
-            "OAuth consumer secrets and signing keys are copied verbatim and "
+            "OAuth client credentials, access tokens and signing keys are copied verbatim and "
             "keep working against the migrated system. Acknowledge with "
-            "--accept carry-credentials and rotate/verify them before "
+            "--accept carry-credentials and verify integrations before "
             "go-live.", accept="carry-credentials", data=carried))
+
+
+def check_oauth_grants(c):
+    """Refuse ambiguous or orphaned grants; report malformed credentials.
+
+    Queries and reports contain counts only, never keys, token IDs or secrets.
+    The comparison uses the target collation so a source's case variants cannot
+    become an ambiguous grant after import.
+    """
+    for table, key, secret in (("ServiceClient", "clientKey", "clientSecret"),
+                               ("ServiceAccessToken", "tokenId", "tokenSecret")):
+        if table not in c.tables:
+            continue
+        live = c.tables[table].replace("`", "``")
+        expr = "CONVERT(`{0}` USING utf8mb4) COLLATE utf8mb4_general_ci".format(key)
+        duplicates = c.count_live(table,
+            "{0} IN (SELECT duplicate_id FROM (SELECT {0} AS duplicate_id "
+            "FROM `{1}` GROUP BY duplicate_id HAVING COUNT(*) > 1) oauth_duplicates)"
+            .format(expr, live))
+        if duplicates:
+            c.findings.append(finding(
+                "oauth-ambiguous-" + table, BLOCKER,
+                "{0}: {1} rows have ambiguous OAuth identifiers".format(table, duplicates),
+                "Resolve duplicate identifiers in the source before import. No credential "
+                "values are shown and no accept flag bypasses this check.",
+                data={"table": table, "rows": duplicates}))
+        invalid = c.count_live(table,
+            "`{0}` IS NULL OR `{0}` = '' OR `{1}` IS NULL OR `{1}` = ''".format(key, secret))
+        if invalid:
+            c.findings.append(finding(
+                "oauth-malformed-" + table, ADVISORY,
+                "{0}: {1} rows have missing OAuth credential material".format(table, invalid),
+                "These rows are preserved but cannot authorize access. Verify the affected "
+                "integration in the source; do not invent replacement credentials.",
+                data={"table": table, "rows": invalid}))
+    if "ServiceAccessToken" in c.tables:
+        invalid = c.count_live("ServiceAccessToken",
+            "`issued` IS NULL OR `lifetime` IS NULL OR `issued` <= 0 OR `lifetime` < -1")
+        if invalid:
+            c.findings.append(finding(
+                "oauth-invalid-token-metadata", ADVISORY,
+                "{0} OAuth access tokens have invalid issuance metadata".format(invalid),
+                "They remain unusable; import does not renew or normalize their lifetime.",
+                data={"rows": invalid}))
+    if "ServiceAccessToken" in c.tables:
+        live = c.tables["ServiceAccessToken"].replace("`", "``")
+        for parent, field, parent_field in (("ServiceClient", "clientId", "id"),
+                                             ("provider", "providerNo", "provider_no")):
+            if parent not in c.tables:
+                missing = c.count_live("ServiceAccessToken")
+            else:
+                parent_live = c.tables[parent].replace("`", "``")
+                missing = c.count_live("ServiceAccessToken",
+                    "`{0}` IS NULL OR NOT EXISTS (SELECT 1 FROM `{1}` oauth_parent "
+                    "WHERE oauth_parent.`{2}` = `{3}`.`{0}`)"
+                    .format(field, parent_live, parent_field, live))
+            if missing:
+                c.findings.append(finding(
+                    "oauth-orphan-" + parent, BLOCKER,
+                    "{0} OAuth grants refer to a missing {1}".format(missing, parent),
+                    "Resolve orphaned grants in the source before import. A target seed "
+                    "or newly created row could reuse a missing owner's identifier and "
+                    "activate the grant for a different identity. No accept flag bypasses "
+                    "this check and no credential values are shown.",
+                    data={"rows": missing}))
 
 
 def check_locked_notes(c):
@@ -3704,6 +3769,7 @@ def run_checks(query, properties=None, province="on", accepted=(),
     # complete as this account's privileges make it
     check_account_reach(c)
     check_carried_credentials(c)
+    check_oauth_grants(c)
     locked_notes = check_locked_notes(c)
     check_unknown_tables(c)
     check_patient_data_in_absent_tables(c)
