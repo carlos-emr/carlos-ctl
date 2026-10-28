@@ -8,9 +8,13 @@ carlos-ctl (1.1.2~dev1) resolute; urgency=medium
     only became visible to those paths' o19 guard once its ledger was
     published, leaving a window in which a configure or boot repair could
     restart MariaDB, rewrite grants or run Flyway under the copy. Every
-    mode except an assessment takes it (a real run, --resume, --cleanup,
-    --dry-run); an import started while a provisioning run holds it is
-    refused with nothing written.
+    mode takes it (a real run, --resume, --cleanup, --dry-run); an
+    import started while a provisioning run holds it is refused with
+    nothing written.
+  * o19-preflight takes the same lock for its staging restore, which runs
+    in the clinic's MariaDB like a real run's (--write-standalone takes
+    none). The lock file is opened without following a symlink and must
+    be a regular file; anything else is refused with nothing written.
   * The dev snapshot version: release builds stamp the tag's version.
 
  -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Wed, 07 Oct 2026 12:00:00 +0000
