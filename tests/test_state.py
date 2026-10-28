@@ -183,6 +183,17 @@ class TestDestroyDataDestroysTheWholeO19Estate(unittest.TestCase):
         self.assertIn("DROP DATABASE IF EXISTS `o19_archive`", batch)
         self.assertIn("DROP DATABASE IF EXISTS `o19_import`", batch)
 
+    def test_every_application_account_is_dropped_with_the_data(self):
+        # the Query by Example reporting account (carlos#3372) included:
+        # an account left behind on a decommissioned host is a credential
+        # still authorised against whatever schema is restored there later
+        code, out, err = self._destroy({})
+        self.assertEqual(code, 0)
+        batch = "\n".join(self.dropped)
+        for account in ("carlos", "drugref", "backup", "carlos_report"):
+            for host in ("localhost", "127.0.0.1"):
+                self.assertIn(f"DROP USER IF EXISTS '{account}'@'{host}';", batch)
+
     def test_a_schema_holding_tables_is_announced_before_it_is_dropped(self):
         # data is never destroyed silently: the table count reaches the
         # operator, and it reaches them before the DROP runs
