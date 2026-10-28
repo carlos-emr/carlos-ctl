@@ -46,13 +46,15 @@ MIGRATIONS = Path(carlos_path("database", "mysql", "migration", "common"))
 
 COLLATED = re.compile(
     r"CONVERT\(([ds]\.`\w+`) USING utf8mb4\) COLLATE utf8mb4_bin")
-BINARY_UTF8 = re.compile(r"BINARY CONVERT\(([ds]\.`\w+`) USING utf8mb4\)")
+BINARY_CONVERTED = re.compile(
+    r"BINARY CONVERT\(([ds]\.`\w+`) USING utf8mb4\)")
 
 
 def translate(sql):
-    sql = COLLATED.sub(r"\1", sql)
-    sql = BINARY_UTF8.sub(r"CAST(\1 AS BLOB)", sql)
-    return sql.replace(" <=> ", " IS ")
+    # SQLite's BLOB comparison keeps the incoming check's byte-exact semantics,
+    # including trailing spaces; utf8mb4 is already SQLite's string encoding.
+    sql = BINARY_CONVERTED.sub(r"CAST(\1 AS BLOB)", sql)
+    return COLLATED.sub(r"\1", sql).replace(" <=> ", " IS ")
 
 
 def rename_pairs(sql):
