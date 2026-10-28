@@ -2,7 +2,7 @@
  "format": 1,
  "kind": "o19map-schema",
  "generator": "scripts/migration/o19/generate_manifests.py",
- "SCHEMA_MAP_VERSION": "o19map-3+6ea61c42",
+ "SCHEMA_MAP_VERSION": "o19map-4+da891c7a",
  "O19_PROFILE": "on",
  "O19_SOURCE_COMMIT": "a7900d569d3faf741993e5e1da8c14021bbefede",
  "TABLES": {
@@ -94,8 +94,13 @@
     "last_entered_by",
     "consent_date",
     "optout_date",
-    "edit_date"
+    "edit_date",
+    "deleted"
    ],
+   "value_exprs": {
+    "optout": "IFNULL(s.`optout`, 1)",
+    "deleted": "IFNULL((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
+   },
    "fk_remap": {
     "consent_type_id": "consentType"
    }
@@ -12665,7 +12670,8 @@
    "consent_date",
    "optout_date",
    "edit_date",
-   "deleted"
+   "deleted",
+   "live_demographic_no"
   ],
   "Contact": [
    "id",
@@ -22955,8 +22961,8 @@
   "scheduleholiday": 28,
   "scheduletemplate": 1,
   "scheduletemplatecode": 23,
-  "secObjPrivilege": 514,
-  "secObjectName": 133,
+  "secObjPrivilege": 548,
+  "secObjectName": 140,
   "secRole": 33,
   "secUserRole": 2,
   "security": 1,
@@ -24627,16 +24633,11 @@
   ],
   "program": [
    "alcohol",
-   "allowBatchAdmission",
-   "allowBatchDischarge",
    "firstNation",
-   "hic",
-   "holdingTank",
    "housing",
    "mentalHealth",
    "physicalHealth",
-   "transgender",
-   "userDefined"
+   "transgender"
   ],
   "program_access": [
    "all_roles"
@@ -24740,7 +24741,7 @@
  },
  "PROFILES": {
   "bc": {
-   "SCHEMA_MAP_VERSION": "o19map-3+a3deefa1",
+   "SCHEMA_MAP_VERSION": "o19map-4+57fc4305",
    "O19_PROFILE": "bc",
    "TABLES": {
     "AppDefinition": {
@@ -24831,8 +24832,13 @@
       "last_entered_by",
       "consent_date",
       "optout_date",
-      "edit_date"
+      "edit_date",
+      "deleted"
      ],
+     "value_exprs": {
+      "optout": "IFNULL(s.`optout`, 1)",
+      "deleted": "IFNULL((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
+     },
      "fk_remap": {
       "consent_type_id": "consentType"
      }
@@ -42696,7 +42702,8 @@
      "consent_date",
      "optout_date",
      "edit_date",
-     "deleted"
+     "deleted",
+     "live_demographic_no"
     ],
     "Contact": [
      "id",
@@ -57341,8 +57348,8 @@
     "scheduleholiday": 28,
     "scheduletemplate": 1,
     "scheduletemplatecode": 23,
-    "secObjPrivilege": 516,
-    "secObjectName": 134,
+    "secObjPrivilege": 550,
+    "secObjectName": 141,
     "secRole": 33,
     "secUserRole": 2,
     "security": 1,
@@ -58846,16 +58853,11 @@
     ],
     "program": [
      "alcohol",
-     "allowBatchAdmission",
-     "allowBatchDischarge",
      "firstNation",
-     "hic",
-     "holdingTank",
      "housing",
      "mentalHealth",
      "physicalHealth",
-     "transgender",
-     "userDefined"
+     "transgender"
     ],
     "program_access": [
      "all_roles"

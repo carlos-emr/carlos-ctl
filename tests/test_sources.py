@@ -122,11 +122,18 @@ class TestCompleteBackupSet(unittest.TestCase):
     def test_system_sql_mode_assignments_cannot_change_dump_quoting(self):
         for target in (b"sql_mode", b"@@sql_mode", b"@@SESSION.sql_mode", b"SESSION sql_mode",
                        b"@@`sql_mode`", b"@@SESSION.`sql_mode`"):
-            for mode in (b"NO_BACKSLASH_ESCAPES", b"ANSI_QUOTES"):
-                with self.subTest(target=target, mode=mode):
-                    source = b"SET " + target + b"='" + mode + b"'; SELECT 'ordinary text';"
-                    with self.assertRaisesRegex(ValueError, "dump changes SQL quoting modes"):
-                        b"".join(o19sources.restore_chunks(io.BytesIO(source)))
+            for mode in (b"NO_BACKSLASH_ESCAPES", b"ANSI_QUOTES", b"ANSI", b"DB2", b"MAXDB",
+                         b"MSSQL", b"ORACLE", b"POSTGRESQL", b"ansi", b"oracle"):
+                for quote in (b"'", b""):
+                    with self.subTest(target=target, mode=mode, quote=quote):
+                        source = b"SET " + target + b"=" + quote + mode + quote + b"; SELECT 'ordinary text';"
+                        with self.assertRaisesRegex(ValueError, "dump changes SQL quoting modes"):
+                            b"".join(o19sources.restore_chunks(io.BytesIO(source)))
+        # MariaDB decodes the otherwise unrecognized \S escape as S, so
+        # the guard must inspect the decoded literal rather than its bytes.
+        source = b"SET sql_mode='AN\\SI'; SELECT 'ordinary text';"
+        with self.assertRaisesRegex(ValueError, "dump changes SQL quoting modes"):
+            b"".join(o19sources.restore_chunks(io.BytesIO(source)))
         # Saving a value in a user variable does not change session quoting.
         for target in (b"@sql_mode", b"@session.sql_mode", b"@clinic.session.sql_mode", b"@`sql_mode`"):
             with self.subTest(user_variable=target):
@@ -139,6 +146,50 @@ class TestCompleteBackupSet(unittest.TestCase):
         restored = b"".join(o19sources.restore_chunks(io.BytesIO(source)))
         self.assertIn(b"SQL_NOTES=0 */;\nSET SESSION UNIQUE_CHECKS=1, SQL_NOTES=1, note_verbosity='all';", restored)
         self.assertIn(b"INSERT INTO a VALUES ('SQL_NOTES=0');", restored)
+
+    def test_every_set_reasserts_zero_key_protection_without_editing_dump_values(self):
+        statements = (b"SET SQL_MODE='';\n",
+                      b"INSERT INTO a VALUES (0,'SQL_MODE=empty');\n",
+                      b"SET SQL_MODE='STRICT_TRANS_TABLES';\n")
+        restored = b"".join(o19sources.restore_chunks(io.BytesIO(b"".join(statements))))
+        control = (b"SET SESSION sql_mode=CONCAT_WS(',', NULLIF(@@SESSION.sql_mode,''), "
+                   b"'NO_AUTO_VALUE_ON_ZERO');\n")
+        self.assertEqual(restored.count(control), 2)
+        for statement in statements:
+            self.assertIn(statement, restored)
+        self.assertLess(restored.index(control), restored.index(statements[1]))
+        self.assertTrue(restored.rstrip().endswith(control.rstrip()))
+
+    def test_standard_dump_mode_capture_and_footer_remain_supported(self):
+        for capture in (b"@@SQL_MODE", b"@@SESSION.sql_mode", b"@@SESSION.`sql_mode`"):
+            with self.subTest(capture=capture):
+                source = (b"/*!40101 SET @OLD_SQL_MODE=" + capture
+                          + b", SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;\n"
+                          b"/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;\n-- Dump completed\n")
+                restored = b"".join(o19sources.restore_chunks(io.BytesIO(source)))
+                self.assertIn(source.split(b"\n")[0], restored)
+                self.assertIn(b"SET SQL_MODE=@OLD_SQL_MODE", restored)
+                path = self.root / "mode-footer.sql"
+                path.write_bytes(source)
+                self.assertEqual(o19sources.inventory(str(path)), {})
+
+    def test_dynamic_mode_values_and_unchecked_saved_modes_are_refused(self):
+        sources = [b"SET SQL_MODE=" + expression + b";" for expression in (
+            b"CONCAT('AN','SI')", b"CONCAT('', 'ORACLE')", b"@saved", b"@OLD_SQL_MODE",
+            b"4", b"0x4", b"DEFAULT", b"@@GLOBAL.sql_mode")]
+        sources.extend(b"SET @OLD_SQL_MODE=@@SQL_MODE; SET @" + name + operator + expression
+                       + b"; SET SQL_MODE=@OLD_SQL_MODE;"
+                       for name in (b"OLD_SQL_MODE", b"'old_sql_mode'", b'"Old_Sql_Mode"', b"`OLD_SQL_MODE`")
+                       for operator in (b"=", b":=")
+                       for expression in (b"'ANSI'", b"CONCAT('AN','SI')", b"@@GLOBAL.SQL_MODE"))
+        for source in sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(ValueError, "SQL_MODE"):
+                    b"".join(o19sources.restore_chunks(io.BytesIO(source)))
+                path = self.root / "dynamic-mode.sql"
+                path.write_bytes(source + b"\n-- Dump completed\n")
+                with self.assertRaisesRegex(ValueError, "SQL_MODE"):
+                    o19sources.inventory(str(path))
 
     def test_quoting_mode_assignments_after_large_set_prefix_are_refused(self):
         for padding in (33000, (1 << 20) - 20):
@@ -368,16 +419,3 @@ class TestCompleteBackupSet(unittest.TestCase):
         self.assertTrue(Path(new["properties"]).parent.exists())
         self.assertTrue(real_sources.exists())
         self.assertEqual(ledger.read_bytes(), before)
-
-    def test_every_set_reasserts_zero_key_protection_without_editing_dump_values(self):
-        statements = (b"SET SQL_MODE='';\n",
-                      b"INSERT INTO a VALUES (0,'SQL_MODE=empty');\n",
-                      b"SET SQL_MODE='STRICT_TRANS_TABLES';\n")
-        restored = b"".join(o19sources.restore_chunks(io.BytesIO(b"".join(statements))))
-        control = (b"SET SESSION sql_mode=CONCAT_WS(',', NULLIF(@@SESSION.sql_mode,''), "
-                   b"'NO_AUTO_VALUE_ON_ZERO');\n")
-        self.assertEqual(restored.count(control), 2)
-        for statement in statements:
-            self.assertIn(statement, restored)
-        self.assertLess(restored.index(control), restored.index(statements[1]))
-        self.assertTrue(restored.rstrip().endswith(control.rstrip()))
