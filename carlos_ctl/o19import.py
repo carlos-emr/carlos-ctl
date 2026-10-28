@@ -41,6 +41,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -3812,17 +3813,31 @@ def take_db_ownership_lock(path: Optional[str], state_dir: str) -> None:
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # no O_TRUNC and nothing written: flock(1) in the postinsts opens
-        # this with `>`, and the file's contents mean nothing to anyone
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+        # this with `>`, and the file's contents mean nothing to anyone.
+        # O_NOFOLLOW / O_NONBLOCK: a symlink planted at this path is not
+        # followed (nothing is created or locked at its target), and a FIFO
+        # cannot hang the open; the regular-file check below refuses both.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+                     | os.O_NONBLOCK, 0o644)
     except OSError as exc:
         die("could not open {0} ({1}); the import cannot exclude a "
             "concurrent configure or boot repair, so it will not start. "
             "Nothing has been written.".format(path, exc))
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            die("{0} is not a regular file, so it cannot be the lock the "
+                "provisioning runs share; the import will not start. Nothing "
+                "has been written.".format(path))
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except BlockingIOError:
         os.close(fd)
         die(db_ownership_refusal(path, workspace_lock_busy(state_dir)))
+    except OSError as exc:
+        os.close(fd)
+        die("could not lock {0} ({1}); the import cannot exclude a "
+            "concurrent configure or boot repair, so it will not start. "
+            "Nothing has been written.".format(path, exc))
     _DB_OWNERSHIP_LOCK["fd"] = fd
 
 
@@ -4196,7 +4211,8 @@ def cmd_o19_preflight(argv) -> int:
     Exit 0/1/2 are this verb's VERDICT (go, go with acknowledgements,
     no-go), so any other failure -- bad flags, an unreachable server, a
     refused dump -- is remapped to the tool-error code rather than being
-    read as a migration verdict."""
+    read as a migration verdict. The database-ownership lock the staging
+    restore takes is released here, however the assessment ends."""
     try:
         return _guarded(lambda: _cmd_o19_preflight(argv),
                         o19_preflight.EXIT_TOOL_ERROR)
@@ -4204,6 +4220,8 @@ def cmd_o19_preflight(argv) -> int:
         if exc.code in (0, None):
             raise
         raise SystemExit(o19_preflight.EXIT_TOOL_ERROR) from exc
+    finally:
+        release_db_ownership_lock()
 
 
 def cmd_import_o19(argv) -> int:
@@ -4235,6 +4253,12 @@ def _cmd_o19_preflight(argv) -> int:
         return 0
     if os.geteuid() != 0 and not args.mariadb_arg:
         die("this command needs root (or --mariadb-arg for a dev database)")
+    # The staging restore below runs in the clinic's MariaDB for as long as
+    # a real run's does, so a configure or boot repair must not restart the
+    # server or rewrite grants under it either. Taken before _make_ctx reads
+    # the workspace, as the import does; the standalone export above writes
+    # a file only and needs none (carlos#3678).
+    take_db_ownership_lock(HOST.db_ownership_lock_path(), HOST.state_dir)
     # an assessment: capacity gates, stage, report — never a recorded
     # verdict or a persisted sign-off; the exit code IS the verdict
     # (_make_ctx refuses a mid-import workspace before touching it)
