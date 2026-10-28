@@ -36,6 +36,7 @@ report, spot checks, UI smoke — before clinical use.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -43,13 +44,14 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import (Callable, Dict, Iterator, List, Optional,
                     Sequence, Set, Tuple)
 
 from . import (o19_preflight, o19bundle, o19digest, o19docs,
                o19etl, o19host, o19manifest, o19map_props, o19map_schema,
-               o19report)
+               o19report, o19sql, o19sources, schema_contract)
 from .util import (die, genpw, genrandom, log, run, warn)
 
 #: The deployment this import runs on. Every substrate question -- where
@@ -342,9 +344,10 @@ def make_query(mariadb_args: Optional[List[str]],
 
     def query(sql, db=None):
         argv = list(base) + list(CLIENT_COMMON_ARGS)
+        initial = "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci; SET SESSION time_zone='+00:00'"
         if statement_timeout:
-            argv.append("--init-command="
-                        + statement_timeout_prelude(statement_timeout))
+            initial += "; " + statement_timeout_prelude(statement_timeout)
+        argv.append("--init-command=" + initial)
         if db:
             argv.append(db)
         # statements go through STDIN, never argv: /proc/<pid>/cmdline is
@@ -473,9 +476,10 @@ def make_row_stream(mariadb_args: Optional[List[str]],
 
     def stream(sql, db=None):
         argv = list(base) + list(CLIENT_COMMON_ARGS) + ["--quick"]
+        initial = "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci; SET SESSION time_zone='+00:00'"
         if statement_timeout:
-            argv.append("--init-command="
-                        + statement_timeout_prelude(statement_timeout))
+            initial += "; " + statement_timeout_prelude(statement_timeout)
+        argv.append("--init-command=" + initial)
         if db:
             argv.append(db)
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
@@ -1083,6 +1087,12 @@ def run_p0(ctx) -> None:
         if rc != 0:
             die("flyway validate failed — the carlos schema does not match "
                 "the deployed application (run carlos-ctl db-migrate first)")
+    if ctx.get("schema_contract"):
+        actual = schema_contract.capture(query, ctx["target_db"])
+        drift = schema_contract.differences(ctx["schema_contract"]["schema"], actual)
+        if drift:
+            report_append(ctx["state_dir"], "Physical schema mismatch", "\n".join(drift))
+            die("the target's columns, collations, indexes or constraints differ from the packaged CARLOS schema; run the supported schema upgrade and resolve the definitions listed in report.txt before importing")
 
     recorded = set(ctx["state"].get("phases", {})) - {"stage"}
     if not (ctx.get("resume") and (recorded or etl_started(ctx["state_dir"])))\
@@ -1193,95 +1203,15 @@ def run_p0(ctx) -> None:
 # P1 — stage
 # --------------------------------------------------------------------------
 
-#: `COLLATE=x` in a CREATE TABLE, `COLLATE x` in a column definition.
-COLLATION_RE = re.compile(rb"COLLATE[= ]([A-Za-z0-9_]+)")
-
-#: Lines whose content is the clinic's DATA, not its schema. They are
-#: skipped: a progress note, an eform template or one of OSCAR's saved
-#: SQL report templates can contain the word COLLATE, and a name read
-#: out of a text column would refuse a perfectly good dump — mid-cutover,
-#: with no flag to clear it. mysqldump writes DDL and data as separate
-#: statements, one statement per line for INSERTs, so the line is the
-#: boundary.
-DATA_LINE_RE = re.compile(rb"\s*(?:INSERT|REPLACE)\b", re.I)
-
-#: Everything on a DDL line that is TEXT rather than syntax: quoted
-#: string literals, block comments (`/*! ... */` among them, which
-#: mysqldump writes into every dump) and line comments.
-#:
-#: Skipping data LINES is not enough on its own. MEASURED against this
-#: scanner: `-- note: COLLATE=x`, `# note: COLLATE=x`,
-#: `/*!40101 ... COLLATE=x */` and
-#: `CREATE TABLE t (...) COMMENT='use COLLATE=x' COLLATE=utf8mb4_real`
-#: all yielded `x` as though the clinic's schema declared it. The real
-#: OSCAR 19 fixture happens to carry none of those (521 COLLATE
-#: occurrences, every one genuine DDL), so this is a refusal waiting for
-#: a dump with a table comment rather than one seen in the wild -- but
-#: the refusal it would cause lands mid-cutover with no flag to clear
-#: it, which is the same reason data lines are skipped at all.
-#:
-#: A quoted collation name (`COLLATE 'utf8mb4_bin'`) is legal SQL and is
-#: scrubbed here, but COLLATION_RE never matched it anyway: the quote is
-#: not in its character class. So nothing that used to be found is lost.
-#: Per LINE, like the rest of this scanner -- a block comment split
-#: across lines is not tracked.
-SQL_NOISE_RE = re.compile(
-    rb"'(?:[^'\\]|\\.|'')*'"          # single-quoted literal
-    rb"|\"(?:[^\"\\]|\\.|\"\")*\""      # double-quoted literal
-    rb"|/\*!\d*(?P<executable>.*?)\*/"   # executable comment: body KEPT
-    rb"|/\*.*?\*/"                      # ordinary block comment
-    rb"|--[ \t][^\n]*|--$"              # MySQL line comment needs a space
-    rb"|#[^\n]*",                       # ...`#` does not
-    re.S)
-
-
-def sql_noise_blank(match) -> bytes:
-    """A space for noise -- but an executable comment's own SQL back.
-
-    `/*!... */` is not a comment to the server: it EXECUTES the text
-    inside, and mysqldump puts a real declaration there. MEASURED with
-    mysqldump 10.11 `--databases`:
-
-        CREATE DATABASE /*!32312 IF NOT EXISTS*/ `x`
-          /*!40100 DEFAULT CHARACTER SET latin1 COLLATE latin1_general_ci */;
-
-    -- the schema's default collation, and on a clinic whose default the
-    target server does not carry, the one name the gate exists to refuse
-    on. Blanking it made the gate pass and the restore fail mid-stream.
-    The body is re-scrubbed so a literal or ordinary comment nested
-    inside it is still noise."""
-    body = match.group("executable")
-    if body is None:
-        return b" "
-    return b" " + SQL_NOISE_RE.sub(sql_noise_blank, body) + b" "
-
-
-#: enough to hold a collation name split across a chunk boundary
-COLLATION_CARRY = 64
-
-#: an unfinished non-data line is held whole up to this much before it is
-#: scanned and trimmed. mysqldump writes DDL a few hundred bytes to a
-#: line, so this exists to bound memory on a pathological input (a dump
-#: with no newlines at all), not because it is ever reached.
-MAX_UNFINISHED_LINE = 1 << 20
+# OSCAR 19's MySQL utf8 is three-byte UTF-8. Pin the restore session rather
+# than letting a MariaDB distribution's old_mode silently reinterpret it.
+RESTORE_OLD_MODE = "UTF8_IS_UTF8MB3"
+ETL_CONTRACT_VERSION = o19etl.ETL_CONTRACT_VERSION
 
 
 def ddl_collations(data: bytes) -> Set[str]:
-    """The collation names `data` declares, ignoring its data lines.
-
-    `data` is treated as whole lines; a trailing partial line is read
-    like any other, which is safe here because both callers either hold
-    the whole head or have already split the stream on newlines."""
-    names = set()
-    for line in data.split(b"\n"):
-        if DATA_LINE_RE.match(line):
-            continue
-        # a SPACE, not an empty string: scrubbing must not weld two
-        # tokens into a third that matches
-        scanned = SQL_NOISE_RE.sub(sql_noise_blank, line)
-        for m in COLLATION_RE.finditer(scanned):
-            names.add(m.group(1).decode("ascii", "replace"))
-    return names
+    """Syntactic COLLATE names, ignoring clinical literals and comments."""
+    return o19sql.Collations().feed(data, final=True)
 
 
 def head_collations(head: bytes) -> List[str]:
@@ -1294,60 +1224,22 @@ def head_collations(head: bytes) -> List[str]:
     `COLLATE=` only where the collation is not the charset default, so
     on an ordinary all-latin1_swedish_ci clinic this finds nothing at
     all -- and a 580-table dump puts most of its DDL far past 64 KiB."""
-    return sorted(ddl_collations(head[:65536]))
+    # An arbitrary prefix may end inside a valid collation name. Leave that
+    # token unfinished; the streaming scanner will inspect its complete name.
+    return sorted(o19sql.Collations().feed(head[:65536], final=len(head) < 65536))
 
 
 class CollationScanner:
-    """The head check, carried through the whole stream.
-
-    Measured: a dump declaring an unavailable collation at 1.95 MB gets
-    past the head scan, and the restore then dies mid-stream with the
-    client's own `ERROR 1273 ... Unknown collation` — after however much
-    of a multi-hour restore had already run, and with the diagnosis in
-    the client's output rather than in a CARLOS refusal. The stream is
-    already being read chunk by chunk for the redirect scan, so testing
-    each name here costs one regex per megabyte.
-
-    It IS line-anchored, like the redirect scan: only complete lines are
-    tested, INSERT/REPLACE lines are skipped as the clinic's own text
-    (see DATA_LINE_RE), and an unfinished line is carried whole so a
-    name split across a chunk boundary is neither missed nor reported
-    cut in half."""
+    """Check SQL collation clauses across arbitrary quote/comment boundaries."""
 
     def __init__(self, available):
-        self.available = set(available or ())
-        #: the unfinished last line of the stream so far
-        self.carry = b""
-        #: True while the rest of the current line is a data line
-        self.skipping = False
+        self.available = {name.lower() for name in (available or ())}
+        self.syntax = o19sql.Collations()
 
-    def feed(self, chunk: bytes) -> Optional[str]:
+    def feed(self, chunk: bytes, final: bool = False) -> Optional[str]:
         if not self.available:
             return None
-        buf = self.carry + chunk
-        self.carry = b""
-        names = set()
-        pos = 0
-        while pos < len(buf):
-            nl = buf.find(b"\n", pos)
-            if nl < 0:
-                break
-            if not self.skipping:
-                names |= ddl_collations(buf[pos:nl])
-            self.skipping = False
-            pos = nl + 1
-        tail = buf[pos:]
-        if self.skipping:
-            pass                       # the rest of a data line: drop it
-        elif DATA_LINE_RE.match(tail):
-            # decided even though the line is unfinished: an extended
-            # INSERT runs to megabytes and must not be buffered
-            self.skipping = True
-        elif len(tail) > MAX_UNFINISHED_LINE:
-            names |= ddl_collations(tail[:-COLLATION_CARRY])
-            self.carry = tail[-COLLATION_CARRY:]
-        else:
-            self.carry = tail
+        names = self.syntax.feed(chunk, final=final)
         missing = sorted(names - self.available)
         if not missing:
             return None
@@ -1358,26 +1250,27 @@ class CollationScanner:
                 "here, then --restage.".format(", ".join(missing)))
 
 
-def dump_redirect_marker(data: bytes) -> Optional[str]:
-    """The refusal message when a dump fragment carries a statement that
-    would steer the restore out of the staging schema (or a MySQL GTID
-    directive), else None. `data` must start at a line boundary."""
-    hit = DUMP_REDIRECT_RE.search(data)
-    if hit:
-        return ("the dump carries a {0} statement — it was taken with "
-                "--databases/--all-databases and would redirect the "
-                "restore at the live schema. Re-take it as "
-                "`mysqldump <o19-db> > o19.sql` (no --databases)"
-                .format(hit.group(1).decode("ascii", "replace").upper()))
-    if DUMP_GTID_MARKER in data:
+def redirect_message(marker):
+    if marker == "GTID_PURGED":
         return ("the dump carries SET @@GLOBAL.GTID_PURGED (a MySQL 5.6+ "
                 "GTID directive MariaDB rejects) — re-take it with "
                 "mysqldump --set-gtid-purged=OFF")
+    if marker:
+        return ("the dump carries a {0} statement — it was taken with "
+                "--databases/--all-databases and would redirect the "
+                "restore at the live schema. Re-take it as "
+                "`mysqldump <o19-db> > o19.sql` (no --databases)".format(marker))
     return None
 
 
+def dump_redirect_marker(data: bytes) -> Optional[str]:
+    """Inspect SQL syntax without treating a clinical literal as a command."""
+    return redirect_message(o19sql.Redirects().feed(data, final=True))
+
+
 _CLIENT_IDENTITY_PREFIXES = ("--user", "-u", "--password", "-p",
-                             "--defaults-extra-file", "--defaults-file")
+                             "--defaults-extra-file", "--defaults-file",
+                             "--no-defaults")
 # options that take their value as the NEXT argv element (`--user root`);
 # a bare -p / --password prompts instead, so only a following non-option
 # token (which the client would read as a database name) is dropped
@@ -1416,11 +1309,13 @@ def strip_client_identity(args: List[str]) -> List[str]:
 def staging_init_command(statement_timeout: int = 0) -> str:
     """The session the restore runs under: no binlog (a throwaway
     schema), no constraint checks (a dump arrives in dump order), and
-    permissive SQL so 2006-era statements load. `--statement-timeout`
+    permissive SQL so 2006-era statements load. Preserve explicit zero
+    AUTO_INCREMENT keys even when a dump omits mysqldump's mode header.
+    `--statement-timeout`
     bounds the dump's own statements too -- one crafted INSERT could
     otherwise hold the restore forever."""
     init = ("SET SESSION sql_log_bin=0, FOREIGN_KEY_CHECKS=0, "
-            "UNIQUE_CHECKS=0, sql_mode=''")
+            "UNIQUE_CHECKS=1, sql_mode='NO_AUTO_VALUE_ON_ZERO', old_mode='" + RESTORE_OLD_MODE + "'")
     if statement_timeout:
         init += ", max_statement_time={0}".format(int(statement_timeout))
     return init
@@ -1521,67 +1416,51 @@ def revoke_staging_account(query, client_cnf: str) -> None:
         HOST.clear_stage_credential(client_cnf)
 
 
-# an incomplete line longer than this is carried as "mid-line" instead:
-# its start was scanned in an earlier buffer, and an unbounded carry
-# would hold a single-line dump entirely in memory
-DUMP_CARRY_MAX = 1 << 16
-
-
 class RedirectScanner:
-    """Scans a dump chunk by chunk for a redirecting statement, tracking
-    line starts across chunk boundaries.
-
-    dump_redirect_marker anchors on `^`, so it must only ever see a
-    buffer that begins a line. A fixed-size carry gets this wrong in both
-    directions: it misses a marker split across the boundary (`CREATE`
-    plus whitespace ending one chunk), and it matches `^` in the middle
-    of a clinical note that happens to start the carry."""
-
+    """Quote/comment-aware redirect checks across arbitrary read boundaries."""
     def __init__(self):
-        self.carry = b""       # the trailing incomplete line, a line start
-        self.mid_line = False  # the next buffer opens inside a line
+        self.syntax = o19sql.Redirects()
 
-    def feed(self, chunk: bytes) -> Optional[str]:
-        buf = self.carry + chunk
-        scan = buf
-        if self.mid_line:
-            nl = buf.find(b"\n")
-            scan = buf[nl + 1:] if nl >= 0 else b""
-        marker = dump_redirect_marker(scan)
-        nl = buf.rfind(b"\n")
-        partial = buf[nl + 1:] if nl >= 0 else buf
-        if nl < 0 or len(partial) > DUMP_CARRY_MAX:
-            # one line longer than the carry bound: its start was scanned
-            # already, so the next buffer opens mid-line
-            self.carry, self.mid_line = b"", True
-        else:
-            self.carry, self.mid_line = partial, False
-        return marker
+    def feed(self, chunk: bytes, final: bool = False) -> Optional[str]:
+        return redirect_message(self.syntax.feed(chunk, final=final))
 
 
 def _stream_dump(opener: List[str], restore_argv: List[str],
                  available_collations=(),
-                 restore_env: Optional[Dict[str, str]] = None):
+                 restore_env: Optional[Dict[str, str]] = None,
+                 diagnostics_path: Optional[str] = None):
     """Pipe the dump through the restore client, scanning every chunk for
     redirecting statements and for a collation this server lacks.
     Returns (source_rc, client_rc, tail_bytes, refusal_or_None); the
     caller drops the staging schema and dies on a refusal, which is the
     same handling either scan needs."""
-    src = subprocess.Popen(opener, stdout=subprocess.PIPE)  # nosec B603
-    sink = subprocess.Popen(restore_argv,                    # nosec B603
-                            stdin=subprocess.PIPE,
-                            env=(dict(os.environ, **restore_env)
-                                 if restore_env else None))
+    diagnostics = (open_private_binary(diagnostics_path) if diagnostics_path
+                   else tempfile.TemporaryFile())
+    src = None
+    try:
+        src = subprocess.Popen(opener, stdout=subprocess.PIPE)  # nosec B603
+        sink = subprocess.Popen(restore_argv + ["--show-warnings"],  # nosec B603
+                                stdin=subprocess.PIPE, stdout=diagnostics,
+                                stderr=subprocess.STDOUT,
+                                env=(dict(os.environ, **restore_env)
+                                     if restore_env else None))
+    except BaseException:
+        diagnostics.close()
+        if src is not None:
+            src.stdout.close()
+            if src.poll() is None:
+                src.terminate()
+            src.wait()
+        raise
     tail = b""
     scanner = RedirectScanner()
     collations = CollationScanner(available_collations)
     broken = False
     redirect = None
+    failure = None
     try:
-        while True:
-            chunk = src.stdout.read(1 << 20)
-            if not chunk:
-                break
+        for chunk in o19sources.restore_chunks(src.stdout,
+                os.path.dirname(diagnostics_path) if diagnostics_path else None):
             # the whole stream is scanned, not only its head: a USE /
             # CREATE DATABASE anywhere would steer the rest of the dump
             # (the account's grants and --one-database are the backstops)
@@ -1597,6 +1476,12 @@ def _stream_dump(opener: List[str], restore_argv: List[str],
                 broken = True
                 break
             tail = (tail + chunk)[-8192:]
+        if not broken:
+            redirect = scanner.feed(b"", final=True) or collations.feed(b"", final=True)
+            broken = bool(redirect)
+    except (ValueError, OSError, EOFError) as exc:
+        broken = True
+        failure = str(exc)
     finally:
         src.stdout.close()
         try:
@@ -1607,9 +1492,52 @@ def _stream_dump(opener: List[str], restore_argv: List[str],
         src.terminate()
     src.wait()
     rc = sink.wait()
+    diagnostics.flush()
+    diagnostics.seek(0)
+    warnings = set()
+    errors = set()
+    for line in diagnostics:
+        text = line.decode("utf-8", "replace")
+        warnings.update(sql_warning_codes(text))
+        errors.update(re.findall(r"^ERROR\s+(\d+)\b", text))
+    diagnostics.close()
+    if not redirect and (warnings or errors):
+        codes = ", ".join(sorted(warnings | errors))
+        redirect = "staging restore reported SQL diagnostic code(s) {0}; refusing a potentially lossy restore".format(codes)
+        if diagnostics_path:
+            redirect += "; inspect the private diagnostics in " + diagnostics_path
+    if failure and not redirect:
+        redirect = "cannot read the complete staging SQL stream: " + failure
     if broken and rc == 0:
         rc = 1
     return src.returncode, rc, tail, redirect
+
+
+def open_private_binary(path):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, "w+b")
+
+
+def sql_warning_codes(output):
+    """Reject warnings and lossy conversion notes without echoing row values."""
+    lossy = {"1048", "1263", "1264", "1265", "1292", "1300", "1364", "1366", "1406", "1411", "1690"}
+    found = set()
+    for match in re.finditer(r"^(Warning|Note)(?:\s+\(Code\s+(\d+)\):|\t(\d+)\t)", output, re.MULTILINE):
+        code = match.group(2) or match.group(3)
+        # MariaDB 11.8 deprecates SQL_NOTES, but it still suppresses lossy
+        # Note diagnostics independently of note_verbosity. Source dumps and
+        # our restore controls must set it; this exact compatibility notice
+        # says nothing about converted row values. Other 1287 warnings remain
+        # subject to the normal refusal rule.
+        line_end = output.find("\n", match.end())
+        message = output[match.end():line_end if line_end >= 0 else len(output)].strip()
+        if code == "1287" and message == ("'@@sql_notes' is deprecated and will be removed in a future release. "
+                                         "Please use '@@note_verbosity' instead"):
+            continue
+        if match.group(1) == "Warning" or code in lossy:
+            found.add(code)
+    return found
 
 
 def run_p1(ctx) -> None:
@@ -1662,7 +1590,7 @@ def run_p1(ctx) -> None:
     head_cp.stdout.close()
     head_cp.terminate()
     head_cp.wait()
-    available = {row[0] for row in query("SHOW COLLATION")}
+    available = o19sql.available_collations(query("SHOW COLLATION"), RESTORE_OLD_MODE)
     missing = [c for c in head_collations(head) if c not in available]
     if missing:
         die("the dump uses collation(s) unavailable on this server: {0}"
@@ -1698,7 +1626,8 @@ def run_p1(ctx) -> None:
 
     try:
         src_rc, rc, tail, redirect = _stream_dump(opener, restore_argv,
-                                                  available, stage_env)
+                                                  available, stage_env,
+                                                  os.path.join(ctx["state_dir"], "staging-diagnostics.txt"))
     finally:
         # the account and its credential file never outlive the restore,
         # whatever the failure mode
@@ -1719,7 +1648,8 @@ def run_p1(ctx) -> None:
         # A clinic view is the likeliest cause of ERROR 1227 here, and
         # the only fix is to leave the views out of the dump — which
         # costs nothing, the import migrating base tables only.
-        die("restore into {0} failed — see the client error above. The "
+        die("restore into {0} failed — inspect the private staging-diagnostics.txt "
+            "in the import workspace. The "
             "restore runs as an account limited to that schema: a dump "
             "carrying DEFINER clauses, GRANTs or server-wide SET "
             "statements must be re-taken without them (mysqldump "
@@ -2058,16 +1988,20 @@ def make_etl_query(base_argv: List[str],
     INSERT ... SELECT encounters duplicate unique keys with both unique
     and foreign-key checks disabled. Keep unique checks on so the client
     reports the collision before the driver checkpoints the copy.
+
+    Keep literal zero AUTO_INCREMENT keys intact as well: zero is an
+    existing source identity, not a request to allocate a fresh one.
+    This mode leaves the copy non-strict and keeps backslash SQL quoting.
     """
     prelude = ("SET SESSION sql_log_bin=0, FOREIGN_KEY_CHECKS=0, "
-               "UNIQUE_CHECKS=1, sql_mode=''")
+               "UNIQUE_CHECKS=1, sql_mode='NO_AUTO_VALUE_ON_ZERO', collation_connection='utf8mb4_general_ci', time_zone='+00:00'")
     if statement_timeout:
         prelude += ", " + statement_timeout_prelude(
             statement_timeout).replace("SET SESSION ", "")
 
     def query(sql, db=None):
         argv = list(base_argv) + ["--init-command=" + prelude] \
-            + list(CLIENT_COMMON_ARGS)
+            + list(CLIENT_COMMON_ARGS) + ["--show-warnings"]
         if db:
             argv.append(db)
         cp = run_sql_client(argv, sql)
@@ -2083,6 +2017,14 @@ def make_etl_query(base_argv: List[str],
                     redact_statement(sql, 120),
                     CREDENTIAL_SQL_RE.sub(r"\1'<redacted>'",
                                           error.strip())), error)
+        warning_codes = sql_warning_codes(cp.stdout)
+        if warning_codes:
+            codes = sorted(warning_codes)
+            # Diagnostics can echo clinical values. Report codes only; the
+            # caller leaves the table/window unconfirmed and retryable.
+            message = "ETL produced SQL warning(s) {0} ({1} ...); refusing to record completion".format(
+                ", ".join(codes), redact_statement(sql, 120))
+            raise o19etl.QueryError(message, message)
         return batch_rows(cp.stdout)
 
     return query
@@ -2642,6 +2584,12 @@ def run_p7(ctx) -> None:
     src, dst = STAGING_SCHEMA, ctx["target_db"]
     problems: List[str] = []
     lines: List[str] = []
+    if ctx.get("schema_contract"):
+        actual = schema_contract.capture(query, dst)
+        drift = schema_contract.differences(ctx["schema_contract"]["schema"], actual)
+        problems.extend(drift)
+        problems.extend(schema_contract.foreign_key_violations(query, dst, actual))
+        lines.append("physical schema and all declared foreign keys checked against the packaged CARLOS contract")
 
     ok, bad = _row_parity(ctx)
     # three counts, never one: NOT CHECKED lines and acknowledged
@@ -2811,6 +2759,22 @@ def run_p7(ctx) -> None:
                         "patient(s) in staging, every join table absent) "
                         "— verification cannot vouch for this import"
                         .format(total))
+    if not problems and ctx.get("schema_contract"):
+        tables = [row[0] for row in ctx["schema_contract"]["schema"]["tables"]]
+        for offset in range(0, len(tables), 32):
+            names = ", ".join("{0}.{1}".format(o19etl.ident(dst), o19etl.ident(table))
+                              for table in tables[offset:offset + 32])
+            try:
+                result = query("ANALYZE TABLE " + names)
+            except RuntimeError as exc:
+                problems.append("optimizer statistics could not be refreshed: " + o19etl._query_reason(exc))
+                break
+            errors = [row[0] for row in result if len(row) >= 4 and row[2].lower() == "error"]
+            if errors:
+                problems.append("optimizer statistics failed for: " + ", ".join(errors))
+        if not problems:
+            lines.append("optimizer statistics refreshed for {0} application tables".format(len(tables)))
+
     # record the patients a mismatch was seen for so the next attempt
     # re-checks them instead of drawing past them
     mismatched = sorted({ln.split()[1].rstrip(":") for ln in details
@@ -3027,7 +2991,7 @@ def run_cleanup(ctx) -> None:
     for host in STAGING_ACCOUNT_HOSTS:
         ctx["query"]("DROP USER IF EXISTS '{0}'@'{1}'".format(
             STAGING_USER, host))
-    for name in ("bundle", "bundle-assess"):
+    for name in ("bundle", "bundle-assess", "bundle-sources", "bundle-assess-sources"):
         bundle_dir = os.path.join(ctx["state_dir"], name)
         if os.path.isdir(bundle_dir):
             shutil.rmtree(bundle_dir)
@@ -3133,6 +3097,7 @@ RUN_FILES = ("report.txt", "import-report.txt", "import-report.json",
              CONTENT_DETAILS, VERIFY_PROBLEMS, "preflight.txt",
              "preflight.json", "etl-progress.json",
              "content-transfer.json", "o19-digests.json",
+             "source-set.json", "staging-diagnostics.txt",
              "o19-derived-carlos.properties",
              "o19-derived-carlos.properties.dry-run",
              # the CSV rendering of this run's archive schema: clinic
@@ -3145,6 +3110,15 @@ RUN_FILES = ("report.txt", "import-report.txt", "import-report.json",
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+
+class _InputPart(argparse.Action):
+    """Keep the single-path API and collect every repeated input explicitly."""
+    def __call__(self, parser, namespace, value, option_string=None):
+        parts = list(getattr(namespace, self.dest + "_parts", None) or [])
+        parts.append(value)
+        setattr(namespace, self.dest + "_parts", parts)
+        setattr(namespace, self.dest, parts[0])
+
 
 def _parser(prog: str, import_mode: bool) -> argparse.ArgumentParser:
     """The argument parser for either verb.
@@ -3186,8 +3160,8 @@ def _parser(prog: str, import_mode: bool) -> argparse.ArgumentParser:
                     metavar="OPT",
                     help="passthrough openssl option for legacy bundles "
                          "(repeatable), e.g. -md then md5")
-    ap.add_argument("--dump", metavar="FILE",
-                    help="mysqldump of the O19 database (.sql or .sql.gz)")
+    ap.add_argument("--dump", metavar="FILE", action=_InputPart,
+                    help="O19 EMR SQL dump (.sql or .sql.gz); repeat for complementary main/MyISAM parts")
     ap.add_argument("--properties", metavar="FILE",
                     help="the clinic's deployed oscar.properties")
     ap.add_argument("--o19-digests", metavar="FILE",
@@ -3239,7 +3213,7 @@ def _parser(prog: str, import_mode: bool) -> argparse.ArgumentParser:
                          "rehearsed on one development server without one "
                          "destroying the other's target")
     if import_mode:
-        ap.add_argument("--documents", metavar="FILE",
+        ap.add_argument("--documents", metavar="FILE", action=_InputPart,
                         help="tar of the OscarDocument tree")
         ap.add_argument("--skip-documents", action="store_true",
                         help="import without documents (requires "
@@ -3450,7 +3424,7 @@ def _resolve_inputs(args, state_dir: str, accepted=None,
         # the run's own copy is taken by _make_ctx, AFTER the ledger
         # binding has vetted it: a candidate that is about to be refused
         # must not first overwrite what the run measured
-        return opened
+        return _prepare_input_sets(opened, state_dir, workdir_name)
     if args.bundle_pass or args.bundle_openssl_opt or args.bundle_sha256:
         die("--bundle-pass/--bundle-openssl-opt/--bundle-sha256 need "
             "--bundle")
@@ -3462,13 +3436,66 @@ def _resolve_inputs(args, state_dir: str, accepted=None,
         die("--documents missing (or pass --skip-documents with "
             "--accept no-documents)")
     supplied_digests = getattr(args, "o19_digests", None)
-    for p in (args.dump, args.properties, docs, supplied_digests):
+    dumps = getattr(args, "dump_parts", None) or [args.dump]
+    documents = getattr(args, "documents_parts", None) or ([docs] if docs else [])
+    for p in dumps + documents + [args.properties, supplied_digests]:
         if p and not os.path.isfile(p):
             die("no such file: {0}".format(p))
-    return {"dump": args.dump, "documents": docs,
+    return _prepare_input_sets({"dump": args.dump, "dumps": dumps,
+            "documents": docs, "document_parts": documents,
             "properties": args.properties,
             "digests": supplied_digests,
-            "bundle_sha256": None}
+            "bundle_sha256": None}, state_dir, workdir_name)
+
+
+def _prepare_input_sets(inputs: Dict, state_dir: str, workdir_name: str) -> Dict:
+    """Normalize complete backup sets before the target or ledger changes."""
+    dumps = inputs.get("dumps") or [inputs["dump"]]
+    documents = inputs.get("document_parts") or ([inputs["documents"]] if inputs.get("documents") else [])
+    try:
+        identities = [[os.path.basename(path), sha256_file(path)] for path in dumps + documents]
+        properties_sha = sha256_file(inputs["properties"])
+        key = hashlib.sha256(json.dumps([identities, properties_sha], sort_keys=True).encode()).hexdigest()
+        workdir = os.path.join(state_dir, workdir_name + "-sources", key)
+        sql = o19sources.prepare_dump_set(dumps, workdir)
+        docs = o19sources.prepare_documents(documents, workdir)
+        observed = [[part["name"], part["sha256"]] for part in sql["parts"] + docs["parts"]]
+        if observed != identities:
+            raise ValueError("an input changed while its private snapshot was prepared; obtain one stable backup set")
+        properties_path = os.path.join(workdir, "source.properties")
+        if o19sources.snapshot_file(inputs["properties"], properties_path) != properties_sha:
+            raise ValueError("properties changed while their snapshot was prepared")
+    except (ValueError, OSError, EOFError) as exc:
+        die("cannot prepare the complete backup set: {0}".format(exc))
+    inputs.update(dump=sql["dump"], documents=docs["documents"],
+                  properties=properties_path, properties_sha256=properties_sha,
+                  source_parts=sql["parts"], document_sources=docs["parts"],
+                  duplicate_tables=sql["duplicates"], source_snapshot_dir=workdir)
+    inputs["sources_sha256"] = hashlib.sha256(json.dumps({
+        "format": o19sources.FORMAT, "sql": sql["parts"], "documents": docs["parts"],
+        "properties": properties_sha}, sort_keys=True).encode()).hexdigest()
+    return inputs
+
+
+def retire_input_snapshots(inputs: Dict, state_dir: str, workdir_name: str) -> None:
+    """Remove obsolete source sets only after their replacement is accepted.
+
+    Real imports call this after the durable ledger write. Assessments have a
+    separate namespace and call it only after all context checks succeed.
+    """
+    root = os.path.join(state_dir, workdir_name + "-sources")
+    current = inputs.get("source_snapshot_dir")
+    if not current or os.path.dirname(current) != root or not os.path.isdir(current):
+        return
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if path == current or not re.fullmatch(r"[0-9a-f]{64}", name) or os.path.islink(path):
+            continue
+        if os.path.isdir(path):
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                warn("cannot retire obsolete input snapshot {0}: {1}".format(path, exc))
 
 
 def bundle_acknowledgements(cli_accept, merged, recorded_digest: Optional[str],
@@ -3871,6 +3898,8 @@ def _make_ctx(args, import_mode: bool,
             die(refusal)
     elif state.get("cleanup") == "in-progress":
         die("a previous --cleanup was interrupted — run --cleanup again")
+    if real_run and etl_started(state_dir) and state.get("inputs", {}).get("etl_contract") != ETL_CONTRACT_VERSION:
+        die("this partial import was written by an older ETL contract. Finish it with the original carlos-ctl package or restore the pre-import snapshot; conversion and comparison rules cannot change mid-import")
 
     from . import o19roles
     try:
@@ -3882,12 +3911,27 @@ def _make_ctx(args, import_mode: bool,
         die("--fixups-dir is a development seam and needs --dev-target")
     accepted = merged_acknowledgements(args.accept, state,
                                        continues_recorded_run(args))
+    workdir_name = "bundle" if real_run else "bundle-assess"
     inputs = _resolve_inputs(
         args, state_dir, accepted,
         recorded_digest=state.get("inputs", {}).get("bundle_sha256"),
         # an assessment extracts into its own workdir: the real run's
         # members (what --resume continues from) are never replaced
-        workdir_name="bundle" if real_run else "bundle-assess")
+        workdir_name=workdir_name)
+    recorded_sources = state.get("inputs", {}).get("sources_sha256")
+    if real_run and recorded_sources and recorded_sources != inputs.get("sources_sha256"):
+        if not getattr(args, "restage", False) or etl_started(state_dir):
+            die("the complete backup set or properties differ from this run's recorded inputs. Resume with the original inputs; before ETL starts, --restage may select another complete set. After ETL starts, restore the pre-import snapshot")
+    contract = None
+    if import_mode and not dev_target and HOST.is_packaged_host():
+        try:
+            contract = HOST.schema_contract(province)
+        except (ValueError, OSError) as exc:
+            die("cannot load this application's physical schema contract ({0}); install matching carlos-emr and carlos-ctl packages".format(exc))
+    contract_sha = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest() if contract else None
+    previous_contract = state.get("inputs", {}).get("target_contract_sha256")
+    if real_run and previous_contract and previous_contract != contract_sha:
+        die("the application's target schema contract changed during this import; restore the original packages to finish, or restore the pre-import snapshot")
     # An assessment records nothing and persists no sign-off, so it also
     # takes no copy and binds nothing: it reads the operator's file as
     # given, and cannot overwrite a real run's snapshot.
@@ -3951,6 +3995,12 @@ def _make_ctx(args, import_mode: bool,
             # different document is refused above rather than quietly
             # comparing against numbers the earlier phases never saw
             "digests_sha256": digests_sha,
+            "etl_contract": ETL_CONTRACT_VERSION,
+            "sources_sha256": inputs.get("sources_sha256"),
+            "source_parts": inputs.get("source_parts"),
+            "document_sources": inputs.get("document_sources"),
+            "properties_sha256": inputs.get("properties_sha256"),
+            "target_contract_sha256": contract_sha,
             # the schema this import writes: a later invocation that
             # resolves a different one is refused above rather than
             # copying into one database and verifying another
@@ -3959,7 +4009,16 @@ def _make_ctx(args, import_mode: bool,
         })
         recorded.setdefault("schema_map_version",
                             o19map_schema.SCHEMA_MAP_VERSION)
+        durable_json(os.path.join(state_dir, "source-set.json"), {
+            "format": o19sources.FORMAT, "etl_contract": ETL_CONTRACT_VERSION,
+            "sources_sha256": inputs.get("sources_sha256"),
+            "sql": inputs.get("source_parts"), "documents": inputs.get("document_sources"),
+            "properties_sha256": inputs.get("properties_sha256"),
+            "duplicate_tables": inputs.get("duplicate_tables", []),
+            "target_contract_sha256": contract_sha,
+        })
         save_state(state_dir, state)
+    retire_input_snapshots(inputs, state_dir, workdir_name)
 
     return {
         "state_dir": state_dir,
@@ -3979,6 +4038,9 @@ def _make_ctx(args, import_mode: bool,
         "documents": inputs["documents"],
         "properties": inputs["properties"],
         "o19_digests": inputs.get("digests"),
+        "source_parts": inputs.get("source_parts", []),
+        "schema_contract": contract,
+        "duplicate_tables": inputs.get("duplicate_tables", []),
         "dump_size": os.path.getsize(inputs["dump"]) if inputs["dump"] else 0,
         "documents_size": (os.path.getsize(inputs["documents"])
                            if inputs.get("documents") else 0),

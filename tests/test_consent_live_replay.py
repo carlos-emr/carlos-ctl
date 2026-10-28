@@ -46,10 +46,13 @@ MIGRATIONS = Path(carlos_path("database", "mysql", "migration", "common"))
 
 COLLATED = re.compile(
     r"CONVERT\(([ds]\.`\w+`) USING utf8mb4\) COLLATE utf8mb4_bin")
+BINARY_UTF8 = re.compile(r"BINARY CONVERT\(([ds]\.`\w+`) USING utf8mb4\)")
 
 
 def translate(sql):
-    return COLLATED.sub(r"\1", sql).replace(" <=> ", " IS ")
+    sql = COLLATED.sub(r"\1", sql)
+    sql = BINARY_UTF8.sub(r"CAST(\1 AS BLOB)", sql)
+    return sql.replace(" <=> ", " IS ")
 
 
 def rename_pairs(sql):

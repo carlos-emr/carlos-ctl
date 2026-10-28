@@ -1,3 +1,22 @@
+carlos-ctl (1.2.1~dev1) resolute; urgency=medium
+
+  * Fix OSCAR 19 collation aliases and note-lock classification. Compare
+    converted text exactly, including trailing spaces, and use target
+    comparison rules for source keys and merge mappings.
+  * Support complete SQL backup sets and native nested OSCAR archives,
+    verify overlaps, and restore ordered full/incremental document sets.
+    Bind private input snapshots and the ETL contract to resume state.
+  * Guard acknowledged charset repairs before speculative conversions,
+    preserving correct accents and supplementary Unicode without warnings.
+  * Refuse conversion warnings and value mismatches before checkpoints.
+    Verify the packaged physical schema, all declared foreign keys and
+    optimizer statistics before completing an import.
+  * Retire source-set provenance and diagnostics with the completed run,
+    and remove its immutable raw input copies during verified cleanup.
+  * Explain an active import immediately in deployment checks.
+
+ -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Mon, 26 Oct 2026 03:30:00 +0000
+
 carlos-ctl (1.2.0~dev1) resolute; urgency=medium
 
   * db-users creates carlos_report, the read-only account carlos-emr's

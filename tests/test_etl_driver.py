@@ -212,6 +212,11 @@ class FakeDb(object):
     # -- the plain client: reads, plus the archive schema CREATE
     def plain(self, sql, db=None):
         self.log.append(sql)
+        if "information_schema.STATISTICS" in sql and "INDEX_NAME = 'PRIMARY'" in sql:
+            # These workflow fixtures use their first column as identity.
+            # Real SQL comparisons/checkpoint failures are exercised by the
+            # isolated MariaDB suite, not this statement-recording fake.
+            return [[table, columns[0]] for table, columns in self.columns[DST].items() if columns]
         if sql.startswith(self.IS_COLUMNS):
             return self._information_schema(sql)
         if sql.startswith(self.IS_TABLES):
@@ -251,6 +256,8 @@ class FakeDb(object):
         for needle, value in self.scalars.items():
             if needle in sql:
                 return [[str(value)]]
+        if " LEFT JOIN " in sql and " WHERE (d." in sql and "IS NULL OR NOT" in sql:
+            return [["0"]]
         if "IFNULL(MIN(" in sql:
             m = re.search(r"FROM `[^`]+`\.`([^`]+)`", sql)
             lo, hi = self.bounds.get(m.group(1) if m else "", (0, 0))
