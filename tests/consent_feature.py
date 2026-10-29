@@ -33,25 +33,28 @@ def _expressions(value, label):
 def _overlay(root):
     path = root / "scripts/migration/o19/overrides_schema.py"
     module = ast.parse(_read(path), filename=str(path))
-    assignments = []
-    for node in ast.walk(module):
-        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                base = target
-                while isinstance(base, (ast.Subscript, ast.Attribute)):
-                    base = base.value
-                if isinstance(base, ast.Name) and base.id == "VALUE_EXPRS":
-                    if not isinstance(target, ast.Name) or not isinstance(node, ast.Assign):
-                        raise ConsentFeatureError("overlay: dynamic VALUE_EXPRS assignment")
-                    assignments.append(node)
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "VALUE_EXPRS"):
-            raise ConsentFeatureError("overlay: dynamic VALUE_EXPRS mutation")
-    if (len(assignments) != 1 or assignments[0] not in module.body
-            or not isinstance(assignments[0].value, ast.Dict)):
+    assignments = [node for node in module.body
+                   if isinstance(node, ast.Assign) and len(node.targets) == 1
+                   and isinstance(node.targets[0], ast.Name)
+                   and node.targets[0].id == "VALUE_EXPRS"]
+    if len(assignments) != 1 or not isinstance(assignments[0].value, ast.Dict):
         raise ConsentFeatureError("overlay: one static VALUE_EXPRS dictionary is required")
+    declaration = assignments[0].targets[0]
+    # A static declaration proves absence only while its dictionary cannot be
+    # passed, aliased, rebound or mutated elsewhere. Reject every other access
+    # rather than execute the overlay or attempt Python alias/dataflow analysis.
+    for node in ast.walk(module):
+        if isinstance(node, ast.Name) and node.id == "VALUE_EXPRS" and node is not declaration:
+            raise ConsentFeatureError("overlay: nonstatic VALUE_EXPRS reference")
+        if ((isinstance(node, ast.alias)
+             and (node.asname or node.name.split(".")[0]) == "VALUE_EXPRS")
+                or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                      ast.ExceptHandler)) and node.name == "VALUE_EXPRS")
+                or (isinstance(node, ast.arg) and node.arg == "VALUE_EXPRS")
+                or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == "VALUE_EXPRS")
+                or (isinstance(node, ast.MatchMapping) and node.rest == "VALUE_EXPRS")
+                or (isinstance(node, (ast.Global, ast.Nonlocal)) and "VALUE_EXPRS" in node.names)):
+            raise ConsentFeatureError("overlay: nonstatic VALUE_EXPRS binding")
     names = set()
     consent = None
     found = False

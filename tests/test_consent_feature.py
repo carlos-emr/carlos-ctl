@@ -146,6 +146,63 @@ class TestConsentFeature(unittest.TestCase):
                 with self.assertRaises(ConsentFeatureError):
                     classify(self.root)
 
+    def test_overlay_aliases_cannot_hide_partial_feature_mutations(self):
+        for source in (
+                "VALUE_EXPRS = {}\nexpressions = VALUE_EXPRS\nexpressions['Consent'] = {}",
+                "VALUE_EXPRS = {}\nfirst = VALUE_EXPRS\nsecond = first\nsecond.update({'Consent': {}})",
+                "expressions = VALUE_EXPRS = {}\nexpressions['Consent'] = {}",
+                "VALUE_EXPRS = expressions = {}\nexpressions.update({'Consent': {}})",
+                "VALUE_EXPRS = {}\nexpressions, = (VALUE_EXPRS,)\nexpressions['Consent'] = {}",
+                "VALUE_EXPRS = {}\ncontainer = {'expressions': VALUE_EXPRS}\n"
+                "container['expressions']['Consent'] = {}"):
+            with self.subTest(source=source):
+                self.fixture()
+                self.overlay.write_text(source, encoding="utf-8")
+                with self.assertRaises(ConsentFeatureError):
+                    classify(self.root)
+
+    def test_overlay_dictionary_cannot_escape_to_dynamic_code(self):
+        for source in (
+                "VALUE_EXPRS = {}\nmutate(VALUE_EXPRS)",
+                "VALUE_EXPRS = {}\nmutate(expressions=VALUE_EXPRS)",
+                "VALUE_EXPRS = {}\ngetattr(VALUE_EXPRS, 'update')({'Consent': {}})",
+                "VALUE_EXPRS = {}\ndef get_expressions():\n    return VALUE_EXPRS",
+                "VALUE_EXPRS = {}\ndef mutate(expressions=VALUE_EXPRS):\n"
+                "    expressions['Consent'] = {}"):
+            with self.subTest(source=source):
+                self.fixture()
+                self.overlay.write_text(source, encoding="utf-8")
+                with self.assertRaises(ConsentFeatureError):
+                    classify(self.root)
+
+    def test_overlay_other_bindings_cannot_replace_static_dictionary(self):
+        for source in (
+                "VALUE_EXPRS = {}\nfrom hidden import expressions as VALUE_EXPRS",
+                "VALUE_EXPRS = {}\nimport hidden as VALUE_EXPRS",
+                "VALUE_EXPRS = {}\ndef VALUE_EXPRS():\n    pass",
+                "VALUE_EXPRS = {}\nclass VALUE_EXPRS:\n    pass",
+                "VALUE_EXPRS = {}\ntry:\n    pass\nexcept Exception as VALUE_EXPRS:\n    pass",
+                "VALUE_EXPRS = {}\nfor VALUE_EXPRS in hidden:\n    pass",
+                "VALUE_EXPRS = {}\nwith hidden as VALUE_EXPRS:\n    pass",
+                "VALUE_EXPRS = {}\ndel VALUE_EXPRS"):
+            with self.subTest(source=source):
+                self.fixture()
+                self.overlay.write_text(source, encoding="utf-8")
+                with self.assertRaises(ConsentFeatureError):
+                    classify(self.root)
+
+    def test_overlay_match_bindings_cannot_hide_partial_feature(self):
+        for pattern, value in (("VALUE_EXPRS", "{'Consent': {}}"),
+                               ("{**VALUE_EXPRS}", "{'Consent': {}}"),
+                               ("[*VALUE_EXPRS]", "[{'Consent': {}}]")):
+            with self.subTest(pattern=pattern):
+                self.fixture()
+                self.overlay.write_text(
+                    "VALUE_EXPRS = {}\nmatch " + value + ":\n"
+                    "    case " + pattern + ":\n        pass\n", encoding="utf-8")
+                with self.assertRaises(ConsentFeatureError):
+                    classify(self.root)
+
     def test_malformed_overlay_and_json_fail_even_when_other_markers_absent(self):
         for target, text in (("overlay", "VALUE_EXPRS = {"), ("overlay", "# no dictionary"),
                              ("manifest", "{"), ("manifest", "[]"), ("manifest", "{}")):
