@@ -289,6 +289,24 @@ pending. Fix the reported error, then run the command again. A failed service
 start also restores the marker. If the marker cannot be written, automatic
 retry is not assured; retry manually after fixing the filesystem.
 .IP
+Two causes left behind by an earlier setup on the host are fixed in place when
+the command is run by hand in a terminal, each only after the operator agrees.
+A MariaDB whose root@localhost was given a password, with no unix\-socket login,
+is put back to the distribution default: socket login only, with no MariaDB root
+password. The old password is typed once, to the
+.B mariadb
+client's own prompt, and is never seen or kept by this command; anything else
+that logged in as root with it needs its own account. Another service on ports
+80 and 443 (a web server from another package, a snap, an administrator's unit)
+is stopped and kept from starting at boot, by the same rules the package
+configure applies (see
+.IR /usr/lib/carlos\-emr/carlos\-emr\-host\-conflicts ).
+At boot, or with no terminal, neither repair is made (the rest of the
+provisioning still runs as above): the cause is reported and the install stays
+pending. A locked root, or one whose password is unknown, needs
+the reset described under "MariaDB root access" in
+.IR /usr/share/doc/carlos\-emr/README.Debian .
+.IP
 Only one run owns the database at a time: an exclusive lock on
 .I /var/lib/carlos-emr/.finish-install.lock
 is held for the life of the run, so a hand\-typed repair, the boot\-time
