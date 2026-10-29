@@ -322,6 +322,17 @@ class TestHelperAccess(unittest.TestCase):
                 self.assertEqual(p._host_conflicts("front-door", "--plan", "0.0.0.0"), [])
             self.assertIn("could not inspect this host", err.getvalue())
 
+    def test_a_helper_that_cannot_be_launched_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = self._helper(tmp, "")
+            err = io.StringIO()
+            with mock.patch.object(p, "HOST_CONFLICTS", helper), \
+                    mock.patch.object(p, "run", side_effect=OSError(8, "Exec format error")), \
+                    contextlib.redirect_stderr(err):
+                self.assertIsNone(p._host_conflicts("front-door", "--plan", "0.0.0.0"))
+                self.assertEqual(p._mariadb_cause(), "")
+            self.assertIn("could not run", err.getvalue())
+
     def test_a_hung_helper_is_bounded(self):
         with tempfile.TemporaryDirectory() as tmp:
             helper = self._helper(tmp, "sleep 30\n")

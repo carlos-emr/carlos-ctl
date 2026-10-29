@@ -160,6 +160,11 @@ def _host_conflicts(*args: str) -> Optional[list]:
         warn(f"{HOST_CONFLICTS} {' '.join(args)} did not finish within "
              f"{HOST_CONFLICTS_TIMEOUT} seconds; nothing was concluded from it")
         return None
+    except OSError as exc:
+        # Present but not runnable (a noexec mount, a broken interpreter): the
+        # repair carries on exactly as it does without the helper.
+        warn(f"could not run {HOST_CONFLICTS}: {exc}")
+        return None
     if cp.returncode == 2:
         warn(f"{HOST_CONFLICTS} could not inspect this host ({' '.join(args)}); "
              "run it as root, or check that ss(8) is installed")
