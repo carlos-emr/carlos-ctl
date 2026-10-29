@@ -21,7 +21,9 @@ test_manifest_integrity.TestTheShippedManifestRanksConsent checks that
 the shipped manifest carries the same expressions.
 
 The overlay and the migration are read from the carlos checkout named
-by CARLOS_SRC (tests/carlos_src.py); without one those cases skip.
+by CARLOS_SRC (tests/carlos_src.py). Feature-specific cases skip only when
+that checkout demonstrably lacks the complete one-live Consent feature;
+partial or malformed feature contracts fail instead of being skipped.
 
 Run (from the repository root):
     CARLOS_SRC=/path/to/carlos python3 -m unittest discover -s tests -t .
@@ -35,7 +37,8 @@ from pathlib import Path
 
 from carlos_ctl import o19etl, o19map_schema
 
-from .carlos_src import carlos_path
+from .carlos_src import CARLOS_SRC, carlos_path
+from .consent_feature import classify
 
 SRC, DST, ARCH = "src", "dst", "arch"
 
@@ -43,6 +46,8 @@ OVERRIDES = Path(carlos_path("scripts", "migration", "o19",
                              "overrides_schema.py"))
 #: where V1.0.57 lives; its number changes at merge, its name does not
 MIGRATIONS = Path(carlos_path("database", "mysql", "migration", "common"))
+CONSENT_FEATURE = classify(CARLOS_SRC)
+FEATURE_ABSENT = "one-live Consent feature absent from this application checkout"
 
 COLLATED = re.compile(
     r"CONVERT\(([ds]\.`\w+`) USING utf8mb4\) COLLATE utf8mb4_bin")
@@ -131,7 +136,7 @@ def row(rid, patient=100, ctype=1, explicit=0, optout=0, edited=EARLY,
             "optout_date": None, "edit_date": edited, "deleted": deleted}
 
 
-@unittest.skipUnless(OVERRIDES.is_file(), "overlay not in this checkout")
+@unittest.skipUnless(CONSENT_FEATURE, FEATURE_ABSENT)
 class ConsentReplayBase(unittest.TestCase):
 
     #: whether the staged dump's Consent has a `deleted` column
@@ -668,14 +673,12 @@ class TestAManifestWithoutTheRule(unittest.TestCase):
             {"class": "copy", "cols": list(SOURCE_COLS),
              "fk_remap": {"consent_type_id": "consentType"}}))
 
+    @unittest.skipUnless(CONSENT_FEATURE, FEATURE_ABSENT)
     def test_an_entry_with_the_expression_does(self):
-        if not OVERRIDES.is_file():
-            self.skipTest("overlay not in this checkout")
         self.assertTrue(o19etl.consent_live_ranked(ranked_entry()))
 
+    @unittest.skipUnless(CONSENT_FEATURE, FEATURE_ABSENT)
     def test_a_ranked_copy_cannot_be_built_without_the_archive(self):
-        if not OVERRIDES.is_file():
-            self.skipTest("overlay not in this checkout")
         with self.assertRaisesRegex(ValueError, "deleted"):
             o19etl.copy_statement("Consent", ranked_entry(), SRC, DST,
                                   DST_COLS)
@@ -699,7 +702,7 @@ class TestAManifestWithoutTheRule(unittest.TestCase):
             "FROM `src`.`Consent` s")
 
 
-@unittest.skipUnless(MIGRATIONS.is_dir(), "migrations not in this checkout")
+@unittest.skipUnless(CONSENT_FEATURE, FEATURE_ABSENT)
 class TestTheImportRanksAsTheMigrationDoes(unittest.TestCase):
 
     """o19etl.CONSENT_LIVE_ORDER and V1.0.57's ORDER BY are one rule
