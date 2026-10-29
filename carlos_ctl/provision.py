@@ -36,6 +36,8 @@ nonzero when any requested step fails.
 """
 
 import os
+import re
+import sys
 import time
 import tempfile
 from pathlib import Path
@@ -92,6 +94,152 @@ LOCK = util.DB_OWNERSHIP_LOCK
 # import is in progress" means. Referenced by path rather than imported
 # because cli imports this module, not the other way round.
 O19_GUARD = os.path.join(util.LIB, "carlos-emr-o19-guard")
+
+
+# carlos-emr's shipped host-conflicts helper (carlos-emr/carlos#5439): names what
+# holds the front-door ports or keeps MariaDB from answering root, and stops a
+# conflicting service when asked. One implementation for the package configure
+# and this repair, so they cannot disagree about what may be stopped. Optional:
+# a carlos-emr that predates it leaves this verb behaving as it always did.
+HOST_CONFLICTS = os.path.join(util.LIB, "carlos-emr-host-conflicts")
+
+# MariaDB's root back to the distribution default: the system root user over
+# the unix socket, and no MariaDB root password ('invalid' matches none). What
+# a fresh install has, and what CARLOS administers the database through.
+_SOCKET_ONLY_ROOT = ("ALTER USER root@localhost IDENTIFIED VIA unix_socket "
+                     "OR mysql_native_password USING 'invalid'")
+
+ROOT_MY_CNF = "/root/.my.cnf"
+
+
+def _interactive() -> bool:
+    """A person at a terminal who can be asked. Never true at boot, and never
+    for a script or a pipe: those get the diagnosis and nothing changes."""
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _confirm(question: str) -> bool:
+    try:
+        answer = input(f"carlos-ctl: {question} [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def _journal(message: str) -> None:
+    """Also record a change to someone else's service or account in the
+    journal (journalctl -t carlos-emr), where the package configure records
+    the same actions."""
+    if util.which("logger"):
+        run(["logger", "-t", "carlos-emr", "-p", "daemon.notice", "--", message],
+            capture_output=True)
+
+
+def _host_conflicts(*args: str) -> Optional[list]:
+    """The helper's output lines, or None when this carlos-emr does not ship it."""
+    if not os.access(HOST_CONFLICTS, os.X_OK):
+        return None
+    cp = run([HOST_CONFLICTS, *args], capture_output=True)
+    return [line for line in (cp.stdout or "").splitlines() if line.strip()]
+
+
+def _mariadb_cause() -> str:
+    """Why root cannot reach MariaDB over the socket, in the helper's words."""
+    for line in _host_conflicts("mariadb") or []:
+        if line.startswith("cause: "):
+            return line[len("cause: "):]
+    return ""
+
+
+def _root_has_password() -> bool:
+    """MariaDB answered, and refused root for want of a password (ERROR 1045):
+    a root password left by an earlier setup, with no socket login. A locked
+    root (4151) is not this case: it cannot log in to be changed at all."""
+    cp = dbops.db_root(["-N", "-B", "-e", "SELECT 1"], capture_output=True)
+    return cp.returncode != 0 and "ERROR 1045" in (cp.stderr or "")
+
+
+def _offer_socket_only_root() -> bool:
+    """Offer, at a terminal only, to put root back to the distribution default.
+
+    A MariaDB set up before CARLOS (a web-stack tutorial, another
+    application's installer) often gave root a password -- frequently the
+    legacy SHA-1 mysql_native_password hash -- and no socket login, so every
+    provisioning step is refused. The fix is to restore socket-only root, not
+    to keep that password: there is then no MariaDB root password to leak or
+    guess. The operator types the old password ONCE, to the mariadb client
+    itself (--password with no value prompts on the terminal), so it never
+    passes through this process, argv, the environment or a file, and is not
+    kept. Returns True when root answers afterwards."""
+    if not _interactive() or not _root_has_password():
+        return False
+    log("MariaDB's root@localhost has a password from an earlier setup and refuses "
+        "the system root user over the unix socket, which is how CARLOS administers "
+        "the database.")
+    log("This can put root back to the distribution default: socket login only, with "
+        "no MariaDB root password. Anything that logs in as root with the old "
+        "password (phpMyAdmin, a backup script) stops working; give it its own "
+        "account with only the privileges it needs.")
+    if not _confirm("Reset MariaDB root to socket login now? MariaDB asks for the "
+                    "old root password once; CARLOS never sees or keeps it."):
+        log("MariaDB root was left as it is.")
+        return False
+    if run(["mariadb", "--protocol=socket", "--user=root", "--password",
+            "-e", _SOCKET_ONLY_ROOT]).returncode != 0:
+        warn("MariaDB did not accept the change (wrong password?); root was left as it is")
+        return False
+    if not dbops.db_root_ok():
+        warn("root still cannot reach MariaDB over the unix socket after the change")
+        return False
+    log("MariaDB root now logs in over the unix socket only (the distribution default)")
+    _journal("MariaDB root@localhost reset to socket-only login (the distribution "
+             "default) by carlos-ctl finish-install, at the operator's confirmation")
+    try:
+        with open(ROOT_MY_CNF, encoding="utf-8", errors="replace") as fh:
+            stores_password = re.search(r"^\s*password\s*=", fh.read(), re.MULTILINE)
+    except OSError:
+        stores_password = None
+    if stores_password:
+        warn(f"{ROOT_MY_CNF} still stores a MariaDB password, which root no longer uses; "
+             "delete that line (a plaintext credential on disk is a liability)")
+    return True
+
+
+def _free_front_door(bind_ip: str, boot: bool) -> None:
+    """Ports 80 and 443 belong to nginx; another system service holding them
+    keeps the front door down. At a terminal, list what the package configure
+    would stop and stop it on confirmation; otherwise (at boot, from a script)
+    only name it -- a repair nobody is watching does not take other services
+    down. Anything the helper never stops (containers, programs started by
+    hand, database servers) is named either way, by the nginx step's failure."""
+    plan = _host_conflicts("front-door", "--plan", bind_ip)
+    if plan is None:
+        return
+    will_stop = [line[len("will-stop: "):] for line in plan if line.startswith("will-stop: ")]
+    if not will_stop:
+        return
+    if boot or not _interactive():
+        for item in will_stop:
+            warn(f"{item} holds a CARLOS front-door port and was not stopped; run "
+                 "'sudo carlos-ctl finish-install' in a terminal to stop it")
+        return
+    log("these services already use ports 80 and 443, so nginx cannot serve the "
+        "CARLOS front door:")
+    for item in will_stop:
+        log(f"  {item}")
+    if not _confirm("Stop them and keep them from starting at boot? Nothing is uninstalled."):
+        warn("left running; nginx cannot serve the CARLOS front door until ports 80 "
+             "and 443 are free")
+        return
+    for line in _host_conflicts("front-door", bind_ip) or []:
+        if line.startswith("stopped: "):
+            log(line[len("stopped: "):])
+            _journal("front door: " + line[len("stopped: "):])
+        elif line.startswith("blocked: "):
+            warn(line[len("blocked: "):])
 
 
 def pending() -> bool:
@@ -415,7 +563,11 @@ def cmd_finish_install(argv) -> int:
             "or '--cleanup'), then re-run 'carlos-ctl finish-install'. The "
             "unfinished install stays recorded until then.")
 
-    if not _wait_for_db(120 if boot else 0):
+    if not _wait_for_db(120 if boot else 0) and (boot or not _offer_socket_only_root()):
+        cause = _mariadb_cause()
+        if cause:
+            fail(f"MariaDB is not usable as root over the unix socket: {cause}. Fix "
+                 "that, then re-run 'carlos-ctl finish-install'.")
         fail("MariaDB is not answering as root over the unix socket. Start it "
              "(systemctl status mariadb), then re-run 'carlos-ctl finish-install'.")
     s = config.load()
@@ -514,6 +666,9 @@ def cmd_finish_install(argv) -> int:
              "replacement was not requested. Run 'dpkg-reconfigure carlos-emr' and "
              "enable seeded-password replacement to recover.")
         return 1
+    # Another web server on 80/443 (the beta2 tester's apache2) keeps nginx
+    # from starting at all: offer to stop it first, as the configure does.
+    _free_front_door(s.bind_ip, boot)
     # nginx can be stopped after a failed postinst restart. init-config leaves
     # an operator-stopped service alone; install recovery must start and prove
     # it before removing the marker that promises this retry.
