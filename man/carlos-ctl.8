@@ -301,8 +301,9 @@ that logged in as root with it needs its own account. Another service on ports
 is stopped and kept from starting at boot, by the same rules the package
 configure applies (see
 .IR /usr/lib/carlos\-emr/carlos\-emr\-host\-conflicts ).
-At boot, or with no terminal, nothing is changed: the cause is reported and the
-install stays pending. A locked root, or one whose password is unknown, needs
+At boot, or with no terminal, neither repair is made (the rest of the
+provisioning still runs as above): the cause is reported and the install stays
+pending. A locked root, or one whose password is unknown, needs
 the reset described under "MariaDB root access" in
 .IR /usr/share/doc/carlos\-emr/README.Debian .
 .IP

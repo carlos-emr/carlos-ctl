@@ -37,6 +37,7 @@ nonzero when any requested step fails.
 
 import os
 import re
+import subprocess
 import sys
 import time
 import tempfile
@@ -138,11 +139,30 @@ def _journal(message: str) -> None:
             capture_output=True)
 
 
+# The helper's own waits are bounded (each MariaDB probe 10 s, the wait for a
+# stopped server's sockets 10 s, systemd's stop timeout per unit), but this
+# repair holds the database-ownership lock while it runs, so it is bounded here
+# as well.
+HOST_CONFLICTS_TIMEOUT = 300
+
+
 def _host_conflicts(*args: str) -> Optional[list]:
-    """The helper's output lines, or None when this carlos-emr does not ship it."""
+    """The helper's output lines, or None when this carlos-emr does not ship it
+    or it could not run. Its exit status 1 is part of the answer (a conflict is
+    left, no cause was found); 2 means it could not inspect the host at all,
+    which is said rather than read as "nothing found"."""
     if not os.access(HOST_CONFLICTS, os.X_OK):
         return None
-    cp = run([HOST_CONFLICTS, *args], capture_output=True)
+    try:
+        cp = run([HOST_CONFLICTS, *args], capture_output=True,
+                 timeout=HOST_CONFLICTS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        warn(f"{HOST_CONFLICTS} {' '.join(args)} did not finish within "
+             f"{HOST_CONFLICTS_TIMEOUT} seconds; nothing was concluded from it")
+        return None
+    if cp.returncode == 2:
+        warn(f"{HOST_CONFLICTS} could not inspect this host ({' '.join(args)}); "
+             "run it as root, or check that ss(8) is installed")
     return [line for line in (cp.stdout or "").splitlines() if line.strip()]
 
 
@@ -191,12 +211,14 @@ def _offer_socket_only_root() -> bool:
             "-e", _SOCKET_ONLY_ROOT]).returncode != 0:
         warn("MariaDB did not accept the change (wrong password?); root was left as it is")
         return False
+    # Recorded as soon as MariaDB accepted it: the account has changed whether
+    # or not the check below succeeds.
+    _journal("MariaDB root@localhost reset to socket-only login (the distribution "
+             "default) by carlos-ctl finish-install, at the operator's confirmation")
     if not dbops.db_root_ok():
         warn("root still cannot reach MariaDB over the unix socket after the change")
         return False
     log("MariaDB root now logs in over the unix socket only (the distribution default)")
-    _journal("MariaDB root@localhost reset to socket-only login (the distribution "
-             "default) by carlos-ctl finish-install, at the operator's confirmation")
     try:
         with open(ROOT_MY_CNF, encoding="utf-8", errors="replace") as fh:
             stores_password = re.search(r"^\s*password\s*=", fh.read(), re.MULTILINE)
@@ -219,6 +241,11 @@ def _free_front_door(bind_ip: str, boot: bool) -> None:
     if plan is None:
         return
     will_stop = [line[len("will-stop: "):] for line in plan if line.startswith("will-stop: ")]
+    # What the helper never stops is named before anything is asked, so an
+    # operator agreeing to stop one service knows another will still block.
+    for line in plan:
+        if line.startswith("blocked: "):
+            warn(line[len("blocked: "):])
     if not will_stop:
         return
     if boot or not _interactive():

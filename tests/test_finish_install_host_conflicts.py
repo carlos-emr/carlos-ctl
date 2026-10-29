@@ -151,6 +151,13 @@ class TestRootPasswordFromAnEarlierSetup(FinishInstallCase):
         self.assertTrue(os.path.exists(self.marker))
         self.mocks["cmd_db_users"].assert_not_called()
 
+    def test_an_accepted_reset_is_journaled_even_if_the_check_after_it_fails(self):
+        self.answers = ["y"]
+        self.mocks["db_root_ok"].return_value = False
+        rc, out, err = self.finish()
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(any(c[:3] == ["logger", "-t", "carlos-emr"] for c in self.commands()))
+
     def test_wrong_password_leaves_root_alone_and_fails(self):
         self.answers = ["y"]
         self.mocks["run"].side_effect = lambda cmd, **kw: completed(1 if cmd[:1] == ["mariadb"] else 0)
@@ -233,17 +240,41 @@ class TestFrontDoorConflicts(FinishInstallCase):
         self.assertIn("apache2.service (package apache2) was listening", out)
         self.assertTrue(any(c[:3] == ["logger", "-t", "carlos-emr"] for c in self.commands()))
 
-    def test_declined_leaves_the_service_running(self):
-        self.answers = ["n"]
-        self.finish()
-        self.assertEqual(self.helper_calls, [["front-door", "--plan", "0.0.0.0"]])
+    def _nginx_fails_while_the_port_is_held(self):
+        # What the real nginx step does with apache2 still on port 80.
+        self.mocks["apply_nginx"].side_effect = SystemExit(1)
 
-    def test_boot_only_names_what_holds_the_ports(self):
+    def test_declined_leaves_the_service_running_and_the_install_pending(self):
+        self._nginx_fails_while_the_port_is_held()
+        self.answers = ["n"]
+        rc, out, err = self.finish()
+        self.assertEqual(self.helper_calls, [["front-door", "--plan", "0.0.0.0"]])
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(os.path.exists(self.marker))
+
+    def test_boot_only_names_what_holds_the_ports_and_stays_pending(self):
+        self._nginx_fails_while_the_port_is_held()
         rc, out, err = self.finish(["--boot"])
         self.assertFalse(getattr(self, "prompts", []))
         self.assertEqual(self.helper_calls, [["front-door", "--plan", "0.0.0.0"]])
         self.assertIn("apache2.service (package apache2)", err)
         self.assertIn("was not stopped", err)
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(os.path.exists(self.marker))
+
+    def test_a_blocker_it_will_not_stop_is_shown_before_the_question(self):
+        seen_at_prompt = []
+        self.mocks["_host_conflicts"].side_effect = None
+        self.mocks["_host_conflicts"].return_value = list(self.PLAN)
+        err = io.StringIO()
+
+        def answer(prompt):
+            seen_at_prompt.append(err.getvalue())
+            return "n"
+        with mock.patch("builtins.input", side_effect=answer), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            p._free_front_door("0.0.0.0", boot=False)
+        self.assertIn("docker-proxy (pid 4, docker.service)", seen_at_prompt[0])
 
     def test_nothing_to_stop_asks_nothing(self):
         self.PLAN = ["blocked: docker-proxy (pid 4, docker.service) is listening on 0.0.0.0:443"]
@@ -275,6 +306,30 @@ class TestHelperAccess(unittest.TestCase):
             os.chmod(helper, 0o755)
             with mock.patch.object(p, "HOST_CONFLICTS", helper):
                 self.assertEqual(p._mariadb_cause(), "because mariadb")
+
+    def _helper(self, tmp, body):
+        helper = os.path.join(tmp, "carlos-emr-host-conflicts")
+        with open(helper, "w") as fh:
+            fh.write("#!/bin/sh\n" + body)
+        os.chmod(helper, 0o755)
+        return helper
+
+    def test_a_helper_that_cannot_inspect_the_host_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = self._helper(tmp, "exit 2\n")
+            err = io.StringIO()
+            with mock.patch.object(p, "HOST_CONFLICTS", helper), contextlib.redirect_stderr(err):
+                self.assertEqual(p._host_conflicts("front-door", "--plan", "0.0.0.0"), [])
+            self.assertIn("could not inspect this host", err.getvalue())
+
+    def test_a_hung_helper_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = self._helper(tmp, "sleep 30\n")
+            err = io.StringIO()
+            with mock.patch.object(p, "HOST_CONFLICTS", helper), \
+                    mock.patch.object(p, "HOST_CONFLICTS_TIMEOUT", 1), contextlib.redirect_stderr(err):
+                self.assertIsNone(p._host_conflicts("mariadb"))
+            self.assertIn("did not finish within 1 seconds", err.getvalue())
 
     def test_the_helper_path_is_carlos_emrs(self):
         self.assertEqual(p.HOST_CONFLICTS, "/usr/lib/carlos-emr/carlos-emr-host-conflicts")
