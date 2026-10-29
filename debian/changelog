@@ -1,4 +1,4 @@
-carlos-ctl (1.2.1~dev1) resolute; urgency=medium
+carlos-ctl (1.2.2~dev1) resolute; urgency=medium
 
   * Fix OSCAR 19 collation aliases and note-lock classification. Compare
     converted text exactly, including trailing spaces, and use target
