@@ -577,6 +577,11 @@ def cmd_finish_install(argv) -> int:
         fail(f"{PROPERTIES} is missing; reinstall carlos-emr ({REINSTALL_HINT}) to restore the configuration, "
              "then re-run 'carlos-ctl finish-install'.")
 
+    # Another web server on 80/443 (the beta2 tester's apache2) keeps nginx
+    # from serving: offer to stop it first, as the configure does. Before
+    # init-config, which applies the front door itself and, with nginx
+    # running and the site enabled, fails outright on a port it cannot bind.
+    _free_front_door(s.bind_ip, boot)
     _required("init-config", config.cmd_init_config, [], note=note)
     _required("db-apply-settings", dbops.cmd_db_apply_settings, [], note=note)
     _required("db-users", dbops.cmd_db_users, [], note=note)
@@ -666,9 +671,6 @@ def cmd_finish_install(argv) -> int:
              "replacement was not requested. Run 'dpkg-reconfigure carlos-emr' and "
              "enable seeded-password replacement to recover.")
         return 1
-    # Another web server on 80/443 (the beta2 tester's apache2) keeps nginx
-    # from starting at all: offer to stop it first, as the configure does.
-    _free_front_door(s.bind_ip, boot)
     # nginx can be stopped after a failed postinst restart. init-config leaves
     # an operator-stopped service alone; install recovery must start and prove
     # it before removing the marker that promises this retry.

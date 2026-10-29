@@ -212,15 +212,23 @@ class TestFrontDoorConflicts(FinishInstallCase):
             return list(self.PLAN if "--plan" in args else self.STOPPED)
         self.mocks["_host_conflicts"].side_effect = helper
 
-    def test_terminal_confirmation_stops_the_service_before_nginx_starts(self):
+    def test_terminal_confirmation_stops_the_service_before_nginx_is_applied(self):
+        # init-config applies the front door itself, and with nginx running
+        # and the site enabled it fails outright on a port it cannot bind; so
+        # the conflict is offered before init-config, not just before the
+        # final nginx step (review finding).
         order = []
+        helper = self.mocks["_host_conflicts"].side_effect
+        self.mocks["_host_conflicts"].side_effect = lambda *a: order.append(" ".join(a)) or helper(*a)
+        self.mocks["cmd_init_config"].side_effect = lambda *a, **k: order.append("init-config") or 0
         self.mocks["apply_nginx"].side_effect = lambda *a, **k: order.append("nginx") or 0
         self.answers = ["y"]
         rc, out, err = self.finish()
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.helper_calls, [["front-door", "--plan", "0.0.0.0"],
                                              ["front-door", "0.0.0.0"]])
-        self.assertEqual(order, ["nginx"])
+        self.assertEqual(order, ["front-door --plan 0.0.0.0", "front-door 0.0.0.0",
+                                 "init-config", "nginx"])
         self.assertIn("apache2.service (package apache2), on 0.0.0.0:80", out)
         self.assertIn("apache2.service (package apache2) was listening", out)
         self.assertTrue(any(c[:3] == ["logger", "-t", "carlos-emr"] for c in self.commands()))
