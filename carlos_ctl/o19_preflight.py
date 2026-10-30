@@ -1746,7 +1746,8 @@ EXIT_TOOL_ERROR = 3
 #: and every class behind them refuses at P4 with no --accept, so
 #: render_text repeats them beside the bundling recipe: a `go` above
 #: that recipe otherwise reads as a green light for the whole import.
-UNMEASURED_FINDING_IDS = ("column-checks-deferred", "charset-b8-unmeasured")
+UNMEASURED_FINDING_IDS = ("column-checks-deferred", "charset-b8-unmeasured",
+                          "charset-exact-unmeasured")
 
 #: the finding whose data are view names the bundling recipe must
 #: exclude. render_text appends its --ignore-table flags to the
@@ -1940,6 +1941,153 @@ def double_encoded_expr(c):
             "BINARY CONVERT({2} USING utf8mb4) = BINARY {1} AND "
             "BINARY CONVERT(CONVERT(BINARY {2} USING utf8mb4) USING binary) "
             "= BINARY {2}".format(c, u, down))
+
+
+UTF8_BYTE_PATTERN = (
+    r"\A(?:[\x00-\x7F]|[\xC2-\xDF][\x80-\xBF]|"
+    r"\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|"
+    r"\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|"
+    r"[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2})*+\z")
+
+# MySQL/MariaDB latin1 is Windows-1252; these are its Unicode encodings.
+LATIN1_UTF8_BYTE_PATTERN = (
+    r"\A(?:[\x00-\x7F]|\xC2(?:[\xA0-\xBF]|[\x81\x8D\x8F\x90\x9D])|"
+    r"\xC3[\x80-\xBF]|\xC5[\x92\x93\xA0\xA1\xB8\xBD\xBE]|\xC6\x92|"
+    r"\xCB[\x86\x9C]|\xE2(?:\x80[\x93\x94\x98\x99\x9A\x9C\x9D\x9E"
+    r"\xA0\xA1\xA2\xA6\xB0\xB9\xBA]|\x82\xAC|\x84\xA2))*+\z")
+
+
+def guarded_legacy_repair_expr(expr):
+    """Per-row conditional latin1->utf8mb4 repair: rows that are not
+    provably double-encoded pass through untouched.
+
+    Both branches are utf8mb4. The repaired branch is a utf8mb4 CAST,
+    and a raw latin1 column in the ELSE branch is a different character
+    set with a different collation derivation: MariaDB 11.8 (Ubuntu
+    26.04's server, whose utf8mb4 default is utf8mb4_uca1400_ai_ci)
+    refuses that CASE outright -- ERROR 1267 "Illegal mix of collations
+    (utf8mb4_uca1400_ai_ci,CAST) and (latin1_swedish_ci,IMPLICIT) for
+    operation 'case'" -- where 10.11 resolved it to the utf8mb4 side.
+    Converting the untouched branch too costs nothing (the target column
+    is utf8mb4 and a latin1 value converts losslessly) and gives the
+    CASE one character set and one derivation on every server."""
+    candidate = "CONVERT(CONVERT({0} USING utf8mb4) USING latin1)".format(expr)
+    return ("CASE WHEN BINARY CONVERT({2} USING utf8mb4) REGEXP '{5}' THEN "
+            "CASE WHEN BINARY {3} REGEXP '{4}' THEN "
+            "CASE WHEN {0} THEN {1} ELSE CONVERT({2} USING utf8mb4) END "
+            "ELSE CONVERT({2} USING utf8mb4) END "
+            "ELSE CONVERT({2} USING utf8mb4) END").format(
+        double_encoded_expr(expr), REPAIR_TEMPLATE.format(expr), expr,
+        candidate, UTF8_BYTE_PATTERN.replace("\\", "\\\\"),
+        LATIN1_UTF8_BYTE_PATTERN.replace("\\", "\\\\"))
+
+
+# CLI-owned rules; deliberately outside the generated manifest block. The
+# package imports these helpers from this standalone-capable module too.
+EXACT_CHARSET_VERSION = "drugs-special-iso8859-1-v1"
+EXACT_CHARSET_SCOPE = ("drugs", "special")
+EXACT_CHARSET_RULES = (
+    ("iso8859-1-en-dash", "C3A2C280C293", "E28093"),
+    ("iso8859-1-less-or-equal", "C3A2C289C2A4", "E289A4"),
+)
+
+
+def _utf8_hex(value):
+    return "CONVERT(UNHEX('{0}') USING utf8mb4)".format(value)
+
+
+def exact_charset_match(expr, rules=None):
+    u = "CONVERT({0} USING utf8mb4)".format(expr)
+    return "(" + " OR ".join(
+        "LOCATE(BINARY {0}, BINARY {1}) > 0".format(_utf8_hex(before), u)
+        for _name, before, _after in (rules or EXACT_CHARSET_RULES)) + ")"
+
+
+def exact_charset_expr(expr):
+    out = "CONVERT({0} USING utf8mb4)".format(expr)
+    for _name, before, after in EXACT_CHARSET_RULES:
+        out = "REPLACE({0}, {1}, {2})".format(
+            out, _utf8_hex(before), _utf8_hex(after))
+    return out
+
+
+def exact_charset_residual(expr):
+    # Whole character spans, portable even on the old Spencer engine.
+    # Do not reject unrelated C1/NEL characters elsewhere in a value.
+    return "(" + " OR ".join(
+        "LOCATE(BINARY {0}, BINARY CONVERT({1} USING utf8mb4)) > 0"
+        .format(_utf8_hex("C3A2C2{0:02X}".format(n)), expr)
+        for n in range(128, 160)) + ")"
+
+
+def exact_charset_candidate(expr):
+    # Choose from the ORIGINAL value. Chaining the decoders could accept
+    # an additional encoding layer that must remain B8.
+    return "CASE WHEN {0} THEN {1} ELSE {2} END".format(
+        exact_charset_match(expr), exact_charset_expr(expr),
+        guarded_legacy_repair_expr(expr))
+
+
+def checked_charset_count(query, qualified_table, where):
+    rows = query("SELECT COUNT(*) FROM {0} WHERE {1}; "
+                 "SHOW COUNT(*) WARNINGS".format(qualified_table, where))
+    if (len(rows) != 2 or any(len(r) != 1 for r in rows)
+            or not all(str(r[0]).isdigit() for r in rows)):
+        raise RuntimeError("incomplete charset count/warning result")
+    n, warnings = (int(r[0]) for r in rows)
+    if warnings:
+        raise RuntimeError("charset candidate produced {0} SQL warning(s)"
+                           .format(warnings))
+    return n
+
+
+def exact_charset_counts(query, qualified_table, expr):
+    """Authoritative modern-server scan. Counts are read-only and checked.
+
+    The candidate is named once in a derived table to keep the residual
+    searches from multiplying the SQL text of its guarded conversions.
+    """
+    candidate = exact_charset_candidate(expr)
+    relation = "(SELECT {0} AS original, {1} AS candidate FROM {2}) enc" \
+        .format(expr, candidate, qualified_table)
+    known = exact_charset_match("original")
+    changed = "NOT (BINARY candidate <=> BINARY " \
+        "CONVERT(original USING utf8mb4))"
+    # A second guarded hop changing the candidate means one hop did not
+    # finish. Neither a flag nor a known token elsewhere can clear it.
+    repeated = "NOT (BINARY {0} <=> BINARY candidate)".format(
+        guarded_legacy_repair_expr("candidate"))
+    marker = "CONVERT(candidate USING utf8mb4) COLLATE " \
+        "utf8mb4_general_ci REGEXP {0}".format(MOJIBAKE_MARKER_RE)
+    # Modern engines can scan this Unicode span in one pass; keep the
+    # 32 portable LOCATE checks for old source engines only.
+    residual = ("CONVERT(candidate USING utf8mb4) COLLATE utf8mb4_bin "
+                "REGEXP '[\\\\x{E2}][\\\\x{80}-\\\\x{9F}]'")
+    bad = "candidate IS NOT NULL AND ({0} OR {1} OR {2})".format(
+        residual, marker, repeated)
+    result = {
+        "rows": checked_charset_count(query, relation, known + " OR " + changed),
+        "bad": checked_charset_count(query, relation, bad),
+        "rules": {},
+    }
+    for rule in EXACT_CHARSET_RULES:
+        result["rules"][rule[0]] = checked_charset_count(
+            query, relation, exact_charset_match("original", (rule,)))
+    return result
+
+
+def guarded_charset_supported(query):
+    # MySQL 8's Unicode regex engine rejects binary strings. Source
+    # assessments there must retain the portable path and disclose what
+    # could not be measured instead of rejecting an otherwise valid DB.
+    try:
+        value = _utf8_hex("436166C383C2A9")
+        rows = query("SELECT HEX({0}); SHOW COUNT(*) WARNINGS".format(
+            guarded_legacy_repair_expr(value)))
+        return rows == [["436166C3A9"], ["0"]]
+    except Exception:
+        return False
+
 
 
 def _ident(name):
@@ -3362,13 +3510,65 @@ def check_text_encoding(c):
     mojibake = {}
     unrepairable = {}
     marker_scan = _hex_escape_regexp_supported(query)
+    guarded_scan = marker_scan and guarded_charset_supported(query)
     for t, cols in CHARSET_SCAN.items():
         if t not in tables:
             continue
         for col in cols:
             label = "{0}.{1}".format(t, col)
             quoted = "`{0}`".format(col)
+            exact = (t, col) == EXACT_CHARSET_SCOPE
+            known = 0
+            if exact:
+                try:
+                    qualified = _ident(tables[t])
+                    if guarded_scan:
+                        stats = exact_charset_counts(query, qualified,
+                                                     quoted)
+                        if stats["rows"]:
+                            mojibake[label] = stats["rows"]
+                        if stats["bad"]:
+                            unrepairable[label] = [
+                                "{0} row(s) remain corrupt after one "
+                                "approved repair path".format(stats["bad"])]
+                        if any(stats["rules"].values()):
+                            findings.append(finding(
+                                "charset-exact-rules", INFO,
+                                "exact drugs.special repair rules detected",
+                                "Applied only with --accept charset-repair.",
+                                data={"version": EXACT_CHARSET_VERSION,
+                                      "columns": {label: stats}}))
+                        continue
+                    known = checked_charset_count(
+                        query, qualified, exact_charset_match(quoted))
+                    residual = checked_charset_count(
+                        query, qualified,
+                        exact_charset_residual(exact_charset_expr(quoted)))
+                    if residual:
+                        unrepairable[label] = [
+                            "{0} row(s) carry unresolved ISO-style C1 "
+                            "fragments".format(residual)]
+                    if known:
+                        per_rule = dict((rule[0], checked_charset_count(
+                            query, qualified,
+                            exact_charset_match(quoted, (rule,))))
+                                        for rule in EXACT_CHARSET_RULES)
+                        findings.append(finding(
+                            "charset-exact-rules", INFO,
+                            "exact drugs.special repair rules detected",
+                            "Candidate verification completes on the target.",
+                            data={"version": EXACT_CHARSET_VERSION,
+                                  "rows": known, "rules": per_rule}))
+                except Exception as exc:
+                    if _absent_object(str(exc)):
+                        c.absent_objects[label] = str(exc)
+                    else:
+                        c.query_errors[label] = str(exc)
+                    continue
             n = count_live(t, double_encoded_predicate(col))
+            # These lanes are disjoint: the exact C1 sequences cannot
+            # round-trip through the Windows-1252 predicate.
+            n += known
             if n > 0:
                 mojibake[label] = n
             multi = count_live(t, "({0}) AND ({1})".format(
@@ -3382,14 +3582,42 @@ def check_text_encoding(c):
                     "encoded more than twice".format(multi))
             if not marker_scan:
                 continue
+            if exact:
+                # Known tokens are checked on their exact-only output,
+                # without a speculative latin1 conversion of valid ≤/–.
+                try:
+                    known_bad = checked_charset_count(
+                        query, qualified,
+                        "{0} AND CONVERT({1} USING utf8mb4) COLLATE "
+                        "utf8mb4_general_ci REGEXP {2}".format(
+                            exact_charset_match(quoted),
+                            exact_charset_expr(quoted), MOJIBAKE_MARKER_RE))
+                except Exception as exc:
+                    c.query_errors[label] = str(exc)
+                    continue
+                if known_bad:
+                    unrepairable.setdefault(label, []).append(
+                        "{0} row(s) retain mojibake after exact "
+                        "replacement".format(known_bad))
+            source = quoted
             bad = count_live(t, "{0} IS NOT NULL AND {0} REGEXP {1} AND "
-                                "NOT ({2})".format(
-                                    quoted, MOJIBAKE_MARKER_RE,
-                                    double_encoded_predicate(col)))
+                                "NOT ({2}){3}".format(
+                                    source, MOJIBAKE_MARKER_RE,
+                                    double_encoded_expr(source),
+                                    " AND NOT {0}".format(
+                                        exact_charset_match(quoted))
+                                    if exact else ""))
             if bad > 0:
                 unrepairable.setdefault(label, []).append(
                     "{0} row(s) carry mojibake bytes that do not "
                     "round-trip".format(bad))
+    if not guarded_scan and EXACT_CHARSET_SCOPE[0] in tables:
+        findings.append(finding(
+            "charset-exact-unmeasured", ADVISORY,
+            "full drugs.special candidate validation runs on the target",
+            "Exact-pattern and ISO-style C1 counts were measured here. "
+            "This source cannot run the guarded target decoder; remaining "
+            "candidate checks run before copying and can still stop as B8."))
     if unrepairable:
         # B8: no --accept clears this one on either side. The ETL dies on
         # it before the charset-repair question is even asked, so the

@@ -59,6 +59,12 @@ class FakeDb(object):
 
     def __call__(self, sql):
         self.queries.append(sql)
+        if sql.endswith("; SHOW COUNT(*) WARNINGS"):
+            return self(sql.rsplit(";", 1)[0]) + [["0"]]
+        if sql.startswith("SELECT HEX(CASE WHEN "):
+            return [["436166C3A9"]]
+        if sql.startswith("SELECT COUNT(*) FROM (SELECT "):
+            return [["0"]]
         for frag, canned in self.rows.items():
             if frag in sql:
                 return canned
