@@ -142,7 +142,9 @@ class TestExactCharsetMariaDB(unittest.TestCase):
                 self.assertTrue(self.parity(repairs)[1])
 
     def test_should_refuse_residual_and_extra_encoding_layers_before_copy(self):
-        cases = [UNKNOWN, DASH[:-1], DASH + UNKNOWN, CP + DASH,
+        # A literal â+C1 pair is valid UTF-8 but ambiguous. It must not
+        # be guessed or silently rewritten, even if it was intended.
+        cases = [UNKNOWN, DASH[:-1], "â\u0089", DASH + UNKNOWN, CP + DASH,
                  CP.encode().decode("cp1252"), DASH.encode().decode("cp1252"),
                  LE.encode().decode("cp1252")]
         for value in cases:

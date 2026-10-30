@@ -2665,7 +2665,7 @@ def detect_repairs(query, src_schema: str, accepted,
                         continue
                     raise RuntimeError("charset scan of {0}.{1} failed: {2}".format(table, col, exc)) from exc
                 if measured["bad"]:
-                    unrepairable.append("{0}.{1} ({2} row(s) remain corrupt after one approved repair path)".format(table, col, measured["bad"]))
+                    unrepairable.append("{0}.{1} ({2} row(s) retain unresolved encoding markers after one approved repair path)".format(table, col, measured["bad"]))
                 if measured["rows"]:
                     targets = {c for c in entry.get("cols", (col,))
                                if entry.get("renames", {}).get(c, c) == col

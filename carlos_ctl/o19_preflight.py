@@ -3529,7 +3529,8 @@ def check_text_encoding(c):
                             mojibake[label] = stats["rows"]
                         if stats["bad"]:
                             unrepairable[label] = [
-                                "{0} row(s) remain corrupt after one "
+                                "{0} row(s) retain unresolved encoding "
+                                "markers after one "
                                 "approved repair path".format(stats["bad"])]
                         if any(stats["rules"].values()):
                             findings.append(finding(
