@@ -98,7 +98,7 @@ jobs:
           export CARLOS_CTL_O19_MANIFEST_DIR="$GITHUB_WORKSPACE/tests/fixtures/o19-manifest"
           export CARLOS_TEST_MARIADB_SOCKET=/run/mysqld/mysqld.sock
           python3 -c 'from carlos_ctl import o19import; assert o19import.__file__.startswith("/usr/lib/carlos-ctl/")'
-          python3 -m unittest -v tests.test_import_ownership_lock tests.test_etl_mariadb tests.test_o19_compat_mariadb tests.test_schema_contract
+          python3 -m unittest -v tests.test_import_ownership_lock tests.test_etl_mariadb tests.test_exact_charset_mariadb tests.test_o19_compat_mariadb tests.test_schema_contract
       - name: Installed CDS root/service-user delegation boundary
         run: |
           set -euo pipefail

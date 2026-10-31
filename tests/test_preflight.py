@@ -59,6 +59,27 @@ class FakeDb(object):
 
     def __call__(self, sql):
         self.queries.append(sql)
+        if sql.endswith("; SHOW COUNT(*) WARNINGS"):
+            return self(sql.rsplit(";", 1)[0]) + [["0"]]
+        if sql.startswith("SELECT HEX(CASE WHEN "):
+            return [["436166C3A9"]]
+        if sql.startswith("SELECT COUNT(*) FROM (SELECT "):
+            match = re.search(r" FROM `drugs`\) enc WHERE (.+)$", sql)
+            if not match:
+                raise AssertionError("unexpected exact-scan relation: " + sql)
+            where = match.group(1)
+            spec = self.charset.get(("drugs", "special"), {})
+            if " OR NOT (BINARY candidate <=>" in where:
+                n = spec.get("n", 0) + spec.get("exact", 0)
+            elif where.startswith("candidate IS NOT NULL AND "):
+                n = spec.get("bad", 0) + spec.get("multi", 0)
+            elif where == pf.exact_charset_match("original", (pf.EXACT_CHARSET_RULES[0],)):
+                n = spec.get("dash", 0)
+            elif where == pf.exact_charset_match("original", (pf.EXACT_CHARSET_RULES[1],)):
+                n = spec.get("le", 0)
+            else:
+                raise AssertionError("unexpected exact-scan predicate: " + where)
+            return [[str(n)]]
         for frag, canned in self.rows.items():
             if frag in sql:
                 return canned
@@ -840,6 +861,38 @@ class TestTheB8CharsetStop(unittest.TestCase):
         self.assertEqual(report["verdict"], "go")
         self.assertEqual([x["id"] for x in report["findings"]
                           if x["id"] == "charset-b8-unmeasured"], [])
+
+    def test_exact_only_rows_require_ack_and_keep_per_rule_counts(self):
+        db = FakeDb(base_tables(), charset={
+            ("drugs", "special"): {"exact": 2, "dash": 1, "le": 2}})
+        report = pf.run_checks(db, properties=clean_props())
+        self.assertEqual(report["verdict"], "go-with-acknowledgements")
+        f = next(x for x in report["findings"] if x["id"] == "charset-mojibake")
+        self.assertEqual(f["data"]["drugs.special"], 2)
+        self.assertEqual(report["required_accepts"], ["charset-repair"])
+        info = next(x for x in report["findings"] if x["id"] == "charset-exact-rules")
+        self.assertEqual(info["data"]["columns"]["drugs.special"]["rules"], {
+            "iso8859-1-en-dash": 1, "iso8859-1-less-or-equal": 2})
+        self.assertEqual(pf.run_checks(db, properties=clean_props(),
+                                      accepted=["charset-repair"])["verdict"], "go")
+
+    def test_an_exact_match_cannot_mask_a_residual_refusal(self):
+        db = FakeDb(base_tables(), charset={
+            ("drugs", "special"): {"exact": 1, "bad": 1, "dash": 1}})
+        report = pf.run_checks(db, properties=clean_props(), accepted=["charset-repair"])
+        self.assertEqual(report["verdict"], "no-go")
+        f = next(x for x in report["findings"] if x["id"] == "B8-charset-unrepairable")
+        self.assertIsNone(f.get("accept"))
+
+    def test_an_invalid_derived_scan_is_not_a_clean_database(self):
+        class BrokenExactDb(FakeDb):
+            def __call__(self, sql):
+                if sql.startswith("SELECT COUNT(*) FROM (SELECT "):
+                    raise RuntimeError("ERROR 1064: invalid exact-scan SQL")
+                return super().__call__(sql)
+        report = pf.run_checks(BrokenExactDb(base_tables()), properties=clean_props())
+        self.assertEqual(report["verdict"], "no-go")
+        self.assertTrue(any(x["id"] == "query-errors" for x in report["findings"]))
 
 
 class TestRoleAdvisories(unittest.TestCase):

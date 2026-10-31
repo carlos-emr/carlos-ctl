@@ -35,10 +35,10 @@ import re
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import o19digest, o19map_schema
+from . import o19digest, o19map_schema, o19_preflight
 from .util import sql_escape, warn
 
-ETL_CONTRACT_VERSION = 2
+ETL_CONTRACT_VERSION = 3
 
 # a copy is windowed over the id RANGE, so a sparse id space costs
 # windows rather than rows. Beyond this the range is not a table's id
@@ -164,43 +164,15 @@ MOJIBAKE_MARKER_RE = "'[\\\\x{C3}\\\\x{C2}][\\\\x{80}-\\\\x{BF}]'"
 # Guard speculative conversions with target-side binary PCRE. Never HEX a
 # whole note: HEX doubles its size and can exceed max_allowed_packet even
 # when the value itself fits. These guards do not run on the old source DB.
-UTF8_BYTE_PATTERN = (
-    r"\A(?:[\x00-\x7F]|[\xC2-\xDF][\x80-\xBF]|"
-    r"\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|"
-    r"\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|"
-    r"[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2})*+\z")
-
-# MySQL/MariaDB latin1 is Windows-1252; these are its Unicode encodings.
-LATIN1_UTF8_BYTE_PATTERN = (
-    r"\A(?:[\x00-\x7F]|\xC2(?:[\xA0-\xBF]|[\x81\x8D\x8F\x90\x9D])|"
-    r"\xC3[\x80-\xBF]|\xC5[\x92\x93\xA0\xA1\xB8\xBD\xBE]|\xC6\x92|"
-    r"\xCB[\x86\x9C]|\xE2(?:\x80[\x93\x94\x98\x99\x9A\x9C\x9D\x9E"
-    r"\xA0\xA1\xA2\xA6\xB0\xB9\xBA]|\x82\xAC|\x84\xA2))*+\z")
+UTF8_BYTE_PATTERN = o19_preflight.UTF8_BYTE_PATTERN
+LATIN1_UTF8_BYTE_PATTERN = o19_preflight.LATIN1_UTF8_BYTE_PATTERN
 
 
-def repair_expr(expr: str) -> str:
-    """Per-row conditional latin1->utf8mb4 repair: rows that are not
-    provably double-encoded pass through untouched.
-
-    Both branches are utf8mb4. The repaired branch is a utf8mb4 CAST,
-    and a raw latin1 column in the ELSE branch is a different character
-    set with a different collation derivation: MariaDB 11.8 (Ubuntu
-    26.04's server, whose utf8mb4 default is utf8mb4_uca1400_ai_ci)
-    refuses that CASE outright -- ERROR 1267 "Illegal mix of collations
-    (utf8mb4_uca1400_ai_ci,CAST) and (latin1_swedish_ci,IMPLICIT) for
-    operation 'case'" -- where 10.11 resolved it to the utf8mb4 side.
-    Converting the untouched branch too costs nothing (the target column
-    is utf8mb4 and a latin1 value converts losslessly) and gives the
-    CASE one character set and one derivation on every server."""
-    candidate = "CONVERT(CONVERT({0} USING utf8mb4) USING latin1)".format(expr)
-    return ("CASE WHEN BINARY CONVERT({2} USING utf8mb4) REGEXP '{5}' THEN "
-            "CASE WHEN BINARY {3} REGEXP '{4}' THEN "
-            "CASE WHEN {0} THEN {1} ELSE CONVERT({2} USING utf8mb4) END "
-            "ELSE CONVERT({2} USING utf8mb4) END "
-            "ELSE CONVERT({2} USING utf8mb4) END").format(
-        double_encoded_predicate(expr), REPAIR_TEMPLATE.format(expr), expr,
-        candidate, UTF8_BYTE_PATTERN.replace("\\", "\\\\"),
-        LATIN1_UTF8_BYTE_PATTERN.replace("\\", "\\\\"))
+def repair_expr(expr: str, exact: bool = False) -> str:
+    """One acknowledged repair path, shared with standalone assessment."""
+    if exact:
+        return o19_preflight.exact_charset_candidate(expr)
+    return o19_preflight.guarded_legacy_repair_expr(expr)
 
 
 # --------------------------------------------------------------------------
@@ -478,7 +450,7 @@ def source_expr(table_entry: dict, target_col: str,
     # doubled here, and a second line of defence costs nothing.
     expr = "s.{0}".format(ident(src))
     if repaired and target_col in repaired:
-        expr = repair_expr(expr)
+        expr = repair_expr(expr, target_col in table_entry.get("_exact_charset_columns", ()))
     parent = table_entry.get("fk_remap", {}).get(target_col)
     if parent and archive_schema:
         lookup = "(SELECT m.new_id FROM `{0}`.`{1}` m WHERE m.old_id = {2})" \
@@ -2588,6 +2560,27 @@ def load_progress(state_dir: str, dump_sha256: Optional[str] = None,
         if (progress.get("tables") or progress.get("admin_provider_no")) and progress.get("etl_contract") != etl_contract:
             die("the ETL implementation contract changed during this partial import; finish with the original package or restore the pre-import snapshot")
         progress["etl_contract"] = etl_contract
+    rules = progress.get("charset_rules")
+    source_names = o19map_schema.TABLES.get("drugs", {}).get("renames", {})
+    scoped = any(source_names.get(c, c) == "special"
+                 for c in progress.get("repairs", {}).get("drugs", ()))
+    if rules or (scoped and progress.get("etl_contract") == ETL_CONTRACT_VERSION):
+        if (not isinstance(rules, dict)
+                or rules.get("version") != o19_preflight.EXACT_CHARSET_VERSION
+                or not isinstance(rules.get("columns"), dict)
+                or set(rules["columns"]) != {"drugs.special"}):
+            die("unknown or missing charset rule metadata; finish with the original package or restore the pre-import snapshot")
+        measured = rules["columns"]["drugs.special"]
+        names = {r[0] for r in o19_preflight.EXACT_CHARSET_RULES}
+        if (not isinstance(measured, dict)
+                or set(measured) != {"rows", "bad", "rules"}
+                or type(measured.get("rows")) is not int or measured["rows"] <= 0
+                or type(measured.get("bad")) is not int or measured["bad"] != 0
+                or not isinstance(measured.get("rules"), dict)
+                or set(measured["rules"]) != names
+                or any(type(n) is not int or not 0 <= n <= measured["rows"]
+                       for n in measured["rules"].values())):
+            die("inconsistent charset rule counts in the ETL ledger; finish with the original package or restore the pre-import snapshot")
     return progress
 
 
@@ -2647,7 +2640,8 @@ def absent_object_error(exc: Exception) -> bool:
 
 
 def detect_repairs(query, src_schema: str, accepted,
-                   notes: Optional[List[str]] = None) -> Dict[str, set]:
+                   notes: Optional[List[str]] = None,
+                   audit: Optional[dict] = None) -> Dict[str, set]:
     """Charset scan: {table: {columns holding double-encoded rows}} — and
     hard-stop (B8) if rows look double-encoded but cannot be repaired
     losslessly, or if repair is needed but unacknowledged. The repair
@@ -2660,6 +2654,32 @@ def detect_repairs(query, src_schema: str, accepted,
     for table, entry in o19map_schema.TABLES.items():
         for col in entry.get("charset_scan", ()):
             expr = "`{0}`".format(col)
+            if (table, col) == o19_preflight.EXACT_CHARSET_SCOPE:
+                try:
+                    measured = o19_preflight.exact_charset_counts(
+                        query, "`{0}`.`{1}`".format(src_schema, table), expr)
+                except Exception as exc:
+                    if absent_object_error(exc):
+                        if notes is not None:
+                            notes.append("charset scan skipped: {0}.{1} not in this dump".format(table, col))
+                        continue
+                    raise RuntimeError("charset scan of {0}.{1} failed: {2}".format(table, col, exc)) from exc
+                if measured["bad"]:
+                    unrepairable.append("{0}.{1} ({2} row(s) retain unresolved encoding markers after one approved repair path)".format(table, col, measured["bad"]))
+                if measured["rows"]:
+                    targets = {c for c in entry.get("cols", (col,))
+                               if entry.get("renames", {}).get(c, c) == col
+                               and c not in entry.get("value_exprs", {})
+                               and c not in entry.get("archived_cols", {})}
+                    if not targets:
+                        raise RuntimeError("charset repair has no writable target for drugs.special")
+                    repairs.setdefault(table, set()).update(targets)
+                    if audit is not None:
+                        audit["version"] = o19_preflight.EXACT_CHARSET_VERSION
+                        audit["columns"] = {"drugs.special": measured}
+                    if notes is not None:
+                        notes.append("drugs.special: {0} charset repair row(s); exact rules {1}: {2}".format(measured["rows"], o19_preflight.EXACT_CHARSET_VERSION, measured["rules"]))
+                continue
             try:
                 n = int(query(
                     "SELECT COUNT(*) FROM `{0}`.`{1}` WHERE {2}".format(
@@ -2738,6 +2758,13 @@ def effective_entry(table: str, entry: dict,
     if legacy_lifetime:
         entry = dict(entry)
         entry["value_exprs"] = dict(entry.get("value_exprs", {}), lifetime="-1")
+    exact = [c for c in entry.get("cols", ())
+             if (table, entry.get("renames", {}).get(c, c)) ==
+             o19_preflight.EXACT_CHARSET_SCOPE
+             and c not in entry.get("value_exprs", {})
+             and c not in entry.get("archived_cols", {})]
+    if exact:
+        entry = dict(entry, _exact_charset_columns=exact)
     have = {c.lower() for c in src_cols}
     renames = entry.get("renames", {})
     ve = entry.get("value_exprs", {})
@@ -3996,7 +4023,8 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
     # the charset scan first (reads only): the never-truncate pre-check
     # below must measure the text as it will be stored, i.e. repaired
     scan_notes: List[str] = []
-    repairs = detect_repairs(plain, src, ctx["accepted"], scan_notes)
+    charset_audit: dict = {}
+    repairs = detect_repairs(plain, src, ctx["accepted"], scan_notes, charset_audit)
     if scan_notes:
         report("charset scan:\n  " + "\n  ".join(scan_notes))
     if repairs:
@@ -4051,6 +4079,7 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
     # proves nothing. Recorded on every pass, so a resume that finds new
     # mojibake (a restage) does not verify against the old set.
     progress["repairs"] = dict((t, sorted(cs)) for t, cs in repairs.items())
+    progress["charset_rules"] = charset_audit
     save_progress(state_dir, progress)
 
     # Has the target been rewound under this ledger? The pre-import
