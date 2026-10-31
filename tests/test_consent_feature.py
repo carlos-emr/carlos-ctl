@@ -302,6 +302,37 @@ class TestConsentFeature(unittest.TestCase):
         next(self.migrations.iterdir()).write_text(sql, encoding="utf-8")
         self.assertTrue(classify(self.root))
 
+    def test_dropping_required_unique_key_is_an_error(self):
+        for kind in ("INDEX", "KEY", "CONSTRAINT"):
+            for optional in ("", "IF EXISTS "):
+                drop = f"DROP {kind} {optional}`uq_consent_live_type`"
+                for sql in (
+                        SQL + f"ALTER TABLE `Consent` {drop};\n",
+                        SQL.rstrip().removesuffix(";") + f", {drop};\n"):
+                    with self.subTest(sql=sql):
+                        self.fixture(True, True, True)
+                        next(self.migrations.iterdir()).write_text(sql, encoding="utf-8")
+                        with self.assertRaises(ConsentFeatureError):
+                            classify(self.root)
+        for optional in ("", "IF EXISTS "):
+            with self.subTest(standalone=True, optional=optional):
+                self.fixture(True, True, True)
+                next(self.migrations.iterdir()).write_text(
+                    SQL + f"DROP INDEX {optional}`uq_consent_live_type` ON `Consent`;\n",
+                    encoding="utf-8")
+                with self.assertRaises(ConsentFeatureError):
+                    classify(self.root)
+
+    def test_commented_or_unrelated_index_drop_preserves_feature(self):
+        self.fixture(True, True, True)
+        next(self.migrations.iterdir()).write_text(
+            SQL + "/* DROP INDEX uq_consent_live_type ON Consent; */\n"
+            "-- ALTER TABLE Consent DROP KEY uq_consent_live_type;\n"
+            "# ALTER TABLE Consent DROP CONSTRAINT uq_consent_live_type;\n"
+            "ALTER TABLE Consent DROP KEY unrelated_index;\n",
+            encoding="utf-8")
+        self.assertTrue(classify(self.root))
+
 
 if __name__ == "__main__":
     unittest.main()

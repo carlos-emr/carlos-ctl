@@ -147,7 +147,10 @@ def _migration(root):
     expression = re.sub(r"\s+", "", generated[0]) if len(generated) == 1 else ""
     if (expression not in ("if(deleted=0,demographic_no,null)",
                            "casewhendeleted=0thendemographic_noelsenullend")
-            or len(unique) != 1):
+            or len(unique) != 1
+            or any(re.search(r"\bdrop\s+(?:index|key|constraint)\s+"
+                             r"(?:if\s+exists\s+)?uq_consent_live_type\b", statement)
+                   for statement in statements)):
         raise ConsentFeatureError("migration: invalid generated live-patient column or unique key")
     return True
 
