@@ -1,5 +1,9 @@
 carlos-ctl (1.2.2~dev1) resolute; urgency=medium
 
+  * Repair the two reviewed ISO-8859-1 C1 sequences in OSCAR 19 drugs.special
+    during an acknowledged copy, with shared standalone assessment rules,
+    byte-exact detection and P7 verification. Keep residual or extra-layer
+    corruption blocked. Bind the rule audit and ETL contract to resume state.
   * Fix OSCAR 19 collation aliases and note-lock classification. Compare
     converted text exactly, including trailing spaces, and use target
     comparison rules for source keys and merge mappings.
