@@ -475,18 +475,14 @@ or a nonzero
 .B --timeshift DAYS
 and cannot be combined with real-chart merge. Unknown, duplicate,
 abbreviated and conflicting arguments are refused.
-.IP
-Existing-run operations are
-.BR "--status-submission KEY"
+.TP
+.B --status-submission KEY --provider ID
 Recover an accepted run handle after output loss using its printed submission key.
 The verified OS operator and selected provider must match and remain authorized.
 An unknown outcome exits 4; preserve original source/evidence and reconcile before resubmitting.
 .TP
-.BR "--status RUN_ID" ,
-.BR "--resume RUN_ID" ,
-.BR "--cancel RUN_ID" ,
-or
-.BR "--report RUN_ID" ,
+.BR "--status RUN_ID" ", " "--resume RUN_ID" ", " "--cancel RUN_ID" ", " "--report RUN_ID"
+Mutually exclusive existing-run operations,
 always with
 .BR "--provider ID" .
 They use the run's recorded source/options and cannot replace those options.

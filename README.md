@@ -79,6 +79,14 @@ its durable result and resume/reconcile the same run rather than resubmitting
 the source. Counts/progress are console-safe; patient-level diagnostics and
 the required event/error/completeness files remain access-controlled.
 
+If acceptance output is lost after a printed `SUBMISSION` key, use
+`sudo carlos-ctl cds-import --status-submission KEY --provider ID` as the same
+OS operator. This read-only lookup requires matching CARLOS support, rechecks
+current delegation, and returns only that operator/provider's accepted run.
+An unknown outcome exits 4; retain the original source and submission evidence
+and reconcile before any new submission. A status exit 0 confirms the query;
+check the returned import outcome before treating the data as complete.
+
 The wrapper refuses incompatible engine protocols and unsupported JVMs
 before execution. Java's actual properties loader supplies the launch budget
 through the capability response; Python does not reinterpret property syntax.
@@ -142,11 +150,3 @@ separate, later issue.
 ## License
 
 AGPL-3.0-only. See [LICENSE](LICENSE).
-
-If acceptance output is lost after a printed `SUBMISSION` key, use
-`sudo carlos-ctl cds-import --status-submission KEY --provider ID` as the same
-OS operator. This read-only lookup requires matching CARLOS support, rechecks
-current delegation, and returns only that operator/provider's accepted run.
-An unknown outcome exits 4; retain the original source and submission evidence
-and reconcile before any new submission. A status exit 0 confirms the query;
-check the returned import outcome before treating the data as complete.
