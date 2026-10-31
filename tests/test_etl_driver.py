@@ -24,6 +24,7 @@ Run (from the repository root):
 """
 
 import contextlib
+from copy import deepcopy
 import io
 import os
 import re
@@ -32,7 +33,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from carlos_ctl import o19etl, o19map_schema
+from carlos_ctl import o19etl, o19manifest, o19map_schema
 
 SRC, DST, ARCH = "o19_import", "carlos", "o19_archive"
 
@@ -1335,6 +1336,17 @@ class TestAManifestFromBeforeTheConsentRuling(ConsentDriverBase):
 
     ENTRY = CONSENT_UNRANKED
 
+    def assert_no_persistent_writes(self, db):
+        # Capacity admission may use its isolated TEMPORARY probe. Session
+        # setup is permitted, but no persistent data/DDL write may precede
+        # this refusal, including when the same run is resumed.
+        self.assertEqual(
+            [w for w in db.writes
+             if w.startswith(("INSERT", "DELETE", "UPDATE", "CREATE", "DROP",
+                              "TRUNCATE", "RENAME", "ALTER"))
+             and "__o19_twin_probe" not in w], [],
+            "the refusal came after a persistent write")
+
     def test_the_run_is_refused_before_any_write(self):
         db = self.db()
         err = io.StringIO()
@@ -1343,19 +1355,43 @@ class TestAManifestFromBeforeTheConsentRuling(ConsentDriverBase):
             self.run_etl(db=db)
         self.assertIn("does not carry the one-live-record rule",
                       err.getvalue())
-        # the pre-checks' own TEMPORARY probe is the one allowed
-        # statement (etl_precheck_problems); nothing else may run
-        self.assertEqual(
-            [w for w in db.writes
-             if w.startswith(("INSERT", "DELETE", "UPDATE", "CREATE",
-                              "RENAME", "ALTER"))
-             and "__o19_twin_probe" not in w], [],
-            "the refusal came after a write")
+        self.assert_no_persistent_writes(db)
 
     def test_a_resumed_run_is_refused_too(self):
         for _attempt in range(2):
+            db = self.db()
             self.assertIn("does not carry the one-live-record rule",
-                          self.refusal(self.db()))
+                          self.refusal(db))
+            self.assert_no_persistent_writes(db)
+
+
+class _CurrentManifestConsentEntry:
+    """Use the loaded ON/BC entry, never a replacement fixture or source.
+
+    An older application is exercised exactly as shipped. When the feature
+    exists, remove its expression only in this isolated negative-case copy;
+    the feature replay tests separately exercise the supported full entry.
+    """
+
+    PROFILE = "on"
+
+    def setUp(self):
+        manifest = o19manifest.load("o19map-schema")
+        model = manifest if self.PROFILE == "on" else manifest["PROFILES"][self.PROFILE]
+        self.ENTRY = deepcopy(model["TABLES"]["Consent"])
+        if o19etl.consent_live_ranked(self.ENTRY):
+            self.ENTRY.pop("value_exprs")
+        super().setUp()
+
+
+class TestCurrentOnManifestConsentRefusal(
+        _CurrentManifestConsentEntry, TestAManifestFromBeforeTheConsentRuling):
+    PROFILE = "on"
+
+
+class TestCurrentBcManifestConsentRefusal(
+        _CurrentManifestConsentEntry, TestAManifestFromBeforeTheConsentRuling):
+    PROFILE = "bc"
 
 
 class TestAConsentEntryThatIsNotACopy(ConsentDriverBase):

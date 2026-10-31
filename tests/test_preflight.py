@@ -501,6 +501,61 @@ class TestVerdicts(unittest.TestCase):
                           "olis-gone", "dropped-columns",
                           "carry-credentials", "charset-repair"})
 
+    def test_ambiguous_oauth_identifiers_are_not_clearable_by_credential_acceptance(self):
+        report = pf.run_checks(FakeDb(base_tables(ServiceAccessToken=2),
+                               where_counts={("ServiceAccessToken", "oauth_duplicates"): 2}),
+                               properties=clean_props(), accepted=["carry-credentials"])
+        self.assertEqual(report["verdict"], "no-go")
+        finding = next(f for f in report["findings"] if f["id"] == "oauth-ambiguous-ServiceAccessToken")
+        self.assertEqual(finding["data"]["rows"], 2)
+
+    def test_access_tokens_share_the_existing_credential_acknowledgement(self):
+        report = pf.run_checks(FakeDb(base_tables(ServiceClient=1, ServiceAccessToken=3)),
+                               properties=clean_props())
+        carried = [f for f in report["findings"] if f["id"] == "B9-credentials-carried"]
+        self.assertEqual(len(carried), 1)
+        self.assertEqual(carried[0]["data"], {"ServiceClient": 1, "ServiceAccessToken": 3})
+        self.assertEqual(carried[0]["severity"], pf.BLOCKER)
+        self.assertEqual(carried[0]["accept"], "carry-credentials")
+        self.assertEqual(report["verdict"], "go-with-acknowledgements")
+        self.assertIn("carry-credentials", report["required_accepts"])
+        report = pf.run_checks(FakeDb(base_tables(ServiceClient=1, ServiceAccessToken=3)),
+                               properties=clean_props(), accepted=["carry-credentials"])
+        self.assertEqual(report["verdict"], "go")
+
+    def test_orphaned_oauth_grants_cannot_be_accepted_as_carried_credentials(self):
+        for parent, key in (("provider", "provider_no"), ("ServiceClient", "id")):
+            with self.subTest(parent=parent):
+                report = pf.run_checks(FakeDb(
+                    base_tables(ServiceClient=1, ServiceAccessToken=3),
+                    where_counts={("ServiceAccessToken", "oauth_parent.`{0}`".format(key)): 1}),
+                    properties=clean_props(), accepted=["carry-credentials"])
+                orphan = next(f for f in report["findings"] if f["id"] == "oauth-orphan-" + parent)
+                self.assertEqual(orphan["severity"], pf.BLOCKER)
+                self.assertNotIn("accept", orphan)
+                self.assertEqual(orphan["data"], {"rows": 1})
+                self.assertEqual(report["verdict"], "no-go")
+
+    def test_grants_with_an_absent_client_table_cannot_acquire_a_target_client(self):
+        report = pf.run_checks(FakeDb(base_tables(ServiceAccessToken=1)),
+                               properties=clean_props(), accepted=["carry-credentials"])
+        orphan = next(f for f in report["findings"] if f["id"] == "oauth-orphan-ServiceClient")
+        self.assertEqual(orphan["severity"], pf.BLOCKER)
+        self.assertNotIn("accept", orphan)
+        self.assertEqual(orphan["data"], {"rows": 1})
+        self.assertEqual(report["verdict"], "no-go")
+
+    def test_null_oauth_issuance_or_lifetime_is_reported_without_inventing_metadata(self):
+        for field in ("issued", "lifetime"):
+            with self.subTest(field=field):
+                report = pf.run_checks(FakeDb(
+                    base_tables(ServiceClient=1, ServiceAccessToken=2),
+                    where_counts={("ServiceAccessToken", "`{0}` IS NULL".format(field)): 1}),
+                    properties=clean_props(), accepted=["carry-credentials"])
+                malformed = next(f for f in report["findings"] if f["id"] == "oauth-invalid-token-metadata")
+                self.assertEqual(malformed["severity"], pf.ADVISORY)
+                self.assertEqual(malformed["data"], {"rows": 1})
+
     def test_live_credentials_are_a_blocker_cleared_by_sign_off(self):
         report = pf.run_checks(FakeDb(base_tables(ServiceClient=2,
                                                   oscarKeys=1)),

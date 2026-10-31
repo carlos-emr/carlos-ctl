@@ -4,7 +4,8 @@
 host installed from the Debian packages: the deployment check, service
 lifecycle, schema migration and database accounts, certificates, the
 ModSecurity front door, backups and restore drills, and the experimental
-OSCAR 19 clinic import. Every routine job is a `carlos-ctl` verb, run with
+OSCAR 19 clinic import, plus OntarioMD CDS bulk import through CARLOS's
+shared browser/CLI engine. Every routine job is a `carlos-ctl` verb, run with
 `sudo`; `carlos-ctl check` is the one command to remember.
 
 It ships as its own package, `carlos-ctl_<version>_all.deb`, which the
@@ -49,6 +50,56 @@ sudo apt install --no-remove ./carlos-emr_<version>_amd64.deb \
                  ./carlos-emr-drugref_<version>_all.deb \
                  ./carlos-emr-eform-renderer_<version>_all.deb
 ```
+
+## CDS patient-data import
+
+`carlos-ctl cds-import` drives the import engine shipped by a compatible
+CARLOS application, with no clinical interpretation in the Python wrapper.
+The existing web import remains supported. Start with a preflight:
+
+```bash
+sudo carlos-ctl cds-import --input /var/lib/carlos-emr/import/batch.zip \
+  --provider 999998 --source-namespace clinic-source --source-profile omd-5.2 \
+  --dry-run
+```
+
+The source namespace must be a registered vendor/instance, the profile must
+be approved, and the invoking OS operator needs explicit delegation to the
+selected CARLOS provider/program/facility. Root access or a provider number
+alone is insufficient. Merge is off unless `--merge-existing` is supplied;
+ambiguous identity never creates or merges a chart silently. The engine
+enforces the supported migration window, resource admission and allowed
+input roots for both browser and CLI.
+
+Follow the returned opaque run ID with `--status RUN_ID`, `--resume RUN_ID`,
+`--cancel RUN_ID` or `--report RUN_ID`, always with `--provider ID`.
+Existing-run operations do not accept replacement source/options. A failed
+or interrupted command may already have committed clinical units: inspect
+its durable result and resume/reconcile the same run rather than resubmitting
+the source. Counts/progress are console-safe; patient-level diagnostics and
+the required event/error/completeness files remain access-controlled.
+
+If acceptance output is lost after a printed `SUBMISSION` key, use
+`sudo carlos-ctl cds-import --status-submission KEY --provider ID` as the same
+OS operator. This read-only lookup requires matching CARLOS support, rechecks
+current delegation, and returns only that operator/provider's accepted run.
+An unknown outcome exits 4; retain the original source and submission evidence
+and reconcile before any new submission. A status exit 0 confirms the query;
+check the returned import outcome before treating the data as complete.
+
+The wrapper refuses incompatible engine protocols and unsupported JVMs
+before execution. Java's actual properties loader supplies the launch budget
+through the capability response; Python does not reinterpret property syntax.
+Its heap comes from `cds.import.cliHeapMiB` in production
+`carlos.properties` (default 512 MiB, allowed 128–16384); this is a configurable
+process budget, not proof that every dataset fits that heap. The engine's
+shared admission also accounts for memory/connection/disk use.
+The wrapper attests the exact request in a short-lived root-owned file;
+CARLOS verifies it independently instead of trusting an operator-name
+environment variable. The root supervisor relays signals, streams output
+without capture and retires its own attestation after the engine exits.
+See [the operator reference](docs/carlos-ctl.md#cds-import) and
+`carlos-ctl cds-import --help` for flags and exit semantics.
 
 ## Development
 

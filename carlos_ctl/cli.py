@@ -57,6 +57,11 @@ _USAGE = """carlos-ctl — administration for a CARLOS EMR host
                                   (refuses on any database with patients;
                                   NEVER for production systems)
 
+  carlos-ctl cds-import           bulk OntarioMD CDS XML/ZIP/directory import
+                                  through the shared web/CLI engine; --help
+                                  includes dry run, opt-in merge and durable
+                                  status/resume/cancel/report operations
+
   carlos-ctl cert status          what certificate is being served
   carlos-ctl cert selfsigned      (re)generate the self-signed certificate
   carlos-ctl cert acme <email>    switch to a Let's Encrypt certificate
@@ -260,6 +265,12 @@ def _cmd_o19_preflight(argv) -> int:
     return _o19import().cmd_o19_preflight(argv)
 
 
+def _cmd_cds_import(argv) -> int:
+    # Keep CDS parser/probe setup out of unrelated administration commands.
+    from . import cdsimport
+    return cdsimport.cmd_cds_import(argv)
+
+
 _VERBS = {
     "check": validate.cmd_check,
     "finish-install": provision.cmd_finish_install,
@@ -275,6 +286,7 @@ _VERBS = {
     "db-repair": dbops.make_flyway_cmd("repair"),
     "db-apply-settings": dbops.cmd_db_apply_settings,
     "demo-data": dbops.cmd_demo_data,
+    "cds-import": _cmd_cds_import,
     "cert": _cmd_cert,
     "cert-renew": _cmd_cert_renew,
     "waf": waf.cmd_waf,
@@ -358,7 +370,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     # lives behind that package's files (import-o19 builds its parser
     # after loading the manifests carlos-emr ships, cert and backup are
     # the package's helper scripts) and would fail instead of helping.
-    if rest in (["-h"], ["--help"], ["help"]):
+    if verb == "cds-import":
+        # This parser is shipped by the CLI, not the application. It answers
+        # full help without an installed WAR, validates arguments first, and
+        # maps missing/incompatible deployment to its documented runtime exit 2.
+        pass
+    elif rest in (["-h"], ["--help"], ["help"]):
         if not util.carlos_emr_installed():
             print(f"usage:\n{_verb_usage(verb)}\n\n"
                   f"(carlos-emr is not installed on this host; the full "

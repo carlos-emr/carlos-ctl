@@ -290,3 +290,135 @@ class TestCopyMariaDB(unittest.TestCase):
             self.copy()
         self.assertEqual(self.plain("SELECT id FROM `{0}`.sample".format(self.dst)), [["9"]])
         self.assertFalse(self.state.get("done", False))
+
+
+@unittest.skipUnless(os.environ.get("CARLOS_TEST_MARIADB_SOCKET") and shutil.which("mariadb"),
+                     "set CARLOS_TEST_MARIADB_SOCKET to run live OAuth migration checks")
+class TestOAuthGrantMariaDB(unittest.TestCase):
+    def setUp(self):
+        self.base = ["mariadb", "--no-defaults", "--protocol=socket", "--user=root",
+                     "--socket=" + os.environ["CARLOS_TEST_MARIADB_SOCKET"]]
+        name = "carlos_oauth_test_" + uuid.uuid4().hex
+        self.src, self.dst = name + "_src", name + "_dst"
+        for schema in (self.src, self.dst):
+            self.plain("CREATE DATABASE `{0}`".format(schema))
+            self.addCleanup(self.plain, "DROP DATABASE `{0}`".format(schema))
+            self.plain("CREATE TABLE `{0}`.ServiceClient (id INT PRIMARY KEY, name VARCHAR(255), "
+                       "clientKey VARCHAR(255), clientSecret VARCHAR(255), uri VARCHAR(255), "
+                       "dateCreated TIMESTAMP NULL, lifetime INT NULL)".format(schema))
+            self.plain("CREATE TABLE `{0}`.ServiceAccessToken (id INT PRIMARY KEY, clientId INT, "
+                       "tokenId VARCHAR(255), tokenSecret VARCHAR(255), issued INT, lifetime INT, "
+                       "providerNo VARCHAR(25), scopes VARCHAR(255), dateCreated TIMESTAMP NULL)".format(schema))
+        self.ledger = tempfile.TemporaryDirectory(prefix="oauth-import-test-")
+        self.addCleanup(self.ledger.cleanup)
+        self.run = SimpleNamespace(query=o19import.make_etl_query(self.base, statement_timeout=10),
+            plain=self.plain, src=self.src, dst=self.dst, arch=self.dst,
+            state_dir=self.ledger.name, progress={"tables": {}}, counts={"copy": 0},
+            seed_group=set(), admin_user="unused", admin_pn=None)
+        self.plain("INSERT INTO `{0}`.ServiceClient VALUES "
+                   "(7,'fixture','fixture-o19-consumer','fixture-o19-consumer-secret',"
+                   "'https://integration.example/callback','2019-02-12 19:33:20',-1)".format(self.src))
+        self.plain("INSERT INTO `{0}`.ServiceAccessToken VALUES "
+                   "(1,7,'fixture-o19-token','fixture-o19-token-secret',1550000000,-1,'999998','demographics.read',NULL),"
+                   "(2,7,'fixture-finite','fixture-finite-secret',1550000000,86400,'999998','demographics.read',NULL),"
+                   "(3,7,'fixture-expired','fixture-expired-secret',1,1,'999998','',NULL)".format(self.src))
+
+    def plain(self, sql):
+        cp = subprocess.run(self.base + ["--batch", "--skip-column-names"], input=sql,
+                            text=True, capture_output=True, check=True, timeout=20)
+        return o19import.batch_rows(cp.stdout)
+
+    def copy(self, table):
+        from carlos_ctl import o19map_schema
+        entry = o19map_schema.TABLES[table]
+        self.assertEqual(entry["class"], "copy")
+        source = o19etl.introspect_columns(self.plain, self.src)[table]
+        entry, _ = o19etl.effective_entry(table, entry, source)
+        target = o19etl.introspect_columns(self.plain, self.dst)[table]
+        state = self.run.progress["tables"].setdefault(table, {})
+        o19etl.etl_copy_table(self.run, table, entry, state, target, set())
+
+    def test_should_preserve_credentials_ownership_scopes_and_original_expiry(self):
+        self.copy("ServiceClient")
+        self.copy("ServiceAccessToken")
+        fields = "id,clientId,HEX(tokenId),HEX(tokenSecret),issued,lifetime,providerNo,HEX(scopes)"
+        self.assertEqual(self.plain("SELECT {0} FROM `{1}`.ServiceAccessToken ORDER BY id".format(fields,self.src)),
+                         self.plain("SELECT {0} FROM `{1}`.ServiceAccessToken ORDER BY id".format(fields,self.dst)))
+        self.assertEqual(self.plain("SELECT HEX(clientKey),HEX(clientSecret),lifetime FROM `{0}`.ServiceClient".format(self.src)),
+                         self.plain("SELECT HEX(clientKey),HEX(clientSecret),lifetime FROM `{0}`.ServiceClient".format(self.dst)))
+        self.copy("ServiceAccessToken")
+        self.assertEqual(self.plain("SELECT COUNT(*) FROM `{0}`.ServiceAccessToken".format(self.dst)), [["3"]])
+
+    def test_should_resume_an_unconfirmed_token_copy_without_duplicate_grants(self):
+        self.copy("ServiceClient")
+        self.copy("ServiceAccessToken")
+        self.run.progress["tables"]["ServiceAccessToken"].pop("done")
+        # An interrupted destination must be repaired, not merely left alone.
+        self.plain("DELETE FROM `{0}`.ServiceAccessToken WHERE id=2".format(self.dst))
+        self.plain("UPDATE `{0}`.ServiceAccessToken SET tokenSecret='damaged',issued=1 WHERE id=1".format(self.dst))
+        self.copy("ServiceAccessToken")
+        self.assertEqual(self.plain("SELECT COUNT(*) FROM `{0}`.ServiceAccessToken".format(self.dst)), [["3"]])
+        self.assertEqual(self.plain("SELECT issued,lifetime FROM `{0}`.ServiceAccessToken WHERE id=1".format(self.dst)),
+                         [["1550000000", "-1"]])
+        fields = "id,clientId,HEX(tokenId),HEX(tokenSecret),issued,lifetime,providerNo,HEX(scopes)"
+        self.assertEqual(self.plain("SELECT {0} FROM `{1}`.ServiceAccessToken ORDER BY id".format(fields,self.src)),
+                         self.plain("SELECT {0} FROM `{1}`.ServiceAccessToken ORDER BY id".format(fields,self.dst)))
+
+    def test_should_use_minus_one_only_when_the_old_source_column_is_absent(self):
+        self.plain("ALTER TABLE `{0}`.ServiceClient DROP COLUMN lifetime".format(self.src))
+        self.copy("ServiceClient")
+        self.assertEqual(self.plain("SELECT lifetime FROM `{0}`.ServiceClient".format(self.dst)), [["-1"]])
+
+    def test_should_preserve_a_present_null_setting_instead_of_inventing_a_default(self):
+        self.plain("UPDATE `{0}`.ServiceClient SET lifetime=NULL".format(self.src))
+        self.copy("ServiceClient")
+        self.assertEqual(self.plain("SELECT lifetime IS NULL FROM `{0}`.ServiceClient".format(self.dst)), [["1"]])
+
+    def test_should_detect_target_collation_ambiguity_without_disclosing_credentials(self):
+        from carlos_ctl import o19_preflight as pf
+        checks = []
+        # The subquery runs in the staged database, just as standalone preflight does.
+        def staged_count(table, where=None):
+            return int(self.plain("USE `{0}`; SELECT COUNT(*) FROM `{1}` WHERE {2}".format(self.src,table,where or "1=1"))[0][0])
+        self.plain("INSERT INTO `{0}`.ServiceAccessToken SELECT 4,clientId,UPPER(tokenId),tokenSecret,issued,lifetime,providerNo,scopes,dateCreated "
+                   "FROM `{0}`.ServiceAccessToken WHERE id=1".format(self.src))
+        pf.check_oauth_grants(SimpleNamespace(tables={"ServiceClient":"ServiceClient", "ServiceAccessToken":"ServiceAccessToken"},
+                                             count_live=staged_count, findings=checks))
+        self.assertTrue(any(f["id"] == "oauth-ambiguous-ServiceAccessToken" for f in checks))
+        self.assertNotIn("fixture-o19-token", str(checks))
+
+    def test_should_block_an_orphaned_grant_before_a_migration_admin_reuses_its_provider_number(self):
+        from carlos_ctl import o19_preflight as pf
+        for schema in (self.src, self.dst):
+            self.plain("CREATE TABLE `{0}`.provider (provider_no VARCHAR(25) PRIMARY KEY)".format(schema))
+        self.plain("INSERT INTO `{0}`.provider VALUES ('42')".format(self.src))
+        next_admin = self.plain("SELECT MAX(CAST(provider_no AS SIGNED))+1 FROM `{0}`.provider".format(self.src))[0][0]
+        self.assertEqual(next_admin, "43")
+        self.plain("INSERT INTO `{0}`.provider VALUES ('43')".format(self.dst))
+        self.plain("UPDATE `{0}`.ServiceAccessToken SET providerNo='43'".format(self.src))
+        checks = []
+        def staged_count(table, where=None):
+            return int(self.plain("USE `{0}`; SELECT COUNT(*) FROM `{1}` WHERE {2}".format(self.src,table,where or "1=1"))[0][0])
+        pf.check_oauth_grants(SimpleNamespace(
+            tables={"ServiceClient":"ServiceClient", "ServiceAccessToken":"ServiceAccessToken", "provider":"provider"},
+            count_live=staged_count, findings=checks))
+        orphan = next(f for f in checks if f["id"] == "oauth-orphan-provider")
+        self.assertEqual(orphan["severity"], pf.BLOCKER)
+        self.assertNotIn("accept", orphan)
+        self.assertEqual(orphan["data"], {"rows": 3})
+        self.assertNotIn("fixture-o19-token", str(checks))
+
+    def test_should_report_null_issuance_and_lifetime_without_rewriting_credentials(self):
+        from carlos_ctl import o19_preflight as pf
+        self.plain("UPDATE `{0}`.ServiceAccessToken SET issued=NULL WHERE id=1".format(self.src))
+        self.plain("UPDATE `{0}`.ServiceAccessToken SET lifetime=NULL WHERE id=2".format(self.src))
+        checks = []
+        def staged_count(table, where=None):
+            return int(self.plain("USE `{0}`; SELECT COUNT(*) FROM `{1}` WHERE {2}".format(self.src,table,where or "1=1"))[0][0])
+        pf.check_oauth_grants(SimpleNamespace(
+            tables={"ServiceClient":"ServiceClient", "ServiceAccessToken":"ServiceAccessToken"},
+            count_live=staged_count, findings=checks))
+        malformed = next(f for f in checks if f["id"] == "oauth-invalid-token-metadata")
+        self.assertEqual(malformed["severity"], pf.ADVISORY)
+        self.assertEqual(malformed["data"], {"rows": 2})
+        self.assertNotIn("fixture-o19-token", str(checks))

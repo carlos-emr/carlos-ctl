@@ -6,6 +6,7 @@ __pycache__/
 /debian/files
 /debian/*.substvars
 /debian/*.debhelper.log
+/debian/*.debhelper
 /.mypy_cache/
 /.ruff_cache/
 /.pytest_cache/
