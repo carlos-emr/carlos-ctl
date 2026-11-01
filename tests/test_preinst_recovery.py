@@ -2,6 +2,7 @@
 """Exercise the code embedded in preinst before the package is unpacked."""
 import fcntl
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -37,12 +38,48 @@ class TestInstallRecovery(unittest.TestCase):
         self.assertTrue(self.allowed())
 
     def test_table_or_admin_write_is_refused(self):
+        """A table mark or created administrator makes package replacement unsafe."""
         for data in ({'tables': {'Consent': {'started': True}}},
                      {'tables': {}, 'admin_provider_no': '1'}, {'tables': []}):
             (self.directory / 'etl-progress.json').write_text(json.dumps(data))
             self.assertFalse(self.allowed())
 
+    def test_unknown_or_malformed_phases_fail_closed(self):
+        """Future or corrupted phases cannot be interpreted as a stopped import."""
+        for phases in ({'future-copy': {'status': 'done'}},
+                       {'backup': None}, {'stage': []}, {'preflight': 'done'},
+                       {'stage': {}}, {'stage': {'status': 'unknown'}}):
+            with self.subTest(phases=phases):
+                self.state['phases'] = phases
+                self.write_state()
+                self.assertFalse(self.allowed())
+
+    def test_nonregular_locks_are_refused_before_fork(self):
+        """FIFO and symlink paths must neither block nor redirect exclusion."""
+        for path in (self.directory.parent / '.finish-install.lock', self.directory / '.lock'):
+            for kind in ('fifo', 'symlink'):
+                with self.subTest(path=path.name, kind=kind):
+                    if path.exists():
+                        path.unlink()
+                    target = self.directory.parent / 'lock-target'
+                    target.write_text('unchanged')
+                    if kind == 'fifo':
+                        os.mkfifo(path)
+                    else:
+                        path.symlink_to(target)
+                    try:
+                        with mock.patch.dict(SCOPE, {'dpkg_identity': lambda _: 'fixed'}), \
+                                mock.patch.object(SCOPE['sys'], 'argv', ['preinst', str(self.directory / 'state.json'), '1']), \
+                                mock.patch.object(SCOPE['os'], 'fork') as fork:
+                            with self.assertRaises((OSError, ValueError)):
+                                SCOPE['main']()
+                            fork.assert_not_called()
+                        self.assertEqual(target.read_text(), 'unchanged')
+                    finally:
+                        path.unlink()
+
     def test_later_phases_cleanup_and_unbound_state_are_refused(self):
+        """Only a recognized pre-copy ledger with package bindings is eligible."""
         for phase in ('etl', 'documents', 'props', 'verify'):
             self.state['phases'][phase] = {'status': 'failed'}
             self.write_state()

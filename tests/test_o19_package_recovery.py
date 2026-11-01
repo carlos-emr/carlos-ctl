@@ -14,6 +14,7 @@ from carlos_ctl import o19etl, o19import, schema_contract
 
 
 def metadata(kind="varchar(30)"):
+    """Build a minimal physical contract with a variable capacity under test."""
     result = {name: [] for name in schema_contract.FIELDS}
     result["columns"] = [["favorites", "BN", kind, "YES", "NULL", "",
                           "utf8mb4", "utf8mb4_general_ci", "", 2]]
@@ -21,6 +22,19 @@ def metadata(kind="varchar(30)"):
 
 
 class TestWideningTransition(unittest.TestCase):
+    def test_character_to_byte_capacity_uses_the_existing_character_set(self):
+        """Admit only transitions large enough for that charset's worst case."""
+        for charset, accepted in (("ascii", True), ("latin1", True),
+                                  ("cp1251", True), ("ucs2", True),
+                                  ("utf8mb3", True), ("utf8mb4", False),
+                                  ("unknown_charset", False)):
+            with self.subTest(charset=charset):
+                before, after = metadata("varchar(20000)"), metadata("text")
+                for data in (before, after):
+                    data["columns"][0][6:8] = [charset, charset + "_bin"]
+                self.assertEqual(schema_contract.widening_columns(after, before),
+                                 ["favorites.BN"] if accepted else [])
+
     def test_accepts_only_capacity_growth_with_other_attributes_identical(self):
         self.assertEqual(schema_contract.widening_columns(
             metadata("varchar(255)"), metadata()), ["favorites.BN"])
@@ -30,6 +44,7 @@ class TestWideningTransition(unittest.TestCase):
             metadata("mediumtext"), metadata("varchar(65535)")), ["favorites.BN"])
 
     def test_rejects_shrinking_and_unrelated_schema_drift(self):
+        """Only growth with identical surrounding metadata is eligible for recovery."""
         for wanted in ("varchar(20)", "int", "varbinary(255)"):
             self.assertEqual(schema_contract.widening_columns(
                 metadata(wanted), metadata()), [])
@@ -102,6 +117,7 @@ class TestPreCopyRecovery(unittest.TestCase):
         self.assertEqual(self.ctx["state"]["inputs"]["target_contract_sha256"], "old")
 
     def test_backup_and_migrate_only_after_pristine_checks(self):
+        """Establish pristine data before backup and schema writes."""
         calls = []
         with mock.patch.object(o19import, "gather_copy_counts", return_value={}), \
                 mock.patch.object(o19import, "startup_row_counts", return_value={}), \

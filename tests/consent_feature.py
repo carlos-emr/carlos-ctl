@@ -116,6 +116,7 @@ def _manifest(root, overlay):
 
 
 def _migration(root):
+    """Recognize the single audited Consent migration by its structural rules."""
     directory = root / "database/mysql/migration/common"
     found = sorted(p for p in directory.iterdir()
                    if p.name.endswith("one_live_consent_per_type.sql"))

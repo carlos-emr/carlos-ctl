@@ -210,6 +210,7 @@ class TestO19Compatibility(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("CARLOS_SRC"), "set CARLOS_SRC to test the packaged Consent migration")
     def test_consent_upgrade_preserves_rows_audits_flags_and_is_repeatable(self):
+        """Replay the migration twice and verify every flag and audit attribution."""
         migration = next((Path(os.environ["CARLOS_SRC"]) / "database/mysql/migration/common").glob(
             "*__one_live_consent_per_type.sql")).read_text()
         self.q("CREATE TABLE `{0}`.Consent(id INT PRIMARY KEY, demographic_no INT, consent_type_id INT, "
@@ -221,19 +222,21 @@ class TestO19Compatibility(unittest.TestCase):
                "(7,104,1,0,0,0,NULL),(8,104,1,0,0,0,NULL)".format(self.dst))
         for attempt in range(2):
             self.q("USE `{0}`; ".format(self.dst) + migration)
-            self.assertEqual(self.q("SELECT id FROM `{0}`.Consent WHERE deleted=0 ORDER BY id".format(self.dst)),
-                             [["2"], ["6"], ["8"]])
+            self.assertEqual(self.q("SELECT id,deleted FROM `{0}`.Consent ORDER BY id".format(self.dst)),
+                             [["1", "1"], ["2", "0"], ["3", "1"], ["4", "1"],
+                              ["5", "1"], ["6", "0"], ["7", "1"], ["8", "0"]])
             self.assertEqual(self.q("SELECT COUNT(*) FROM `{0}`.Consent".format(self.dst)), [["8"]])
             self.assertEqual(self.q("SELECT consent_id,reason FROM `{0}`.Consent_migration_audit ORDER BY consent_id".format(self.dst)),
                              [["1", "duplicate_retired"], ["4", "null_flag"], ["5", "null_flag"],
                               ["6", "null_flag"], ["7", "duplicate_retired"]])
-        self.assertEqual(self.q("SELECT COUNT(*) FROM `{0}`.Consent_migration_audit WHERE lastUpdateUser <> 'system' OR lastUpdateDate IS NULL".format(self.dst)), [["0"]])
+        self.assertEqual(self.q("SELECT COUNT(*) FROM `{0}`.Consent_migration_audit WHERE lastUpdateUser IS NULL OR lastUpdateUser <> 'system' OR lastUpdateDate IS NULL".format(self.dst)), [["0"]])
         with self.assertRaises(subprocess.CalledProcessError):
             self.q("INSERT INTO `{0}`.Consent(id,demographic_no,consent_type_id,deleted) VALUES(9,100,1,0)".format(self.dst))
 
     @unittest.skipUnless(os.environ.get("CARLOS_TEST_O19_REFERENCE_DB"),
                          "set CARLOS_TEST_O19_REFERENCE_DB to a freshly migrated CARLOS database")
     def test_migrated_capacity_preserves_long_values_through_real_etl(self):
+        """Copy oversized legacy values through actual SQL into migrated columns."""
         reference = os.environ["CARLOS_TEST_O19_REFERENCE_DB"]
         self.assertRegex(reference, r"^[A-Za-z0-9_]+$")
         cases = (("demographic", "sourceOfIncome", "VARCHAR(255)", "REPEAT('guardian details ',8)"),

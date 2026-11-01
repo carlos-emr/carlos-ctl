@@ -13,6 +13,17 @@ from pathlib import Path
 
 FORMAT = 2
 
+# MariaDB information_schema.CHARACTER_SETS.MAXLEN, plus MySQL's gb18030.
+# An unknown charset cannot prove a character-to-byte capacity transition.
+CHARSET_MAX_BYTES = {
+    **dict.fromkeys("armscii8 ascii binary cp1250 cp1251 cp1256 cp1257 cp850 cp852 cp866 "
+                    "dec8 geostd8 greek hebrew hp8 keybcs2 koi8r koi8u latin1 latin2 latin5 "
+                    "latin7 macce macroman swe7 tis620".split(), 1),
+    **dict.fromkeys("big5 cp932 euckr gb2312 gbk sjis ucs2".split(), 2),
+    **dict.fromkeys("eucjpms ujis utf8 utf8mb3".split(), 3),
+    **dict.fromkeys("gb18030 utf16 utf16le utf32 utf8mb4".split(), 4),
+}
+
 FIELDS = {
     "defaults": ("SCHEMATA", ["SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME"], "1=1"),
     "tables": ("TABLES", ["TABLE_NAME", "ENGINE", "ROW_FORMAT", "TABLE_COLLATION"], "TABLE_TYPE = 'BASE TABLE'"),
@@ -113,6 +124,7 @@ def widening_columns(expected, actual):
     binary = {k.replace("text", "blob"): v for k, v in text.items()}
 
     def capacity(decl):
+        """Return the storage family, size and whether that size counts bytes."""
         sized = re.fullmatch(r"(var)?(char|binary)\((\d+)\)", decl.lower())
         if sized:
             return sized.group(2), int(sized.group(3)), False
@@ -137,7 +149,10 @@ def widening_columns(expected, actual):
             continue  # fixed/variable padding semantics are not a widening
         required = before[1]
         if after[2] and not before[2] and before[0] == "char":
-            required *= 4
+            width = CHARSET_MAX_BYTES.get((row[6] or "").lower())
+            if width is None:
+                continue
+            required *= width
         if not after[2] and before[2] or after[1] < required:
             continue
         row[2] = want[2]
