@@ -13122,7 +13122,8 @@
    "passwordUpdateDate",
    "pinUpdateDate",
    "lastUpdateUser",
-   "lastUpdateDate"
+   "lastUpdateDate",
+   "usingMfa"
   ],
   "ServiceAccessToken": [
    "id",
@@ -14263,7 +14264,8 @@
    "key_val",
    "value",
    "date_time",
-   "hidden"
+   "hidden",
+   "dashboard_single_value_key"
   ],
   "demographicExtArchive": [
    "id",
@@ -43177,7 +43179,8 @@
      "passwordUpdateDate",
      "pinUpdateDate",
      "lastUpdateUser",
-     "lastUpdateDate"
+     "lastUpdateDate",
+     "usingMfa"
     ],
     "ServiceAccessToken": [
      "id",
@@ -44283,7 +44286,8 @@
      "key_val",
      "value",
      "date_time",
-     "hidden"
+     "hidden",
+     "dashboard_single_value_key"
     ],
     "demographicExtArchive": [
      "id",

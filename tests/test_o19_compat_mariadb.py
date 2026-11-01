@@ -227,6 +227,7 @@ class TestO19Compatibility(unittest.TestCase):
             self.assertEqual(self.q("SELECT consent_id,reason FROM `{0}`.Consent_migration_audit ORDER BY consent_id".format(self.dst)),
                              [["1", "duplicate_retired"], ["4", "null_flag"], ["5", "null_flag"],
                               ["6", "null_flag"], ["7", "duplicate_retired"]])
+        self.assertEqual(self.q("SELECT COUNT(*) FROM `{0}`.Consent_migration_audit WHERE lastUpdateUser <> 'system' OR lastUpdateDate IS NULL".format(self.dst)), [["0"]])
         with self.assertRaises(subprocess.CalledProcessError):
             self.q("INSERT INTO `{0}`.Consent(id,demographic_no,consent_type_id,deleted) VALUES(9,100,1,0)".format(self.dst))
 
@@ -239,6 +240,7 @@ class TestO19Compatibility(unittest.TestCase):
                  ("favorites", "BN", "VARCHAR(255)", "REPEAT('B',255)"),
                  ("property", "value", "VARCHAR(4000)", "REPEAT('P',3974)"),
                  ("demographic", "previousAddress", "VARCHAR(255)", "REPEAT('A',255)"),
+                 ("formMentalHealthForm1", "datetimeOfDetention", "VARCHAR(50)", "REPEAT('D',50)"),
                  ("pharmacyInfo", "city", "VARCHAR(255)", "REPEAT('C',255)"),
                  ("pharmacyInfo", "notes", "TEXT", "REPEAT(CONVERT(0xE9 USING latin1),50000)"),
                  ("admission", "admission_notes", "TEXT", "REPEAT(CONVERT(0xE9 USING latin1),50000)"))
