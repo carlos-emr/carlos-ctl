@@ -1823,7 +1823,11 @@ def run_p2(ctx) -> Dict:
         accepted=ctx["accepted"], schema_map=o19map_schema,
         db_name=STAGING_SCHEMA)
     consent = o19map_schema.TABLES.get(o19etl.CONSENT_TABLE)
-    if consent and not o19etl.consent_live_ranked(consent):
+    staged_tables = o19etl.schema_tables(query, STAGING_SCHEMA)
+    has_consent = any(name.lower() == o19etl.CONSENT_TABLE.lower()
+                      for name in staged_tables)
+    if (has_consent and (not consent or consent.get("class") != "copy"
+                         or not o19etl.consent_live_ranked(consent))):
         report["findings"].append(o19_preflight.finding(
             "consent-package-contract", o19_preflight.BLOCKER,
             "the installed application manifest lacks the Consent import rule",
