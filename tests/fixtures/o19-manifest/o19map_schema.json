@@ -2,7 +2,7 @@
  "format": 1,
  "kind": "o19map-schema",
  "generator": "scripts/migration/o19/generate_manifests.py",
- "SCHEMA_MAP_VERSION": "o19map-5+9e7bc615",
+ "SCHEMA_MAP_VERSION": "o19map-6+cccc8801",
  "O19_PROFILE": "on",
  "O19_SOURCE_COMMIT": "a7900d569d3faf741993e5e1da8c14021bbefede",
  "TABLES": {
@@ -98,8 +98,8 @@
     "deleted"
    ],
    "value_exprs": {
-    "optout": "IFNULL(s.`optout`, 1)",
-    "deleted": "IFNULL((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
+    "optout": "COALESCE(s.`optout`, 1)",
+    "deleted": "COALESCE((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
    },
    "fk_remap": {
     "consent_type_id": "consentType"
@@ -13122,8 +13122,7 @@
    "passwordUpdateDate",
    "pinUpdateDate",
    "lastUpdateUser",
-   "lastUpdateDate",
-   "usingMfa"
+   "lastUpdateDate"
   ],
   "ServiceAccessToken": [
    "id",
@@ -14193,7 +14192,9 @@
    "pronoun",
    "pronounId",
    "gender",
-   "pref_name"
+   "pref_name",
+   "cds_identity_hin",
+   "cds_identity_issuer"
   ],
   "demographicArchive": [
    "id",
@@ -14262,8 +14263,7 @@
    "key_val",
    "value",
    "date_time",
-   "hidden",
-   "dashboard_single_value_key"
+   "hidden"
   ],
   "demographicExtArchive": [
    "id",
@@ -14395,7 +14395,8 @@
    "abnormal",
    "receivedDate",
    "report_media",
-   "sent_date_time"
+   "sent_date_time",
+   "cds_content_precision"
   ],
   "document_storage": [
    "id",
@@ -14477,7 +14478,10 @@
    "demographic_contact_id",
    "protocol",
    "priorRxProtocol",
-   "pharmacyId"
+   "pharmacyId",
+   "cds_currentness",
+   "cds_dose_text",
+   "cds_projection_incomplete"
   ],
   "dsGuidelineProviderMap": [
    "mapid",
@@ -22984,8 +22988,8 @@
   "scheduleholiday": 28,
   "scheduletemplate": 1,
   "scheduletemplatecode": 23,
-  "secObjPrivilege": 548,
-  "secObjectName": 140,
+  "secObjPrivilege": 514,
+  "secObjectName": 133,
   "secRole": 33,
   "secUserRole": 2,
   "security": 1,
@@ -23410,7 +23414,6 @@
    "archived",
    "custom_instructions",
    "hide_cpp",
-   "nosubs",
    "prn",
    "start_date_unknown",
    "takemax",
@@ -24765,7 +24768,7 @@
  },
  "PROFILES": {
   "bc": {
-   "SCHEMA_MAP_VERSION": "o19map-5+ccf44f43",
+   "SCHEMA_MAP_VERSION": "o19map-6+1aac654d",
    "O19_PROFILE": "bc",
    "TABLES": {
     "AppDefinition": {
@@ -24860,8 +24863,8 @@
       "deleted"
      ],
      "value_exprs": {
-      "optout": "IFNULL(s.`optout`, 1)",
-      "deleted": "IFNULL((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
+      "optout": "COALESCE(s.`optout`, 1)",
+      "deleted": "COALESCE((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
      },
      "fk_remap": {
       "consent_type_id": "consentType"
@@ -43178,8 +43181,7 @@
      "passwordUpdateDate",
      "pinUpdateDate",
      "lastUpdateUser",
-     "lastUpdateDate",
-     "usingMfa"
+     "lastUpdateDate"
     ],
     "ServiceAccessToken": [
      "id",
@@ -44214,7 +44216,9 @@
      "pronoun",
      "pronounId",
      "gender",
-     "pref_name"
+     "pref_name",
+     "cds_identity_hin",
+     "cds_identity_issuer"
     ],
     "demographicArchive": [
      "id",
@@ -44283,8 +44287,7 @@
      "key_val",
      "value",
      "date_time",
-     "hidden",
-     "dashboard_single_value_key"
+     "hidden"
     ],
     "demographicExtArchive": [
      "id",
@@ -44416,7 +44419,8 @@
      "abnormal",
      "receivedDate",
      "report_media",
-     "sent_date_time"
+     "sent_date_time",
+     "cds_content_precision"
     ],
     "document_storage": [
      "id",
@@ -44498,7 +44502,10 @@
      "demographic_contact_id",
      "protocol",
      "priorRxProtocol",
-     "pharmacyId"
+     "pharmacyId",
+     "cds_currentness",
+     "cds_dose_text",
+     "cds_projection_incomplete"
     ],
     "dsGuidelineProviderMap": [
      "mapid",
@@ -57395,8 +57402,8 @@
     "scheduleholiday": 28,
     "scheduletemplate": 1,
     "scheduletemplatecode": 23,
-    "secObjPrivilege": 550,
-    "secObjectName": 141,
+    "secObjPrivilege": 516,
+    "secObjectName": 134,
     "secRole": 33,
     "secUserRole": 2,
     "security": 1,
@@ -57636,7 +57643,6 @@
      "archived",
      "custom_instructions",
      "hide_cpp",
-     "nosubs",
      "prn",
      "start_date_unknown",
      "takemax",

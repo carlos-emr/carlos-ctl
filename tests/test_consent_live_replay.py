@@ -439,6 +439,16 @@ class TestADumpWithoutDeleted(ConsentReplayBase):
         self.assertCounts(duplicate=0, undecided=1)
 
 
+class TestADumpWithoutOptout(ConsentReplayBase):
+
+    SOURCE_LACKS = ("optout",)
+
+    def test_missing_decision_retires_every_row_and_preserves_history(self):
+        self.assertEqual(self.imported(row(1), row(2)),
+                         [(1, 1, 1, 0), (2, 1, 1, 0)])
+        self.assertEqual(self.mismatches(), 0)
+
+
 class TestADumpWithoutExplicit(ConsentReplayBase):
 
     SOURCE_LACKS = ("explicit",)

@@ -3118,7 +3118,7 @@ class TestConsentLiveHelper(unittest.TestCase):
     def test_the_counts_read_the_dumps_deleted_column_when_it_has_one(
             self):
         counts = dict(o19etl.consent_live_count_sql(
-            "src", "arch", {"id": {}, "deleted": {}}))
+            "src", "arch", {"id": {}, "deleted": {}, "optout": {}}))
         self.assertEqual(
             counts["duplicate"],
             "SELECT COUNT(*) FROM `src`.`Consent` s JOIN "

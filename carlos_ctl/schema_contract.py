@@ -8,6 +8,7 @@ column/index/constraint definitions are compared, not just their names.
 """
 import hashlib
 import json
+import re
 from pathlib import Path
 
 FORMAT = 2
@@ -99,6 +100,49 @@ def differences(expected, actual):
             problems.append("{0}: unexpected definition for {1}{2}".format(
                 kind, value[0], "." + str(value[1]) if len(value) > 1 and kind != "tables" else ""))
     return problems
+
+
+def widening_columns(expected, actual):
+    """Columns explained entirely by a lossless text/binary widening.
+
+    No values are scanned. Every other metadata attribute must match;
+    this is used only to recover an import that has never copied rows.
+    """
+    text = {"tinytext": 255, "text": 65535,
+            "mediumtext": 16777215, "longtext": 4294967295}
+    binary = {k.replace("text", "blob"): v for k, v in text.items()}
+
+    def capacity(decl):
+        sized = re.fullmatch(r"(var)?(char|binary)\((\d+)\)", decl.lower())
+        if sized:
+            return sized.group(2), int(sized.group(3)), False
+        if decl.lower() in text:
+            return "char", text[decl.lower()], True
+        if decl.lower() in binary:
+            return "binary", binary[decl.lower()], True
+        return None
+
+    adjusted = dict(actual, columns=[list(row) for row in actual["columns"]])
+    wanted = {(row[0], row[1]): row for row in expected["columns"]}
+    changed = []
+    for row in adjusted["columns"]:
+        want = wanted.get((row[0], row[1]))
+        if not want or row[2] == want[2]:
+            continue
+        before, after = capacity(row[2]), capacity(want[2])
+        if not before or not after or before[0] != after[0]:
+            continue
+        if (not before[2] and not after[2]
+                and row[2].split("(", 1)[0] != want[2].split("(", 1)[0]):
+            continue  # fixed/variable padding semantics are not a widening
+        required = before[1]
+        if after[2] and not before[2] and before[0] == "char":
+            required *= 4
+        if not after[2] and before[2] or after[1] < required:
+            continue
+        row[2] = want[2]
+        changed.append(row[0] + "." + row[1])
+    return changed if not differences(expected, adjusted) else []
 
 
 def foreign_key_violations(query, schema, metadata=None):
