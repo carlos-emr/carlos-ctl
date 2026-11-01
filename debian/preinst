@@ -10,9 +10,9 @@
 # the predicate is carlos-emr's own guard, the one its service unit and
 # postinst consult (carlos-emr-o19-guard): ONE predicate, so this cannot
 # disagree with them. Fails CLOSED: a ledger that exists but cannot be
-# judged (no guard on the host, or the guard cannot read it) counts as an
-# import in progress. The remedy is to finish or clean up the import, then
-# retry the install.
+# judged counts as an import in progress. An inactive, structurally valid
+# pre-copy run may install the fixed package while both import locks are
+# held until dpkg exits. The importer must then verify the target on resume.
 set -e
 
 LEDGER=/var/lib/carlos-emr/o19-import/state.json
@@ -34,7 +34,84 @@ case "$1" in
         # file is never a written state (the guard treats it the same way).
         if [ -s "$LEDGER" ]; then
             if [ -x "$GUARD" ]; then
-                "$GUARD" "$LEDGER" >/dev/null 2>&1 || refuse
+                if ! "$GUARD" "$LEDGER" >/dev/null 2>&1; then
+                    python3 - "$LEDGER" "$PPID" <<'PRE_COPY_UPGRADE' || refuse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+
+
+def stopped_before_copy(directory):
+    state = json.loads((directory / 'state.json').read_text())
+    if not isinstance(state, dict) or not isinstance(state.get('phases'), dict):
+        return False
+    if state.get('cleanup') or set(state['phases']) & {'etl', 'documents', 'props', 'verify'}:
+        return False
+    inputs = state.get('inputs', {})
+    if not isinstance(inputs, dict) or not re.fullmatch(r'[0-9a-f]{64}', inputs.get('target_contract_sha256', '')):
+        return False
+    if not re.fullmatch(r'o19map-\d+\+[0-9a-f]{8}', inputs.get('schema_map_version', '')):
+        return False
+    progress = directory / 'etl-progress.json'
+    if progress.exists():
+        data = json.loads(progress.read_text())
+        if (not isinstance(data, dict) or not isinstance(data.get('tables'), dict)
+                or data['tables'] or data.get('admin_provider_no')):
+            return False
+    return True
+
+
+def dpkg_identity(pid):
+    directory = Path('/proc') / str(pid)
+    if directory.joinpath('comm').read_text().strip() != 'dpkg':
+        raise ValueError('recovery must run inside dpkg')
+    return directory.joinpath('stat').read_text().split()[21]
+
+
+def main():
+    directory = Path(sys.argv[1]).parent
+    pid = int(sys.argv[2])
+    identity = dpkg_identity(pid)
+    # Same lock order as import-o19. Keep both through unpack/configure,
+    # not merely until preinst returns: a new importer must not start in
+    # the gap between checking the ledger and replacing lazy-loaded files.
+    with contextlib.ExitStack() as stack:
+        for path in (directory.parent / '.finish-install.lock', directory / '.lock'):
+            handle = stack.enter_context(open(path, 'a'))
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not stopped_before_copy(directory):
+            return 1
+        if os.fork() == 0:
+            os.setsid()
+            null = os.open('/dev/null', os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(null, fd)
+            if null > 2:
+                os.close(null)
+            try:
+                while dpkg_identity(pid) == identity:
+                    time.sleep(1)
+            except (OSError, ValueError, IndexError):
+                pass
+            os._exit(0)
+        print('carlos-ctl: allowing package recovery before the first ETL write; '
+              'the application remains guarded and --resume must verify the target.', file=sys.stderr)
+        return 0
+
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, TypeError, IndexError):
+        sys.exit(1)
+PRE_COPY_UPGRADE
+                fi
             else
                 # a ledger with nothing on the host able to judge it: closed
                 echo "carlos-ctl: $GUARD is missing, so the import ledger cannot be judged." >&2

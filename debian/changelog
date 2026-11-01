@@ -4,6 +4,9 @@ carlos-ctl (1.3.1) resolute; urgency=medium
     schema upgrade, retaining staging and the original backup. Revalidate
     the pristine target before rebinding package contracts; protect partial
     copies from changed schema/ETL contracts.
+  * Permit installing the fixed CLI over a stopped, untouched retained
+    import; hold the workspace/database locks through dpkg completion.
+    Continue to refuse active processes, partial copies and malformed ledgers.
   * Diagnose the incompatible Consent mapping during preflight without
     additional source-value scans. Preserve legacy missing decision fields
     conservatively and correct the package-mismatch error.
