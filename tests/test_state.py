@@ -345,6 +345,15 @@ class TestTheP2ReportsAreWrittenPrivately(unittest.TestCase):
             self.assertTrue(os.path.isfile(path), name)
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600, name)
 
+    def test_incompatible_consent_package_is_reported_before_etl(self):
+        with mock.patch.object(o19import.o19map_schema, "TABLES", {
+                "Consent": {"class": "copy", "cols": ["id", "optout"]}}):
+            self.run_p2()
+        self.assertEqual(self.report["verdict"], "no-go")
+        self.assertNotEqual(self.report["exit_code"], 0)
+        self.assertEqual([f["id"] for f in self.report["findings"]],
+                         ["consent-package-contract"])
+
     def test_a_file_left_by_an_earlier_run_is_re_tightened(self):
         # the mode argument of os.open applies to a NEW file only, so a
         # resumed run over a world-readable leftover must fchmod it
