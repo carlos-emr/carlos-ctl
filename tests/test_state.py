@@ -345,6 +345,36 @@ class TestTheP2ReportsAreWrittenPrivately(unittest.TestCase):
             self.assertTrue(os.path.isfile(path), name)
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600, name)
 
+    def test_incompatible_consent_package_is_reported_before_etl(self):
+        """Report a staged Consent mapping without the required ranking as a blocker."""
+        with mock.patch.object(o19import.o19map_schema, "TABLES", {
+                "Consent": {"class": "copy", "cols": ["id", "optout"]}}), \
+                mock.patch.object(o19import.o19etl, "schema_tables", return_value={"Consent"}):
+            self.run_p2()
+        self.assertEqual(self.report["verdict"], "no-go")
+        self.assertNotEqual(self.report["exit_code"], 0)
+        self.assertEqual([f["id"] for f in self.report["findings"]],
+                         ["consent-package-contract"])
+
+    def test_staged_consent_requires_a_copy_entry_even_with_ranked_expression(self):
+        """Ranking alone cannot authorize a missing or archive-only Consent mapping."""
+        for entry in (None, {"class": "archive", "cols": ["deleted"],
+                             "value_exprs": {"deleted": "`Consent__live`.deleted"}}):
+            with self.subTest(entry=entry):
+                self.report.update(verdict="go", exit_code=0, findings=[])
+                entries = {} if entry is None else {"Consent": entry}
+                with mock.patch.object(o19import.o19map_schema, "TABLES", entries), \
+                        mock.patch.object(o19import.o19etl, "schema_tables", return_value={"consent"}):
+                    self.run_p2()
+                self.assertEqual(self.report["verdict"], "no-go")
+                self.assertEqual([f["id"] for f in self.report["findings"]],
+                                 ["consent-package-contract"])
+
+    def test_absent_source_consent_does_not_require_a_mapping(self):
+        with mock.patch.object(o19import.o19map_schema, "TABLES", {}):
+            self.run_p2()
+        self.assertEqual(self.report["verdict"], "go")
+
     def test_a_file_left_by_an_earlier_run_is_re_tightened(self):
         # the mode argument of os.open applies to a NEW file only, so a
         # resumed run over a world-readable leftover must fchmod it

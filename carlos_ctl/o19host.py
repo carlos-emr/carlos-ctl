@@ -89,6 +89,29 @@ class Host(object):
         from .schema_contract import load
         return load("/usr/share/carlos-emr/schema", province)
 
+    def import_schema_upgrade(self) -> int:
+        """Apply packaged migrations after the importer proves no copy began."""
+        from . import dbops
+        return dbops.run_flyway("migrate")
+
+    def pre_copy_schema_contract(self, province: str):
+        """The known pre-fix schema, retained for untouched-import recovery."""
+        import json
+        path = "/usr/share/carlos-emr/schema/contracts/o19-pre-copy-" + province + ".json"
+        try:
+            with open(path, encoding="utf-8") as handle:
+                document = json.load(handle)
+        except FileNotFoundError:
+            return None
+        from . import schema_contract
+        if (not isinstance(document, dict)
+                or document.get("format") != schema_contract.FORMAT
+                or document.get("province") != province
+                or not isinstance(document.get("schema"), dict)
+                or set(document["schema"]) != set(schema_contract.FIELDS)):
+            raise ValueError("invalid packaged pre-copy recovery contract")
+        return document
+
     def db_ownership_lock_path(self) -> Optional[str]:
         """The lock every provisioning path on this host takes before it
         mutates the database, or None when there is none to share.

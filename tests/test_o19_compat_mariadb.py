@@ -208,6 +208,66 @@ class TestO19Compatibility(unittest.TestCase):
         self.q("INSERT INTO `{0}`.sample VALUES (1,'seed')".format(self.dst))
         return o19etl.introspect_columns(self.q, self.dst)["sample"]
 
+    @unittest.skipUnless(os.environ.get("CARLOS_SRC"), "set CARLOS_SRC to test the packaged Consent migration")
+    def test_consent_upgrade_preserves_rows_audits_flags_and_is_repeatable(self):
+        """Replay the migration twice and verify every flag and audit attribution."""
+        migration = next((Path(os.environ["CARLOS_SRC"]) / "database/mysql/migration/common").glob(
+            "*__one_live_consent_per_type.sql")).read_text()
+        self.q("CREATE TABLE `{0}`.Consent(id INT PRIMARY KEY, demographic_no INT, consent_type_id INT, "
+               "explicit TINYINT NULL, optout TINYINT NULL, deleted TINYINT NULL, edit_date DATETIME NULL);"
+               "INSERT INTO `{0}`.Consent VALUES"
+               "(1,100,1,1,0,0,'2024-01-01'),(2,100,1,0,1,0,'2023-01-01'),"
+               "(3,100,1,1,0,1,'2026-01-01'),(4,101,1,0,NULL,0,NULL),"
+               "(5,102,1,0,0,NULL,NULL),(6,103,1,NULL,0,0,NULL),"
+               "(7,104,1,0,0,0,NULL),(8,104,1,0,0,0,NULL)".format(self.dst))
+        for attempt in range(2):
+            self.q("USE `{0}`; ".format(self.dst) + migration)
+            self.assertEqual(self.q("SELECT id,deleted FROM `{0}`.Consent ORDER BY id".format(self.dst)),
+                             [["1", "1"], ["2", "0"], ["3", "1"], ["4", "1"],
+                              ["5", "1"], ["6", "0"], ["7", "1"], ["8", "0"]])
+            self.assertEqual(self.q("SELECT COUNT(*) FROM `{0}`.Consent".format(self.dst)), [["8"]])
+            self.assertEqual(self.q("SELECT consent_id,reason FROM `{0}`.Consent_migration_audit ORDER BY consent_id".format(self.dst)),
+                             [["1", "duplicate_retired"], ["4", "null_flag"], ["5", "null_flag"],
+                              ["6", "null_flag"], ["7", "duplicate_retired"]])
+        self.assertEqual(self.q("SELECT COUNT(*) FROM `{0}`.Consent_migration_audit WHERE lastUpdateUser IS NULL OR lastUpdateUser <> 'system' OR lastUpdateDate IS NULL".format(self.dst)), [["0"]])
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.q("INSERT INTO `{0}`.Consent(id,demographic_no,consent_type_id,deleted) VALUES(9,100,1,0)".format(self.dst))
+
+    @unittest.skipUnless(os.environ.get("CARLOS_TEST_O19_REFERENCE_DB"),
+                         "set CARLOS_TEST_O19_REFERENCE_DB to a freshly migrated CARLOS database")
+    def test_migrated_capacity_preserves_long_values_through_real_etl(self):
+        """Copy oversized legacy values through actual SQL into migrated columns."""
+        reference = os.environ["CARLOS_TEST_O19_REFERENCE_DB"]
+        self.assertRegex(reference, r"^[A-Za-z0-9_]+$")
+        cases = (("demographic", "sourceOfIncome", "VARCHAR(255)", "REPEAT('guardian details ',8)"),
+                 ("favorites", "BN", "VARCHAR(255)", "REPEAT('B',255)"),
+                 ("property", "value", "VARCHAR(4000)", "REPEAT('P',3974)"),
+                 ("demographic", "previousAddress", "VARCHAR(255)", "REPEAT('A',255)"),
+                 ("formMentalHealthForm1", "datetimeOfDetention", "VARCHAR(50)", "REPEAT('D',50)"),
+                 ("pharmacyInfo", "city", "VARCHAR(255)", "REPEAT('C',255)"),
+                 ("pharmacyInfo", "notes", "TEXT", "REPEAT(CONVERT(0xE9 USING latin1),50000)"),
+                 ("admission", "admission_notes", "TEXT", "REPEAT(CONVERT(0xE9 USING latin1),50000)"))
+        execute = o19import.make_etl_query(self.base)
+        for table, column, source_type, expression in cases:
+            with self.subTest(column=table + "." + column):
+                target_type = self.q("SELECT COLUMN_TYPE FROM information_schema.COLUMNS "
+                                     "WHERE TABLE_SCHEMA='{0}' AND TABLE_NAME='{1}' AND COLUMN_NAME='{2}'".format(
+                                         reference, table, column))[0][0]
+                self.q("CREATE TABLE `{0}`.sample(id INT PRIMARY KEY, value {2}) DEFAULT CHARSET=latin1;"
+                       "CREATE TABLE `{1}`.sample(id INT PRIMARY KEY, value {3}) DEFAULT CHARSET=utf8mb4;"
+                       "INSERT INTO `{0}`.sample VALUES(1,{4})".format(
+                           self.src, self.dst, source_type, target_type, expression))
+                try:
+                    target = o19etl.introspect_columns(self.q, self.dst)["sample"]
+                    execute(o19etl.copy_statement("sample", {"class": "copy", "cols": ["id", "value"]},
+                                                 self.src, self.dst, target))
+                    self.assertEqual(self.q("SELECT CHAR_LENGTH(s.value), CHAR_LENGTH(d.value), "
+                                            "SHA2(CONVERT(s.value USING utf8mb4),256)=SHA2(d.value,256) "
+                                            "FROM `{0}`.sample s JOIN `{1}`.sample d USING(id)".format(self.src, self.dst)),
+                                     self.q("SELECT CHAR_LENGTH(value),CHAR_LENGTH(value),1 FROM `{0}`.sample".format(self.src)))
+                finally:
+                    self.q("DROP TABLE `{0}`.sample; DROP TABLE `{1}`.sample".format(self.src, self.dst))
+
     def test_merge_uses_carlos_collation_across_source_collations(self):
         cols = self.text_tables()
         entry = {"class": "merge", "cols": ["id", "name"], "merge_keys": ["name"]}

@@ -10,9 +10,10 @@
 # the predicate is carlos-emr's own guard, the one its service unit and
 # postinst consult (carlos-emr-o19-guard): ONE predicate, so this cannot
 # disagree with them. Fails CLOSED: a ledger that exists but cannot be
-# judged (no guard on the host, or the guard cannot read it) counts as an
-# import in progress. The remedy is to finish or clean up the import, then
-# retry the install.
+# judged counts as an import in progress. An inactive, structurally valid
+# pre-copy run may install the fixed package while both import locks are
+# held until dpkg exits. With no active ledger, the workspace lock alone
+# excludes import startup while allowing ordinary configure provisioning.
 set -e
 
 LEDGER=/var/lib/carlos-emr/o19-import/state.json
@@ -30,17 +31,115 @@ refuse() {
 
 case "$1" in
     install|upgrade)
-        # -s: the importer writes the ledger with os.replace(), so a 0-byte
-        # file is never a written state (the guard treats it the same way).
-        if [ -s "$LEDGER" ]; then
-            if [ -x "$GUARD" ]; then
-                "$GUARD" "$LEDGER" >/dev/null 2>&1 || refuse
-            else
-                # a ledger with nothing on the host able to judge it: closed
-                echo "carlos-ctl: $GUARD is missing, so the import ledger cannot be judged." >&2
-                refuse
-            fi
-        fi
+        python3 - "$LEDGER" "$PPID" "$GUARD" <<'PRE_COPY_UPGRADE' || refuse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import time
+
+
+def stopped_before_copy(directory):
+    """Accept only a bound ledger with recognized, well-formed pre-copy phases."""
+    state = json.loads((directory / 'state.json').read_text())
+    if not isinstance(state, dict) or not isinstance(state.get('phases'), dict):
+        return False
+    phases = state['phases']
+    if (state.get('cleanup')
+            or not set(phases) <= {'check-pristine', 'backup', 'stage', 'preflight'}
+            or any(not isinstance(entry, dict)
+                   or entry.get('status') not in {'done', 'in-progress'}
+                   for entry in phases.values())):
+        return False
+    inputs = state.get('inputs', {})
+    if not isinstance(inputs, dict) or not re.fullmatch(r'[0-9a-f]{64}', inputs.get('target_contract_sha256', '')):
+        return False
+    if not re.fullmatch(r'o19map-\d+\+[0-9a-f]{8}', inputs.get('schema_map_version', '')):
+        return False
+    progress = directory / 'etl-progress.json'
+    if progress.exists():
+        data = json.loads(progress.read_text())
+        if (not isinstance(data, dict) or not isinstance(data.get('tables'), dict)
+                or data['tables'] or data.get('admin_provider_no')):
+            return False
+    return True
+
+
+def dpkg_identity(pid):
+    """Identify the supervising dpkg instance without trusting a reused PID."""
+    directory = Path('/proc') / str(pid)
+    if directory.joinpath('comm').read_text().strip() != 'dpkg':
+        raise ValueError('recovery must run inside dpkg')
+    return directory.joinpath('stat').read_text().split()[21]
+
+
+def main():
+    """Serialize ledger inspection and retain import exclusion through unpack."""
+    directory = Path(sys.argv[1]).parent
+    pid = int(sys.argv[2])
+    guard = Path(sys.argv[3])
+    identity = dpkg_identity(pid)
+    directory.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    # Same lock order as import-o19, BEFORE examining ledger existence.
+    # A new importer can already own the database without having a ledger.
+    with contextlib.ExitStack() as stack:
+        locks = []
+        for path, mode in ((directory.parent / '.finish-install.lock', 0o644),
+                           (directory / '.lock', 0o600)):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+                         | os.O_NONBLOCK, mode)
+            stack.callback(os.close, fd)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError('import lock must be a regular file: ' + str(path))
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locks.append(fd)
+        recovery = False
+        ledger = directory / 'state.json'
+        if os.path.lexists(ledger):
+            if not guard.is_file() or not os.access(guard, os.X_OK):
+                raise ValueError('the application import guard is missing')
+            recovery = subprocess.run([str(guard), str(ledger)], stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, timeout=10).returncode != 0
+        if recovery and not stopped_before_copy(directory):
+            return 1
+        if os.fork() == 0:
+            os.setsid()
+            if not recovery:
+                # No active import: configure must be able to provision the
+                # database. The workspace lock still excludes every import
+                # through dpkg exit; retaining the database lock here would
+                # block postinst while this child waits for dpkg.
+                os.close(locks[0])
+            null = os.open('/dev/null', os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(null, fd)
+            if null > 2:
+                os.close(null)
+            try:
+                while dpkg_identity(pid) == identity:
+                    time.sleep(1)
+            except (OSError, ValueError, IndexError):
+                pass
+            os._exit(0)
+        if recovery:
+            print('carlos-ctl: allowing package recovery before the first ETL write; '
+                  'the application remains guarded and --resume must verify the target.', file=sys.stderr)
+        return 0
+
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, TypeError, IndexError, subprocess.SubprocessError):
+        sys.exit(1)
+PRE_COPY_UPGRADE
         ;;
 esac
 

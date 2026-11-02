@@ -116,6 +116,7 @@ def _manifest(root, overlay):
 
 
 def _migration(root):
+    """Recognize the single audited Consent migration by its structural rules."""
     directory = root / "database/mysql/migration/common"
     found = sorted(p for p in directory.iterdir()
                    if p.name.endswith("one_live_consent_per_type.sql"))
@@ -133,12 +134,12 @@ def _migration(root):
     cols = r"\(\s*live_demographic_no\s*,\s*consent_type_id\s*\)"
     for statement in alters:
         generated.extend(re.findall(
-            r"\badd\s+(?:column\s+)?live_demographic_no\s+(?:bigint|int)"
+            r"\badd\s+(?:column\s+)?(?:if\s+not\s+exists\s+)?live_demographic_no\s+(?:bigint|int)"
             r"(?:\s*\(\s*\d+\s*\))?(?:\s+unsigned)?\s+"
             r"(?:generated\s+always\s+)?as\s*\((.+?)\)\s*(?:stored|persistent|virtual)\b",
             statement))
         unique.extend(re.findall(
-            r"\b(?:unique\s+(?:key|index)\s+uq_consent_live_type|"
+            r"\b(?:unique\s+(?:key|index)\s+(?:if\s+not\s+exists\s+)?uq_consent_live_type|"
             r"constraint\s+uq_consent_live_type\s+unique)\s*" + cols, statement))
     for statement in statements:
         unique.extend(re.findall(

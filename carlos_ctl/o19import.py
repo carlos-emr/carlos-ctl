@@ -1037,6 +1037,82 @@ def inherited_import_refusal(archive_present: bool,
     return None
 
 
+def prepare_pre_copy_upgrade(ctx, actual):
+    """Recover the known widening transition while keeping staging intact.
+
+    Every other physical difference remains unexplained drift. No target
+    writes are permitted until both ledgers and the pristine sweep agree.
+    """
+    if not ctx.get("resume") or ctx.get("dry_run") or etl_started(ctx["state_dir"]):
+        return
+    expected = ctx["schema_contract"]["schema"]
+    changed = schema_contract.widening_columns(expected, actual)
+    if not changed:
+        try:
+            legacy = HOST.pre_copy_schema_contract(ctx.get("province", "on"))
+        except (OSError, ValueError) as exc:
+            die("cannot verify the packaged pre-copy recovery contract: " + str(exc))
+        legacy_sha = hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest() if legacy else None
+        if (not legacy or legacy_sha != ctx.get("previous_contract_sha256")
+                or schema_contract.differences(legacy["schema"], actual)):
+            return
+        changed = ["verified pre-fix OSCAR capacity and Consent schema"]
+    query, target = ctx["query"], ctx["target_db"]
+    counts = gather_copy_counts(query, target)
+    startup = startup_row_counts(query, target)
+    problems = pristine_violations(tolerate_startup_rows(counts, startup))
+    users = query("SELECT user_name FROM `{0}`.security".format(target))
+    if users != [[o19map_schema.SEED_USER_NAME]]:
+        problems.append("the target no longer has only the seeded login")
+    if problems:
+        die("cannot upgrade this retained import: the target is not pristine; "
+            "no migrations were applied. " + "; ".join(problems))
+    if not HOST.backup_configured():
+        die("configure backups before recovering this package upgrade; "
+            "the original pre-import backup remains unchanged")
+    ok, diagnosis = HOST.pre_import_backup()
+    if not ok:
+        die("recovery backup failed; no schema upgrade was attempted: " + diagnosis)
+    report_append(ctx["state_dir"], "Pre-copy package recovery",
+                  "additional recovery backup taken; applying packaged "
+                  "widening for " + ", ".join(changed))
+    if HOST.import_schema_upgrade() != 0:
+        die("packaged schema upgrade failed; the application remains stopped "
+            "and staging is retained. Resolve the migration failure before --resume")
+
+
+def commit_pre_copy_contract(ctx):
+    """Bind a verified untouched target to its new package pair."""
+    if ctx.get("dry_run") or etl_started(ctx["state_dir"]):
+        return
+    recorded = ctx["state"].setdefault("inputs", {})
+    if not ctx.get("contract_refresh") and recorded.get("schema_map_version") in (
+            None, o19map_schema.SCHEMA_MAP_VERSION):
+        return
+    old = {name: recorded.get(name) for name in
+           ("schema_map_version", "target_contract_sha256", "etl_contract")}
+    current = {"schema_map_version": o19map_schema.SCHEMA_MAP_VERSION,
+               "target_contract_sha256": ctx.get("target_contract_sha256"),
+               "etl_contract": ETL_CONTRACT_VERSION}
+    if old != current:
+        source_set = os.path.join(ctx["state_dir"], "source-set.json")
+        document = None
+        if os.path.exists(source_set):
+            try:
+                with open(source_set, encoding="utf-8") as handle:
+                    document = json.load(handle)
+                if not isinstance(document, dict):
+                    raise ValueError("expected a JSON object")
+            except (OSError, ValueError) as exc:
+                die("cannot rebind the retained source-set record: " + str(exc))
+            document["target_contract_sha256"] = current["target_contract_sha256"]
+            durable_json(source_set, document)
+        ctx["state"].setdefault("package_recoveries", []).append(
+            {"previous": old, "current": current})
+        recorded.update(current)
+        save_state(ctx["state_dir"], ctx["state"])
+
+
 def run_p0(ctx) -> None:
     """P0 -- refuse anything but a stock, province-matched, pristine target.
 
@@ -1082,6 +1158,11 @@ def run_p0(ctx) -> None:
             .format(ctx.get("province"), ", ".join(supported)))
     run_p0_capacity(ctx)
 
+    # A retained pre-copy target can have the newly packaged migrations
+    # pending. migrate validates the applied history itself; a standalone
+    # validate before this recovery would refuse those pending versions.
+    if ctx.get("schema_contract") and ctx.get("contract_refresh"):
+        prepare_pre_copy_upgrade(ctx, schema_contract.capture(query, ctx["target_db"]))
     if not dev:
         rc = HOST.flyway_validate()
         if rc != 0:
@@ -1197,6 +1278,7 @@ def run_p0(ctx) -> None:
     if not ctx.get("dry_run"):
         mark_done(ctx["state_dir"], ctx["state"], "check-pristine",
                   pristine=not violations, dev_target=dev)
+        commit_pre_copy_contract(ctx)
 
 
 # --------------------------------------------------------------------------
@@ -1740,6 +1822,22 @@ def run_p2(ctx) -> Dict:
         pf_query, properties=props, province=ctx["province"],
         accepted=ctx["accepted"], schema_map=o19map_schema,
         db_name=STAGING_SCHEMA)
+    consent = o19map_schema.TABLES.get(o19etl.CONSENT_TABLE)
+    staged_tables = o19etl.schema_tables(query, STAGING_SCHEMA)
+    has_consent = any(name.lower() == o19etl.CONSENT_TABLE.lower()
+                      for name in staged_tables)
+    if (has_consent and (not consent or consent.get("class") != "copy"
+                         or not o19etl.consent_live_ranked(consent))):
+        report["findings"].append(o19_preflight.finding(
+            "consent-package-contract", o19_preflight.BLOCKER,
+            "the installed application manifest lacks the Consent import rule",
+            "Install the compatible fixed carlos-emr/carlos-ctl pair. "
+            "Unmodified older package files can carry this incompatible mapping."))
+        verdict, code, acknowledged, outstanding = o19_preflight.preflight_verdict(
+            report["findings"], ctx["accepted"])
+        report.update(verdict=verdict, exit_code=code,
+                      acknowledged=acknowledged,
+                      required_accepts=sorted({f["accept"] for f in outstanding}))
     # 0600 like every other artifact naming the clinic's own objects:
     # these two carry the unknown-table inventory, the identifier-class
     # names, the credential tables found and the per-table counts. The
@@ -3930,7 +4028,9 @@ def _make_ctx(args, import_mode: bool,
             die("cannot load this application's physical schema contract ({0}); install matching carlos-emr and carlos-ctl packages".format(exc))
     contract_sha = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest() if contract else None
     previous_contract = state.get("inputs", {}).get("target_contract_sha256")
-    if real_run and previous_contract and previous_contract != contract_sha:
+    contract_refresh = bool(previous_contract and previous_contract != contract_sha)
+    if real_run and contract_refresh and (not getattr(args, "resume", False)
+                                         or etl_started(state_dir)):
         die("the application's target schema contract changed during this import; restore the original packages to finish, or restore the pre-import snapshot")
     # An assessment records nothing and persists no sign-off, so it also
     # takes no copy and binds nothing: it reads the operator's file as
@@ -4000,7 +4100,7 @@ def _make_ctx(args, import_mode: bool,
             "source_parts": inputs.get("source_parts"),
             "document_sources": inputs.get("document_sources"),
             "properties_sha256": inputs.get("properties_sha256"),
-            "target_contract_sha256": contract_sha,
+            "target_contract_sha256": previous_contract if contract_refresh else contract_sha,
             # the schema this import writes: a later invocation that
             # resolves a different one is refused above rather than
             # copying into one database and verifying another
@@ -4015,7 +4115,7 @@ def _make_ctx(args, import_mode: bool,
             "sql": inputs.get("source_parts"), "documents": inputs.get("document_sources"),
             "properties_sha256": inputs.get("properties_sha256"),
             "duplicate_tables": inputs.get("duplicate_tables", []),
-            "target_contract_sha256": contract_sha,
+            "target_contract_sha256": recorded["target_contract_sha256"],
         })
         save_state(state_dir, state)
     retire_input_snapshots(inputs, state_dir, workdir_name)
@@ -4040,6 +4140,9 @@ def _make_ctx(args, import_mode: bool,
         "o19_digests": inputs.get("digests"),
         "source_parts": inputs.get("source_parts", []),
         "schema_contract": contract,
+        "target_contract_sha256": contract_sha,
+        "previous_contract_sha256": previous_contract,
+        "contract_refresh": contract_refresh,
         "duplicate_tables": inputs.get("duplicate_tables", []),
         "dump_size": os.path.getsize(inputs["dump"]) if inputs["dump"] else 0,
         "documents_size": (os.path.getsize(inputs["documents"])
@@ -4345,13 +4448,13 @@ def _cmd_import_o19(argv) -> int:
     if not args.dry_run:
         run_p3(ctx)  # the rollback point exists before any clinic SQL runs
     run_p1(ctx)
-    run_p2(ctx)
+    report = run_p2(ctx)
     if args.dry_run:
         from . import o19props
         o19props.run_props(ctx)  # report-only in dry-run (fragment flagged)
         log("dry run complete — reports in {0}; nothing was written beyond "
             "the throwaway staging schema".format(ctx["state_dir"]))
-        return 0
+        return int(report["exit_code"])
     run_p4(ctx)
     run_p5(ctx)
     run_p6(ctx)

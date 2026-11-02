@@ -1440,8 +1440,8 @@ def consent_live_ranked(entry: dict) -> bool:
 
 
 #: Why the import stored something other than what the clinic's row
-#: held -- the words V1.0.57 writes to `Consent_migration_audit`, so one
-#: vocabulary describes a row whichever of the two changed it. A row
+#: held -- the one-live-consent migration uses the same words in
+#: `Consent_migration_audit`, so one vocabulary describes either change. A row
 #: that is both carries both, comma-separated in this order.
 CONSENT_NULL_FLAG = "null_flag"
 CONSENT_DUPLICATE = "duplicate_retired"
@@ -1467,7 +1467,8 @@ def consent_source_live(src_cols: Dict[str, dict],
     deleted = consent_source_col(src_cols, "deleted")
     parts = ["{0} <=> 0".format(deleted)] if deleted else []
     if decided:
-        parts.append("s.`optout` IS NOT NULL")
+        optout = consent_source_col(src_cols, "optout")
+        parts.append("{0} IS NOT NULL".format(optout) if optout else "0 = 1")
     return "({0})".format(" AND ".join(parts) or "1 = 1")
 
 
@@ -1509,6 +1510,8 @@ def consent_live_statements(entry: dict, src_schema: str,
     flags = [consent_source_col(src_cols, c)
              for c in ("explicit", "optout", "deleted")]
     null_flag = " OR ".join("{0} IS NULL".format(f) for f in flags if f)
+    if flags[1] is None:
+        null_flag = "1 = 1"   # no source decision exists at this patch level
     name = consent_live_table()
 
     def build(scratch: str) -> List[str]:
@@ -1574,6 +1577,7 @@ def consent_live_count_sql(src_schema: str, archive_schema: str,
     The three that read `deleted` are absent for a dump that has no
     such column: there is nothing they could count."""
     table = "`{0}`.`{1}` s".format(src_schema, CONSENT_TABLE)
+    optout = consent_source_col(src_cols, "optout") or "NULL"
     out = [
         ("duplicate",
          "SELECT COUNT(*) FROM {0} JOIN `{1}`.`{2}` r ON "
@@ -1581,9 +1585,9 @@ def consent_live_count_sql(src_schema: str, archive_schema: str,
              table, archive_schema, consent_live_table(),
              consent_source_live(src_cols))),
         ("undecided",
-         "SELECT COUNT(*) FROM {0} WHERE s.`optout` IS NULL "
-         "AND {1}".format(
-             table, consent_source_live(src_cols, decided=False))),
+         "SELECT COUNT(*) FROM {0} WHERE {1} IS NULL "
+         "AND {2}".format(
+             table, optout, consent_source_live(src_cols, decided=False))),
     ]
     out.append(
         ("changed",
@@ -1596,8 +1600,8 @@ def consent_live_count_sql(src_schema: str, archive_schema: str,
              "SELECT COUNT(*) FROM {0} WHERE {1} IS NULL".format(
                  table, deleted)),
             ("not_live_undecided",
-             "SELECT COUNT(*) FROM {0} WHERE s.`optout` IS NULL AND "
-             "NOT ({1} <=> 0)".format(table, deleted)),
+             "SELECT COUNT(*) FROM {0} WHERE {1} IS NULL AND "
+             "NOT ({2} <=> 0)".format(table, optout, deleted)),
             ("legacy_deleted",
              "SELECT COUNT(*) FROM {0} WHERE {1} <> 0".format(
                  table, deleted)),
@@ -1607,9 +1611,8 @@ def consent_live_count_sql(src_schema: str, archive_schema: str,
 
 def consent_live_duplicates_sql(dst_schema: str) -> str:
     """Counts the (patient, consent type) pairs holding MORE than one
-    live row on the target. The unique key would refuse them, but the
-    copy runs under UNIQUE_CHECKS=0 and the server may then skip the
-    check, so the import asks instead of assuming."""
+    live row on the target. Copy keeps UNIQUE_CHECKS enabled and also
+    verifies this invariant explicitly rather than assuming it holds."""
     return ("SELECT COUNT(*) FROM (SELECT 1 FROM `{0}`.`{1}` WHERE "
             "`deleted` = 0 AND `demographic_no` IS NOT NULL AND "
             "`consent_type_id` IS NOT NULL GROUP BY `demographic_no`, "
@@ -2549,7 +2552,8 @@ def load_progress(state_dir: str, dump_sha256: Optional[str] = None,
             die("the ETL ledger in {0} carries table marks but no manifest "
                 "version — its classification cannot be trusted. Restore "
                 "the pre-import snapshot and start over.".format(state_dir))
-        if recorded and recorded != schema_map_version:
+        if recorded and recorded != schema_map_version and (
+                progress["tables"] or progress.get("admin_provider_no")):
             die("the ETL ledger was written under manifest {0}; this "
                 "package carries {1}. Tables marked done were classified "
                 "differently — restore the pre-import snapshot and start "
@@ -2758,6 +2762,11 @@ def effective_entry(table: str, entry: dict,
     if legacy_lifetime:
         entry = dict(entry)
         entry["value_exprs"] = dict(entry.get("value_exprs", {}), lifetime="-1")
+    legacy_undecided = (table == CONSENT_TABLE
+                        and not any(c.lower() == "optout" for c in src_cols))
+    if legacy_undecided:
+        entry = dict(entry)
+        entry["value_exprs"] = dict(entry.get("value_exprs", {}), optout="1")
     exact = [c for c in entry.get("cols", ())
              if (table, entry.get("renames", {}).get(c, c)) ==
              o19_preflight.EXACT_CHARSET_SCOPE
@@ -2779,6 +2788,9 @@ def effective_entry(table: str, entry: dict,
     if legacy_lifetime:
         notes.append("ServiceClient.lifetime absent from this O19 schema — "
                      "preserving early O19 non-expiring issuance (-1)")
+    if legacy_undecided:
+        notes.append("Consent.optout absent from this dump — no decision "
+                     "invented; records are preserved retired with optout=1")
     # a remap only makes sense for a column the copy actually reads from
     # the dump (a skipped or synthesized column has no source id to map)
     remap = {}
@@ -2963,10 +2975,10 @@ def etl_precheck_problems(ctx, plain, query, src_schema: str,
             "{0}: the manifest's entry does not carry the one-live-record "
             "rule (a copy reading `deleted` from {1}.{2}). Imported "
             "without it, a consent deleted in OSCAR 19 would arrive live "
-            "and one with no recorded decision as an opt-in. The manifest "
-            "this package ships carries the rule, so this one was "
-            "replaced or regenerated from an older overlay: put back the "
-            "shipped manifest".format(
+            "and one with no recorded decision as an opt-in. The installed "
+            "carlos-emr manifest and carlos-ctl are incompatible for this "
+            "import. Install the fixed package pair; unchanged package "
+            "files can also carry this older mapping".format(
                 CONSENT_TABLE, arch, consent_live_table()))
     if admin_user == o19map_schema.SEED_USER_NAME:
         problems.append("--admin-user must not be the seeded login '{0}'"
