@@ -19,9 +19,11 @@ Rules-Requires-Root: no
 
 Package: carlos-ctl
 Architecture: all
+Pre-Depends:
+# The preinst serializes import startup before any package files are unpacked.
+ python3 (>= 3.12)
 Depends:
  ${misc:Depends},
- python3 (>= 3.12),
 # python3-bcrypt hashes the replacement for the seeded administrator password
 # (bootstrap-admin) and the break-glass administrator import-o19 creates.
  python3-bcrypt,

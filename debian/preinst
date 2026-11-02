@@ -12,7 +12,8 @@
 # disagree with them. Fails CLOSED: a ledger that exists but cannot be
 # judged counts as an import in progress. An inactive, structurally valid
 # pre-copy run may install the fixed package while both import locks are
-# held until dpkg exits. The importer must then verify the target on resume.
+# held until dpkg exits. With no active ledger, the workspace lock alone
+# excludes import startup while allowing ordinary configure provisioning.
 set -e
 
 LEDGER=/var/lib/carlos-emr/o19-import/state.json
@@ -30,12 +31,7 @@ refuse() {
 
 case "$1" in
     install|upgrade)
-        # -s: the importer writes the ledger with os.replace(), so a 0-byte
-        # file is never a written state (the guard treats it the same way).
-        if [ -s "$LEDGER" ]; then
-            if [ -x "$GUARD" ]; then
-                if ! "$GUARD" "$LEDGER" >/dev/null 2>&1; then
-                    python3 - "$LEDGER" "$PPID" <<'PRE_COPY_UPGRADE' || refuse
+        python3 - "$LEDGER" "$PPID" "$GUARD" <<'PRE_COPY_UPGRADE' || refuse
 import contextlib
 import fcntl
 import json
@@ -43,6 +39,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 import time
 
@@ -82,14 +79,17 @@ def dpkg_identity(pid):
 
 
 def main():
-    """Hold regular import lock files until the supervising dpkg exits."""
+    """Serialize ledger inspection and retain import exclusion through unpack."""
     directory = Path(sys.argv[1]).parent
     pid = int(sys.argv[2])
+    guard = Path(sys.argv[3])
     identity = dpkg_identity(pid)
-    # Same lock order as import-o19. Keep both through unpack/configure,
-    # not merely until preinst returns: a new importer must not start in
-    # the gap between checking the ledger and replacing lazy-loaded files.
+    directory.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    # Same lock order as import-o19, BEFORE examining ledger existence.
+    # A new importer can already own the database without having a ledger.
     with contextlib.ExitStack() as stack:
+        locks = []
         for path, mode in ((directory.parent / '.finish-install.lock', 0o644),
                            (directory / '.lock', 0o600)):
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
@@ -98,10 +98,24 @@ def main():
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise ValueError('import lock must be a regular file: ' + str(path))
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if not stopped_before_copy(directory):
+            locks.append(fd)
+        recovery = False
+        ledger = directory / 'state.json'
+        if os.path.lexists(ledger):
+            if not guard.is_file() or not os.access(guard, os.X_OK):
+                raise ValueError('the application import guard is missing')
+            recovery = subprocess.run([str(guard), str(ledger)], stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, timeout=10).returncode != 0
+        if recovery and not stopped_before_copy(directory):
             return 1
         if os.fork() == 0:
             os.setsid()
+            if not recovery:
+                # No active import: configure must be able to provision the
+                # database. The workspace lock still excludes every import
+                # through dpkg exit; retaining the database lock here would
+                # block postinst while this child waits for dpkg.
+                os.close(locks[0])
             null = os.open('/dev/null', os.O_RDWR)
             for fd in (0, 1, 2):
                 os.dup2(null, fd)
@@ -113,8 +127,9 @@ def main():
             except (OSError, ValueError, IndexError):
                 pass
             os._exit(0)
-        print('carlos-ctl: allowing package recovery before the first ETL write; '
-              'the application remains guarded and --resume must verify the target.', file=sys.stderr)
+        if recovery:
+            print('carlos-ctl: allowing package recovery before the first ETL write; '
+                  'the application remains guarded and --resume must verify the target.', file=sys.stderr)
         return 0
 
 
@@ -122,16 +137,9 @@ def main():
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (OSError, ValueError, TypeError, IndexError):
+    except (OSError, ValueError, TypeError, IndexError, subprocess.SubprocessError):
         sys.exit(1)
 PRE_COPY_UPGRADE
-                fi
-            else
-                # a ledger with nothing on the host able to judge it: closed
-                echo "carlos-ctl: $GUARD is missing, so the import ledger cannot be judged." >&2
-                refuse
-            fi
-        fi
         ;;
 esac
 
