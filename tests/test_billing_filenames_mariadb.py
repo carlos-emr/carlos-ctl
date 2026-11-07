@@ -18,6 +18,7 @@ from .carlos_src import carlos_path
                      "set CARLOS_TEST_MARIADB_SOCKET for live billing regressions")
 class TestBillingFilenamesMariaDB(unittest.TestCase):
     def setUp(self):
+        """Create isolated source, destination and evidence schemas with real unique indexes."""
         self.client = ["mariadb", "--no-defaults", "--user=root", "--protocol=socket",
                        "--socket=" + os.environ["CARLOS_TEST_MARIADB_SOCKET"]]
         prefix = "billing_test_" + uuid.uuid4().hex
@@ -48,6 +49,7 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
         return o19import.batch_rows(result.stdout)
 
     def seed(self, table, rows):
+        """Write known source values and timestamps without activating automatic timestamp updates."""
         column, date, _ = o19billing.TABLES[table]
         for row_id, filename, stamp in rows:
             value = "NULL" if filename is None else o19billing.literal(filename)
@@ -60,6 +62,7 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
             self.writer("INSERT INTO `{0}`.`{1}` ({2}) VALUES ({3})".format(self.src, table, fields, values))
 
     def run_for(self, table, chunk=False):
+        """Construct the real copy inputs with optional chunking and retained checkpoints."""
         src_info = o19etl.introspect_columns(self.plain, self.src)
         dst_info = o19etl.introspect_columns(self.plain, self.dst)
         columns = list(dst_info[table])
@@ -85,11 +88,13 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
         return run, entry, state, columns
 
     def values(self, table, schema=None):
+        """Read identities, filenames and clinical payload from a chosen schema for comparison."""
         column = o19billing.TABLES[table][0]
         return self.plain("SELECT id, `{0}`, payload, timestamp FROM `{1}`.`{2}` ORDER BY id".format(
             column, schema or self.dst, table))
 
     def test_both_tables_keep_all_rows_originals_payload_and_timestamps(self):
+        """Renaming collisions must preserve source rows and every unrelated destination value."""
         for table, (column, _date, token) in o19billing.TABLES.items():
             with self.subTest(table=table):
                 self.seed(table, [(1, "same", "2020-01-01"), (2, "same", "2021-01-01")])
@@ -116,6 +121,7 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
             self.arch, o19billing.helper(table))), [["3"]])
 
     def test_nulls_zero_and_negative_ids_and_unknown_dates_survive(self):
+        """Sentinel identities, nullable filenames and unknown years must survive allocation."""
         table = "billing_on_diskname"
         self.seed(table, [(-3, None, None), (0, None, None), (1, "same", None),
                           (2, "same", "0000-00-00")])
@@ -149,6 +155,7 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
         self.assertEqual(self.values(table)[1][1], "o19-claim-2021-2-1.claim")
 
     def test_shared_basename_across_tables_is_ambiguous_without_within_table_duplicates(self):
+        """One reference in each table must still create an ambiguous shared-file cohort."""
         tables = list(o19billing.TABLES)
         for table in tables:
             self.seed(table, [(1, "shared.001", "2021-01-01")])
@@ -168,6 +175,7 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
             self.assertEqual(self.values(table, self.src)[0][1], "shared.001")
 
     def test_shared_namespace_uses_destination_collation_and_restored_case_in_preflight(self):
+        """Cross-table counts must use target equality and the actual restored table names."""
         disk, html = o19billing.TABLES
         self.seed(disk, [(1, "Éfile", "2020-01-01")])
         self.seed(html, [(2, "efile ", "2021-01-01")])
@@ -195,6 +203,7 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
             self.plain, table, self.src, info, "Billing_on_diskname"), 2)
 
     def test_resume_after_insert_commits_without_completion_checkpoint(self):
+        """A lost commit acknowledgement must not change filenames or lose rows on retry."""
         table = "billing_on_diskname"
         self.seed(table, [(1, "same", "2020-01-01"), (50001, "same", "2021-01-01")])
         run, entry, state, columns = self.run_for(table, chunk=True)
@@ -216,6 +225,7 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
         self.assertEqual(len(self.values(table)), 2)
 
     def resume_mapping_publication(self, after):
+        """Interrupt either side of the atomic rename and prove deterministic same-version recovery."""
         table = "billing_on_diskname"
         self.seed(table, [(1, "same", "2020-01-01"), (2, "same", "2021-01-01")])
         run, entry, state, columns = self.run_for(table)
@@ -290,6 +300,7 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
         self.assertEqual(o19billing.check_audit(self.plain, table, self.dst, self.arch), [])
 
     def test_canonical_audit_fixture_matches_application_migration(self):
+        """The installed-package test schema must match the paired application migration bytes."""
         application = Path(carlos_path("database", "mysql", "migration", "common",
                                       "V1.0.59.33__audit_imported_billing_filenames.sql"))
         if not application.is_file():

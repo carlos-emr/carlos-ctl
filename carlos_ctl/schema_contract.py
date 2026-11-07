@@ -68,6 +68,7 @@ def capture(query, schema):
 
 
 def migration_digest(root, province, exclude=()):
+    """Bind migration bytes deterministically, excluding only explicitly named recovery additions."""
     digest = hashlib.sha256()
     root = Path(root)
     for location in ("common", province):

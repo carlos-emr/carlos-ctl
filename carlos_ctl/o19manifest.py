@@ -48,6 +48,7 @@ SCHEMA_MANIFEST_FORMAT = 2
 
 
 def manifest_format(kind):
+    """Return the schema envelope version while preserving legacy props and preflight formats."""
     return SCHEMA_MANIFEST_FORMAT if kind == "o19map-schema" else MANIFEST_FORMAT
 
 #: manifest kind -> file name (the kind is written into the file too)

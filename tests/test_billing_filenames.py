@@ -11,6 +11,7 @@ from carlos_ctl import o19billing, o19etl, o19import, o19manifest
 
 class TestBillingContract(unittest.TestCase):
     def test_host_preflight_uses_restored_case_for_filename_counts(self):
+        """Host preflight must count the complete namespace before table-case normalization."""
         sources = {"billing_on_diskname": "Billing_on_diskname", "billing_on_filename": "BILLING_ON_FILENAME"}
         entries = {table: {"class": "copy", "billing_filename": o19billing.RULE,
                            "value_exprs": {o19billing.TABLES[table][0]: o19billing.expression(table)}}
@@ -39,6 +40,7 @@ class TestBillingContract(unittest.TestCase):
         self.assertEqual(o19import.pristine_violations({o19billing.AUDIT: 0}), [])
 
     def test_missing_or_changed_rule_is_refused_for_an_ontario_source(self):
+        """A copy without the exact audited rule must fail before dependent writes."""
         table = "billing_on_diskname"
         entry = {"class": "copy", "billing_filename": o19billing.RULE,
                  "value_exprs": {"ohipfilename": o19billing.expression(table)}}
@@ -74,6 +76,7 @@ class TestBillingContract(unittest.TestCase):
             self.assertEqual(o19billing.inventory({"query": query, "state_dir": directory}, directory), [])
 
     def test_content_migration_acceptance_cannot_waive_missing_originals(self):
+        """A content acknowledgement must never waive structural evidence loss."""
         with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
             for function in ("row_parity", "preserved_parity", "preserved_content_parity",
                              "copy_content_parity", "merge_content_parity", "archived_column_parity"):
