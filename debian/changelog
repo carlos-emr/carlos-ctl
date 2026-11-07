@@ -1,3 +1,18 @@
+carlos-ctl (1.3.2~dev1) resolute; urgency=medium
+
+  * Import historical Ontario billing filename collisions without dropping
+    submissions or changing source values. Reserve original names, allocate
+    against destination comparisons, and retain verified archive/live maps.
+  * Gate ambiguous billing files for explicit reconciliation; report the
+    preserved files and mapping before clinical use. Verify evidence again
+    at P4, P7 and cleanup; retain deterministic interrupted-copy recovery.
+  * Require schema manifest protocol 2 and ETL contract 4. Preserve verified
+    pre-copy recovery across the additive billing audit schema migration.
+  * Add installed-package MariaDB coverage for collisions, source values,
+    width boundaries, checkpoint loss and tampered audit mappings.
+
+ -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Sat, 07 Nov 2026 11:40:00 -0500
+
 carlos-ctl (1.3.1) resolute; urgency=medium
 
   * Recover verified pre-copy OSCAR imports after the supported application

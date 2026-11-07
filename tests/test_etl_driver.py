@@ -419,6 +419,18 @@ class TestAColumnCarlosAddedAfterTheFork(EtlDriverBase):
 class TestTheCopyPath(EtlDriverBase):
     """What reaches the database for each manifest class."""
 
+    def test_bc_archives_unknown_ontario_table_present_in_development_target(self):
+        """The P4 caller must pass the BC profile through to billing prechecks."""
+        table = "billing_on_diskname"
+        source = dict(SRC_COLUMNS, **{table: ["id", "ohipfilename"]})
+        target = dict(DST_COLUMNS, **{table: ["id", "ohipfilename"]})
+        db, _lines, _counts = self.run_etl(
+            src_columns=source, dst_columns=target, counts={(SRC, table): 2},
+            ctx_over={"province": "bc", "accepted": {"unknown-as-archive"}})
+        self.assertIn("INSERT INTO `o19_archive`.`billing_on_diskname__new` SELECT * "
+                      "FROM `o19_import`.`billing_on_diskname`", db.writes)
+        self.assertEqual(self.writes_matching(db, r"^INSERT INTO `carlos`\.`billing_on_diskname`"), [])
+
     def test_a_copy_table_is_inserted_from_staging(self):
         db, _lines, counts = self.run_etl()
         inserts = self.writes_matching(

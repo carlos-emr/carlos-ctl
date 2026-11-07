@@ -67,16 +67,40 @@ def capture(query, schema):
     return metadata
 
 
-def migration_digest(root, province):
+def migration_digest(root, province, exclude=()):
+    """Bind migration bytes deterministically, excluding only explicitly named recovery additions."""
     digest = hashlib.sha256()
     root = Path(root)
     for location in ("common", province):
         if not (root / location).is_dir():
             raise ValueError("missing packaged migration location: " + location)
         for path in sorted((root / location).glob("V*.sql")):
+            if path.name in exclude:
+                continue
             digest.update((location + "/" + path.name + "\0").encode())
             digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def pre_billing_contract(schema_root, province):
+    """The exact preceding contract for the additive billing audit migration.
+
+    This candidate grants nothing by itself: recovery also requires its entire
+    document hash to equal the old ledger and every physical definition to
+    match the pristine target. Future unrelated changes therefore fail closed.
+    """
+    filename = "V1.0.59.33__audit_imported_billing_filenames.sql"
+    root = Path(schema_root)
+    if not (root / "migration" / "common" / filename).is_file():
+        return None
+    current = load(root, province)
+    if not any(row[0] == "billing_filename_import" for row in current["schema"]["tables"]):
+        return None
+    prior = dict(current)
+    prior["migration_sha256"] = migration_digest(root / "migration", province, exclude=(filename,))
+    prior["schema"] = {kind: [row for row in rows if row[0] != "billing_filename_import"]
+                       for kind, rows in current["schema"].items()}
+    return prior
 
 
 def load(schema_root, province):
