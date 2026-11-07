@@ -14,13 +14,14 @@ from .util import sql_escape
 
 RULE = "o19-billing-v1"
 AUDIT = "billing_filename_import"
+IMPORT_ACTOR = "carlos-ctl/import-o19"
 TABLES = {
     "billing_on_diskname": ("ohipfilename", "createdatetime", "claim"),
     "billing_on_filename": ("htmlfilename", "timestamp", "html"),
 }
 AUDIT_COLUMNS = ("source_table", "source_id", "original_filename", "imported_filename",
                  "group_size", "reason", "file_status", "file_sha256", "reconciled_by",
-                 "reconciled_at")
+                 "reconciled_at", "lastUpdateUser", "lastUpdateDate")
 
 
 def ident(value):
@@ -259,6 +260,8 @@ def check_audit(query, table, dst, arch):
             "a.group_size = m.group_size AND BINARY a.reason = BINARY m.reason")
     sql = ("SELECT COUNT(*) FROM {0} m LEFT JOIN {1} a ON a.source_table = {2} AND a.source_id = m.row_id "
            "WHERE a.source_id IS NULL OR NOT (({3})) OR "
+           "a.lastUpdateUser IS NULL OR TRIM(a.lastUpdateUser) = '' OR "
+           "a.lastUpdateDate IS NULL OR YEAR(a.lastUpdateDate) = 0 OR "
            "(m.group_size = 1 AND a.file_status <> 'unchanged') OR "
            "(m.group_size > 1 AND a.file_status NOT IN ('ambiguous', 'reconciled')) OR "
            "(a.file_status = 'reconciled' AND (a.file_sha256 IS NULL "
@@ -291,9 +294,9 @@ def prepare(run, table, entry, state, dst_cols):
                 raise QueryError("; ".join(issues))
         else:
             run.query("INSERT INTO {0} (source_table, source_id, original_filename, imported_filename, "
-                      "group_size, reason, file_status) SELECT {1}, row_id, original_filename, "
-                      "imported_filename, group_size, reason, IF(group_size > 1, 'ambiguous', 'unchanged') "
-                      "FROM {2}".format(audit, literal(table), mapping))
+                      "group_size, reason, file_status, lastUpdateUser) SELECT {1}, row_id, original_filename, "
+                      "imported_filename, group_size, reason, IF(group_size > 1, 'ambiguous', 'unchanged'), {3} "
+                      "FROM {2}".format(audit, literal(table), mapping, literal(IMPORT_ACTOR)))
     issues = check_helper(run.plain, table, run.src, run.arch, run.src_info[table], dst_cols)
     issues += check_audit(run.plain, table, run.dst, run.arch)
     if issues:
