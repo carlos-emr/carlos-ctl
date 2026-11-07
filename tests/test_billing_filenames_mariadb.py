@@ -141,6 +141,21 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
         self.assertEqual(self.plain("SELECT HEX(original_filename) FROM `{0}`.`{1}` ORDER BY row_id".format(
             self.arch, o19billing.helper(table))), [[name.encode().hex().upper()]] * 2)
 
+    def test_claim_candidates_also_reserve_original_html_names(self):
+        table = "billing_on_diskname"
+        self.seed(table, [(1, "same", "2021-01-01"), (2, "same", "2021-01-01")])
+        self.seed("billing_on_filename", [(3, "o19-claim-2021-2-0.claim", "2021-01-01")])
+        self.copy(table)
+        self.assertEqual(self.values(table)[1][1], "o19-claim-2021-2-1.claim")
+
+    def test_preflight_counts_mixed_case_restored_table_before_normalization(self):
+        table = "billing_on_diskname"
+        self.seed(table, [(1, "same", "2020-01-01"), (2, "same", "2021-01-01")])
+        info = o19etl.introspect_columns(self.plain, self.dst)[table]["ohipfilename"]
+        self.plain("RENAME TABLE `{0}`.`{1}` TO `{0}`.`Billing_on_diskname`".format(self.src, table))
+        self.assertEqual(o19billing.collision_count(
+            self.plain, table, self.src, info, "Billing_on_diskname"), 2)
+
     def test_resume_after_insert_commits_without_completion_checkpoint(self):
         table = "billing_on_diskname"
         self.seed(table, [(1, "same", "2020-01-01"), (50001, "same", "2021-01-01")])
@@ -161,6 +176,34 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
         self.assertNotIn("done_through", state)
         self.copy(table, chunk=True)
         self.assertEqual(len(self.values(table)), 2)
+
+    def resume_mapping_publication(self, after):
+        table = "billing_on_diskname"
+        self.seed(table, [(1, "same", "2020-01-01"), (2, "same", "2021-01-01")])
+        run, entry, state, columns = self.run_for(table)
+        original = run.query
+
+        def interrupted(sql):
+            if sql.startswith("RENAME TABLE "):
+                if after:
+                    original(sql)
+                raise o19etl.QueryError("simulated interruption around atomic mapping publication")
+            return original(sql)
+
+        run.query = interrupted
+        with self.assertRaises(o19etl.QueryError):
+            o19billing.prepare(run, table, entry, state, columns)
+        self.assertTrue(o19etl.load_progress(run.state_dir)["tables"][table]["billing_started"])
+        self.assertEqual(self.values(table), [])
+        self.copy(table)
+        self.assertEqual([row[1] for row in self.values(table)],
+                         ["o19-claim-2020-1-0.claim", "o19-claim-2021-2-0.claim"])
+
+    def test_resume_before_mapping_publication(self):
+        self.resume_mapping_publication(after=False)
+
+    def test_resume_after_mapping_publication_without_acknowledgement(self):
+        self.resume_mapping_publication(after=True)
 
     def test_changed_original_is_detected_even_when_live_audit_is_changed_to_match(self):
         table = "billing_on_diskname"

@@ -1832,6 +1832,11 @@ def run_p2(ctx) -> Dict:
         db_name=STAGING_SCHEMA)
     consent = o19map_schema.TABLES.get(o19etl.CONSENT_TABLE)
     staged_tables = o19etl.schema_tables(query, STAGING_SCHEMA)
+    # P2 precedes P4's table-case normalization. Keep the restored spelling
+    # for reads while looking up the canonical manifest/target contract.
+    staged_names = {}
+    for name in sorted(staged_tables, key=lambda value: (value != value.lower(), value)):
+        staged_names.setdefault(name.lower(), name)
     from . import o19billing
     billing_problems = o19billing.manifest_problems(
         o19map_schema.TABLES,
@@ -1854,7 +1859,8 @@ def run_p2(ctx) -> Dict:
         target_columns = o19etl.introspect_columns(query, ctx["target_db"])
         for table in active_billing:
             column = o19billing.TABLES[table][0]
-            count = o19billing.collision_count(query, table, STAGING_SCHEMA, target_columns[table][column])
+            count = o19billing.collision_count(query, table, STAGING_SCHEMA,
+                                               target_columns[table][column], staged_names[table.lower()])
             if count:
                 report["findings"].append(o19_preflight.finding(
                     "historical-billing-filenames", o19_preflight.ADVISORY,

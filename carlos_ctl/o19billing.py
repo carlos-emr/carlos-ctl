@@ -41,12 +41,14 @@ def expression(table):
 
 
 def mapped(table, entry):
+    """Recognize only the exact helper expression and versioned copy rule."""
     return (table in TABLES and entry.get("class") == "copy"
             and entry.get("billing_filename") == RULE
             and entry.get("value_exprs", {}).get(TABLES[table][0]) == expression(table))
 
 
 def manifest_problems(tables, source_tables, province=None):
+    """Refuse unaudited Ontario copies while allowing archived BC tables."""
     return [table + ": the application manifest lacks the audited billing filename rule; "
             "install the fixed carlos-emr/carlos-ctl package pair"
             for table in TABLES if table in source_tables
@@ -55,6 +57,7 @@ def manifest_problems(tables, source_tables, province=None):
 
 
 def key(expr, info):
+    """Compare source text using the destination column's charset/collation."""
     charset, collation = info.get("charset", ""), info.get("collation", "")
     if not all(re.fullmatch(r"[A-Za-z0-9_]+", item or "") for item in (charset, collation)):
         raise ValueError("billing filename destination charset/collation is unavailable")
@@ -62,6 +65,7 @@ def key(expr, info):
 
 
 def ranked_sql(table, src, cols):
+    """Derive collision-group sizes and year tags without changing staging."""
     column, date, _ = TABLES[table]
     filename = "s." + ident(column)
     year = "COALESCE(YEAR(s.{0}), 'x')".format(ident(date)) if date in cols else "'x'"
@@ -71,6 +75,7 @@ def ranked_sql(table, src, cols):
 
 
 def generated(table, alias="m"):
+    """Create bounded basenames carrying the complete row ID and retry nonce."""
     token = TABLES[table][2]
     # Complete numeric id + delimited nonce: different source ids cannot
     # generate each other's candidates. No filename prefix is truncated.
@@ -79,6 +84,7 @@ def generated(table, alias="m"):
 
 
 def precheck(query, src, dst_info, src_info, entries):
+    """Check mapped columns, original capacity and audit structure before writes."""
     problems = manifest_problems(entries, src_info)
     active = [t for t in TABLES if t in src_info and t in dst_info]
     problems.extend(manifest_problems(entries, active, province="on"))
@@ -119,18 +125,29 @@ def _source_shape(table, src_cols, dst_cols):
     return dict(src_cols, **{TABLES[table][0]: dst_cols[TABLES[table][0]]})
 
 
-def collision_predicate(table, src, info, alias="m"):
-    column = TABLES[table][0]
-    return ("{0}.`group_size` > 1 AND EXISTS (SELECT 1 FROM {1}.{2} s WHERE {3} = "
-            "{0}.`imported_filename`)".format(alias, ident(src), ident(table),
-                                              key("s." + ident(column), info)))
+def source_billing_tables(query, src):
+    """Find normalized claim/HTML tables sharing the billing file namespace."""
+    rows = query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = {0} "
+                 "AND TABLE_NAME IN ({1})".format(literal(src), ",".join(literal(t) for t in TABLES)))
+    return [row[0] for row in rows]
 
 
-def collision_count(query, table, src, info):
+def collision_predicate(table, src, info, alias="m", sources=None):
+    """Find allocated names that would reuse any original billing basename."""
+    # OHIP and HTML files share HOME_DIR. A generated claim name must also
+    # avoid an original HTML name (including vendor/custom filenames).
+    occupied = ["EXISTS (SELECT 1 FROM {0}.{1} s WHERE {2} = {3}.`imported_filename`)".format(
+        ident(src), ident(source), key("s." + ident(TABLES[source][0]), info), alias)
+        for source in (sources or [table])]
+    return "{0}.`group_size` > 1 AND ({1})".format(alias, " OR ".join(occupied))
+
+
+def collision_count(query, table, src, info, source_table=None):
+    """Count affected rows before P4 normalizes restored table-name case."""
     filename = "s." + ident(TABLES[table][0])
     return int(query("SELECT COALESCE(SUM(n), 0) FROM (SELECT COUNT(*) AS n FROM {0}.{1} s "
                      "WHERE {2} IS NOT NULL GROUP BY {3} HAVING COUNT(*) > 1) groups_to_rename".format(
-                         ident(src), ident(table), filename, key(filename, info)))[0][0])
+                         ident(src), ident(source_table or table), filename, key(filename, info)))[0][0])
 
 
 def build(query, table, src, arch, src_cols, dst_cols):
@@ -155,8 +172,10 @@ def build(query, table, src, arch, src_cols, dst_cols):
     query("INSERT INTO {0} SELECT row_id, original_filename, original_filename, group_size, "
           "year_tag, 0, IF(group_size > 1, 'collision', 'unchanged') FROM ({1}) r".format(path, ranked))
     query("UPDATE {0} m SET imported_filename = {1} WHERE group_size > 1".format(path, generated(table)))
-    count = int(query("SELECT COUNT(*) FROM " + path)[0][0])
-    occupied = collision_predicate(table, src, info)
+    sources = source_billing_tables(query, src)
+    count = sum(int(query("SELECT COUNT(*) FROM {0}.{1}".format(ident(src), ident(source)))[0][0])
+                for source in sources)
+    occupied = collision_predicate(table, src, info, sources=sources)
     for _ in range(count + 1):
         n = int(query("SELECT COUNT(*) FROM {0} m WHERE {1}".format(path, occupied))[0][0])
         if not n:
@@ -189,6 +208,9 @@ def check_helper(query, table, src, arch, src_cols, dst_cols, name=None):
     """
     path = ident(arch) + "." + ident(name or helper(table))
     rank = ranked_sql(table, src, _source_shape(table, src_cols, dst_cols))
+    sources = source_billing_tables(query, src)
+    source_count = " + ".join("(SELECT COUNT(*) FROM {0}.{1})".format(ident(src), ident(source))
+                              for source in sources)
     checks = [
         ("mapping rows or original values differ from staging",
          "SELECT COUNT(*) FROM ({0}) r LEFT JOIN {1} m ON m.row_id = r.row_id WHERE "
@@ -199,12 +221,12 @@ def check_helper(query, table, src, arch, src_cols, dst_cols, name=None):
              path, ident(src), ident(table))),
         ("mapping values do not follow the allocation policy",
          "SELECT COUNT(*) FROM {0} m WHERE NOT (BINARY m.imported_filename <=> BINARY "
-         "IF(m.group_size > 1, {1}, m.original_filename)) OR m.nonce > (SELECT COUNT(*) FROM {2}.{3}) "
+         "IF(m.group_size > 1, {1}, m.original_filename)) OR m.nonce > ({2}) "
          "OR m.reason <> IF(m.group_size > 1, 'collision', 'unchanged')".format(
-             path, generated(table), ident(src), ident(table))),
+             path, generated(table), source_count)),
         ("allocated filename collides with an original name",
          "SELECT COUNT(*) FROM {0} m WHERE {1}".format(
-             path, collision_predicate(table, src, dst_cols[TABLES[table][0]]))),
+             path, collision_predicate(table, src, dst_cols[TABLES[table][0]], sources=sources))),
         ("allocated filenames are not unique",
          "SELECT COUNT(*) FROM (SELECT imported_filename FROM {0} WHERE imported_filename IS NOT NULL "
          "GROUP BY imported_filename HAVING COUNT(*) > 1) d".format(path)),
@@ -213,6 +235,7 @@ def check_helper(query, table, src, arch, src_cols, dst_cols, name=None):
 
 
 def check_audit(query, table, dst, arch):
+    """Prove live evidence matches its helper and reconciliation is explicit."""
     mapping = ident(arch) + "." + ident(helper(table))
     audit = ident(dst) + "." + ident(AUDIT)
     same = ("(BINARY a.original_filename <=> BINARY m.original_filename) AND "
@@ -233,6 +256,7 @@ def check_audit(query, table, dst, arch):
 
 
 def prepare(run, table, entry, state, dst_cols):
+    """Publish verified helper/audit evidence before resumable clinical copying."""
     from .o19etl import QueryError, save_progress
     if not mapped(table, entry):
         raise QueryError(table + ": missing audited billing filename mapping")
@@ -269,6 +293,7 @@ def prepare(run, table, entry, state, dst_cols):
 
 
 def verify(query, src, dst, arch, src_info, dst_info, tables, live=True):
+    """Verify durable evidence; also compare live submissions during P4/P7."""
     ok, bad = [], []
     for table in TABLES:
         if table not in src_info or tables.get(table, {}).get("class") != "copy":

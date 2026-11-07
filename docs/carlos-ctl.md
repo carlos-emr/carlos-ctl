@@ -184,6 +184,9 @@ original filename is preserved. Every member of a colliding group receives
 a unique name; an old shared file is not assigned to a submission by guesswork.
 Original names remain reserved for future billing. The import report and
 root-only `billing-files-details.txt` identify the reconciliation work.
+Files included in the restored document tree are preserved. Check missing
+source files and custom `HOME_DIR` locations separately, especially when
+using `--skip-documents`.
 
 CARLOS gates ambiguous historical downloads and regeneration until the exact
 file is reconciled. The mapping survives cleanup in `o19_archive`, its CSV

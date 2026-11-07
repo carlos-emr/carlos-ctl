@@ -545,7 +545,10 @@ report, spot checks, UI smoke \(em before clinical use.
 .PP
 Historical Ontario billing filename collisions use an audited, resumable
 mapping. Every member of a colliding group receives a unique name; originals,
-IDs, timestamps and files are preserved. Original names remain reserved.
+IDs and timestamps are preserved. Files included in the restored document
+tree are preserved; check for missing source files and custom HOME_DIR
+locations separately, especially with \-\-skip-documents.
+Original names remain reserved.
 Ambiguous historical downloads and regeneration require file reconciliation;
 the report and root\-only billing-files-details.txt identify the work.
 The beta7 package pair requires schema manifest format 2 and ETL contract 4.
