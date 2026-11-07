@@ -35,10 +35,10 @@ import re
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import o19digest, o19map_schema, o19_preflight
+from . import o19billing, o19digest, o19map_schema, o19_preflight
 from .util import sql_escape, warn
 
-ETL_CONTRACT_VERSION = 3
+ETL_CONTRACT_VERSION = 4
 
 # a copy is windowed over the id RANGE, so a sparse id space costs
 # windows rather than rows. Beyond this the range is not a table's id
@@ -1686,7 +1686,7 @@ REBUILD_OLD = "__old"
 #: table names, and `oversized_preserved_names` bounds the ones a dump
 #: brings.
 SHADOW_SUFFIXES = ("", "__dropped", "__unknown_cols", "__idmap",
-                   "__preseed", "__live")
+                   "__preseed", "__live", "__filenames")
 
 
 def rebuild_statements(archive_schema: str, final: str,
@@ -2966,6 +2966,7 @@ def etl_precheck_problems(ctx, plain, query, src_schema: str,
     src, arch = src_schema, arch_schema
     problems = []
     problems.extend(unknown_manifest_classes(o19map_schema.TABLES))
+    problems.extend(o19billing.precheck(query, src, dst_info, src_info, effective))
     # only a ranked COPY applies the rule: a merge never builds the
     # helper, so a Consent entry of any other shape is refused too
     consent = effective.get(CONSENT_TABLE)
@@ -4202,6 +4203,8 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
         if cls == "merge":
             etl_merge_table(run, table, entry, tstate, dcols, repaired)
         else:
+            if table in o19billing.TABLES:
+                o19billing.prepare(run, table, entry, tstate, dcols)
             ranked = table == CONSENT_TABLE and consent_live_ranked(entry)
             if ranked:
                 etl_consent_live(run, entry, tstate, dcols)

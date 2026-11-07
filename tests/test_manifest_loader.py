@@ -32,7 +32,7 @@ from carlos_ctl import o19_preflight, o19manifest, o19map_props, o19map_schema
 def _write(directory, file_kind, **overrides):
     """A minimal manifest file of `kind` under `directory`, with the
     envelope overridable (a wrong format, a wrong kind)."""
-    body = {"format": o19manifest.MANIFEST_FORMAT, "kind": file_kind,
+    body = {"format": o19manifest.manifest_format(file_kind), "kind": file_kind,
             "generator": "test", "SCHEMA_MAP_VERSION": "o19map-0+test"}
     # every key the format requires, so the envelope tests exercise the
     # envelope and not the completeness check
@@ -110,7 +110,7 @@ class TestEnvelope(unittest.TestCase):
 
     def test_an_unknown_format_is_refused_before_any_key_is_read(self):
         _write(self.tmp.name, "o19map-schema",
-               format=o19manifest.MANIFEST_FORMAT + 1)
+               format=o19manifest.manifest_format("o19map-schema") + 1)
         with self.assertRaises(o19manifest.ManifestError) as caught:
             o19manifest.load("o19map-schema")
         self.assertIn("format", str(caught.exception))

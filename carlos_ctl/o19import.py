@@ -609,6 +609,10 @@ def gather_copy_counts(query, db: str) -> Dict[str, int]:
             continue
         counts[table] = int(query(
             "SELECT COUNT(*) FROM `{0}`.`{1}`".format(db, table))[0][0])
+    from . import o19billing
+    if o19billing.AUDIT in tables:
+        counts[o19billing.AUDIT] = int(query(
+            "SELECT COUNT(*) FROM `{0}`.`{1}`".format(db, o19billing.AUDIT))[0][0])
     return counts
 
 
@@ -1050,13 +1054,17 @@ def prepare_pre_copy_upgrade(ctx, actual):
     if not changed:
         try:
             legacy = HOST.pre_copy_schema_contract(ctx.get("province", "on"))
+            legacy_sha = hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest() if legacy else None
+            if (not legacy or legacy_sha != ctx.get("previous_contract_sha256")
+                    or schema_contract.differences(legacy["schema"], actual)):
+                legacy = HOST.pre_billing_schema_contract(ctx.get("province", "on"))
         except (OSError, ValueError) as exc:
             die("cannot verify the packaged pre-copy recovery contract: " + str(exc))
         legacy_sha = hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest() if legacy else None
         if (not legacy or legacy_sha != ctx.get("previous_contract_sha256")
                 or schema_contract.differences(legacy["schema"], actual)):
             return
-        changed = ["verified pre-fix OSCAR capacity and Consent schema"]
+        changed = ["verified preceding OSCAR import schema"]
     query, target = ctx["query"], ctx["target_db"]
     counts = gather_copy_counts(query, target)
     startup = startup_row_counts(query, target)
@@ -1824,6 +1832,35 @@ def run_p2(ctx) -> Dict:
         db_name=STAGING_SCHEMA)
     consent = o19map_schema.TABLES.get(o19etl.CONSENT_TABLE)
     staged_tables = o19etl.schema_tables(query, STAGING_SCHEMA)
+    from . import o19billing
+    billing_problems = o19billing.manifest_problems(
+        o19map_schema.TABLES,
+        [name for name in o19billing.TABLES
+         if name.lower() in {item.lower() for item in staged_tables}], ctx["province"])
+    for problem in billing_problems:
+        report["findings"].append(o19_preflight.finding(
+            "billing-package-contract", o19_preflight.BLOCKER,
+            "the installed application manifest lacks the audited billing filename rule", problem))
+    if billing_problems:
+        verdict, code, acknowledged, outstanding = o19_preflight.preflight_verdict(
+            report["findings"], ctx["accepted"])
+        report.update(verdict=verdict, exit_code=code,
+                      acknowledged=acknowledged,
+                      required_accepts=sorted({f["accept"] for f in outstanding}))
+    active_billing = [name for name in o19billing.TABLES
+                      if name.lower() in {item.lower() for item in staged_tables}
+                      and o19billing.mapped(name, o19map_schema.TABLES.get(name, {}))]
+    if active_billing and not billing_problems:
+        target_columns = o19etl.introspect_columns(query, ctx["target_db"])
+        for table in active_billing:
+            column = o19billing.TABLES[table][0]
+            count = o19billing.collision_count(query, table, STAGING_SCHEMA, target_columns[table][column])
+            if count:
+                report["findings"].append(o19_preflight.finding(
+                    "historical-billing-filenames", o19_preflight.ADVISORY,
+                    "{0}: {1} historical filename row(s) need disambiguation".format(table, count),
+                    "Every member of a colliding group receives a unique name. Original values and files "
+                    "are preserved; shared files require reconciliation before downloading/regenerating."))
     has_consent = any(name.lower() == o19etl.CONSENT_TABLE.lower()
                       for name in staged_tables)
     if (has_consent and (not consent or consent.get("class") != "copy"
@@ -2161,6 +2198,14 @@ def _row_parity(ctx):
     # model the copy differently from the copy
     src_info = o19etl.introspect_columns(ctx["query"], STAGING_SCHEMA)
     dst_info = o19etl.introspect_columns(ctx["query"], ctx["target_db"])
+    from . import o19billing
+    billing_ok, billing_bad = o19billing.verify(
+        ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive,
+        src_info, dst_info, o19map_schema.TABLES)
+    # Mapping/audit failures are structural failures, never waivable as
+    # accepted content differences: cleanup would otherwise lose originals.
+    ok.extend(billing_ok)
+    bad.extend(billing_bad)
     # the KEYS of every differing row, for the private details file. A
     # primary key joins straight back to a patient, an appointment or a
     # bill, so the report gets the count and this file gets the keys.
@@ -2581,6 +2626,7 @@ def import_report(ctx, progress: Dict, parity_ok: Sequence[str],
             "advisory", "content mismatch(es) accepted with --accept "
                         "content-migration", body))
     for title, key in (("surrogate ids reassigned on merge", "idmap"),
+                       ("historical billing filenames and file reconciliation", "billing"),
                        ("dangling foreign keys in the source", "fk"),
                        ("consent records (one live record per "
                         "patient and consent type)", "consent"),
@@ -2967,7 +3013,13 @@ def _cleanup_home_parity(ctx) -> Tuple[List[str], List[str]]:
         ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive)
     content_ok, content_bad = o19etl.preserved_content_parity(
         ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive)
-    return kept_ok + content_ok, kept_bad + content_bad
+    from . import o19billing
+    billing_ok, billing_bad = o19billing.verify(
+        ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive,
+        o19etl.introspect_columns(ctx["query"], STAGING_SCHEMA),
+        o19etl.introspect_columns(ctx["query"], ctx["target_db"]),
+        o19map_schema.TABLES, live=False)
+    return kept_ok + content_ok + billing_ok, kept_bad + content_bad + billing_bad
 
 
 def cleanup_data_refusal(started: bool,
@@ -3191,7 +3243,7 @@ FAILED_NEXT_STEPS = (
 RUN_FILES = ("report.txt", "import-report.txt", "import-report.json",
              "roles-details.txt", "privilege-diff.txt",
              "verify-details.txt", PRISTINE_DETAILS,
-             "documents-details.txt",
+             "documents-details.txt", "billing-files-details.txt",
              CONTENT_DETAILS, VERIFY_PROBLEMS, "preflight.txt",
              "preflight.json", "etl-progress.json",
              "content-transfer.json", "o19-digests.json",

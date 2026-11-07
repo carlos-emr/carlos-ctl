@@ -176,6 +176,23 @@ name back to it:
 sudo carlos-ctl destroy-data --confirm <server-name>
 ```
 
+## OSCAR 19 historical billing files
+
+The beta7 package pair (carlos-ctl 1.3.2) imports repeated Ontario billing
+filenames through an audited mapping. Every submission, ID, timestamp and
+original filename is preserved. Every member of a colliding group receives
+a unique name; an old shared file is not assigned to a submission by guesswork.
+Original names remain reserved for future billing. The import report and
+root-only `billing-files-details.txt` identify the reconciliation work.
+
+CARLOS gates ambiguous historical downloads and regeneration until the exact
+file is reconciled. The mapping survives cleanup in `o19_archive`, its CSV
+export, and the live `billing_filename_import` table. See the application's
+[migration and recovery runbook](https://github.com/carlos-emr/carlos/blob/main/docs/o19-import-deb.md#historical-ontario-billing-filenames-beta7).
+Schema manifest format 2 and ETL contract 4 require the matched package pair.
+A beta6 import that already copied data uses the tested restore-and-restart
+procedure; a changed package contract cannot be resumed across a partial copy.
+
 ## CDS import
 
 `carlos-ctl cds-import` runs the same CARLOS CDS import engine as the existing

@@ -1185,11 +1185,13 @@ def run_docs(ctx) -> None:
             die("no documents tar and no --accept no-documents sign-off")
         warn("importing WITHOUT documents (acknowledged) — document rows "
              "will reference files that are not there")
+        from . import o19billing
+        billing_lines = o19billing.inventory(ctx, ctx_root)
         csv_lines = _export_archives(ctx)
         o19import.report_append(state_dir, "P5 documents",
                                 "SKIPPED (no-documents acknowledged)\n"
                                 "archive CSV export:\n  "
-                                + "\n  ".join(csv_lines))
+                                + "\n  ".join(csv_lines + billing_lines))
         o19import.mark_done(state_dir, state, "documents",
                             skipped="no-documents")
         return
@@ -1334,6 +1336,8 @@ def run_docs(ctx) -> None:
 
     problems, lines, private_lines = reconcile(query, ctx["target_db"],
                                                ctx_root)
+    from . import o19billing
+    lines.extend(o19billing.inventory(ctx, ctx_root))
     if private_lines:
         private(["P5 reconciliation notes:"] + private_lines)
     csv_lines = _export_archives(ctx)

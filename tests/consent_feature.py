@@ -91,8 +91,8 @@ def _manifest(root, overlay):
     path = root / "debian/assets/o19-manifest/o19map_schema.json"
     model = json.loads(_read(path), object_pairs_hook=_unique_json_keys)
     if (not isinstance(model, dict) or type(model.get("format")) is not int
-            or model["format"] != 1 or model.get("kind") != "o19map-schema"):
-        raise ConsentFeatureError("manifest: expected format 1 o19map-schema envelope")
+            or model["format"] not in (1, 2) or model.get("kind") != "o19map-schema"):
+        raise ConsentFeatureError("manifest: expected format 1 or 2 o19map-schema envelope")
     provinces = [model, model["PROFILES"]["bc"]]
     present = []
     for province, data in zip(("ON", "BC"), provinces):

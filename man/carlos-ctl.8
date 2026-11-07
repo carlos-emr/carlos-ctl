@@ -542,6 +542,15 @@ command refuses unless the host's own configured name is typed back to it.
 .SS Clinic migration from OSCAR 19 (experimental)
 Migration output should receive a technical review \(em verification
 report, spot checks, UI smoke \(em before clinical use.
+.PP
+Historical Ontario billing filename collisions use an audited, resumable
+mapping. Every member of a colliding group receives a unique name; originals,
+IDs, timestamps and files are preserved. Original names remain reserved.
+Ambiguous historical downloads and regeneration require file reconciliation;
+the report and root\-only billing-files-details.txt identify the work.
+The beta7 package pair requires schema manifest format 2 and ETL contract 4.
+A beta6 partial copy must be restored to its pre\-import backup before an
+upgrade and fresh import; see the application migration runbook.
 .TP
 .B import-o19 (experimental)
 Import an OSCAR 19 clinic backup into a STOCK initial deploy (a fresh
@@ -935,6 +944,8 @@ the derived
 .I o19-derived-carlos.properties
 fragment, the root\-only
 .I documents-details.txt
+and the root\-only
+.I billing-files-details.txt
 and
 .I o19-archive-export/
 (the CSV export of the archived tables; its
