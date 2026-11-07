@@ -182,6 +182,8 @@ The beta7 package pair (carlos-ctl 1.3.2) imports repeated Ontario billing
 filenames through an audited mapping. Every submission, ID, timestamp and
 original filename is preserved. Every member of a colliding group receives
 a unique name; an old shared file is not assigned to a submission by guesswork.
+The OHIP and HTML columns share one file namespace, including a basename
+used just once in each table.
 Original names remain reserved for future billing. The import report and
 root-only `billing-files-details.txt` identify the reconciliation work.
 Files included in the restored document tree are preserved. Check missing

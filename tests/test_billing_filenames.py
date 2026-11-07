@@ -11,23 +11,27 @@ from carlos_ctl import o19billing, o19etl, o19import, o19manifest
 
 class TestBillingContract(unittest.TestCase):
     def test_host_preflight_uses_restored_case_for_filename_counts(self):
-        table = "billing_on_diskname"
-        entry = {"class": "copy", "billing_filename": o19billing.RULE,
-                 "value_exprs": {"ohipfilename": o19billing.expression(table)}}
+        sources = {"billing_on_diskname": "Billing_on_diskname", "billing_on_filename": "BILLING_ON_FILENAME"}
+        entries = {table: {"class": "copy", "billing_filename": o19billing.RULE,
+                           "value_exprs": {o19billing.TABLES[table][0]: o19billing.expression(table)}}
+                   for table in sources}
         report = {"findings": [], "verdict": "go", "exit_code": 0,
                   "acknowledged": [], "required_accepts": []}
         with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch.object(o19import.o19map_schema, "TABLES", {table: entry}))
+            stack.enter_context(mock.patch.object(o19import.o19map_schema, "TABLES", entries))
             stack.enter_context(mock.patch.object(o19import.o19_preflight, "run_checks", return_value=report))
             stack.enter_context(mock.patch.object(o19import.o19_preflight, "render_text", return_value=""))
-            stack.enter_context(mock.patch.object(o19etl, "schema_tables", return_value=["Billing_on_diskname"]))
-            stack.enter_context(mock.patch.object(o19etl, "introspect_columns", return_value={table: {"ohipfilename": {}}}))
-            count = stack.enter_context(mock.patch.object(o19billing, "collision_count", return_value=2))
+            stack.enter_context(mock.patch.object(o19etl, "schema_tables", return_value=list(sources.values())))
+            stack.enter_context(mock.patch.object(o19etl, "introspect_columns", return_value={
+                table: {o19billing.TABLES[table][0]: {}} for table in sources}))
+            count = stack.enter_context(mock.patch.object(o19billing, "collision_count", return_value=1))
             stack.enter_context(mock.patch.object(o19import, "report_content_transfer"))
             query = mock.Mock()
             o19import.run_p2({"query": query, "state": {}, "state_dir": directory,
                               "province": "on", "target_db": "target", "accepted": set(), "dry_run": True})
-            count.assert_called_once_with(query, table, o19import.STAGING_SCHEMA, {}, "Billing_on_diskname")
+            self.assertEqual(count.call_args_list, [
+                mock.call(query, table, o19import.STAGING_SCHEMA, {}, actual, sources)
+                for table, actual in sources.items()])
             self.assertTrue(any(f["id"] == "historical-billing-filenames" for f in report["findings"]))
 
     def test_a_previous_import_audit_is_not_a_pristine_target(self):

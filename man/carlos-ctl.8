@@ -544,7 +544,8 @@ Migration output should receive a technical review \(em verification
 report, spot checks, UI smoke \(em before clinical use.
 .PP
 Historical Ontario billing filename collisions use an audited, resumable
-mapping. Every member of a colliding group receives a unique name; originals,
+mapping across the shared OHIP and HTML file namespace, including a name
+used just once in each table. Every member receives a unique name; originals,
 IDs and timestamps are preserved. Files included in the restored document
 tree are preserved; check for missing source files and custom HOME_DIR
 locations separately, especially with \-\-skip-documents.

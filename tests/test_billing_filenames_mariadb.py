@@ -148,6 +148,44 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
         self.copy(table)
         self.assertEqual(self.values(table)[1][1], "o19-claim-2021-2-1.claim")
 
+    def test_shared_basename_across_tables_is_ambiguous_without_within_table_duplicates(self):
+        tables = list(o19billing.TABLES)
+        for table in tables:
+            self.seed(table, [(1, "shared.001", "2021-01-01")])
+        destination = o19etl.introspect_columns(self.plain, self.dst)
+        sources = {table: table for table in tables}
+        for table in tables:
+            info = destination[table][o19billing.TABLES[table][0]]
+            self.assertEqual(o19billing.collision_count(
+                self.plain, table, self.src, info, source_tables=sources), 1)
+            self.copy(table)
+        self.assertEqual(self.values(tables[0])[0][1], "o19-claim-2021-1-0.claim")
+        self.assertEqual(self.values(tables[1])[0][1], "o19-html-2021-1-0.html")
+        self.assertEqual(self.plain("SELECT source_table, source_id, original_filename, group_size, file_status "
+                                   "FROM `{0}`.{1} ORDER BY source_table".format(self.dst, o19billing.AUDIT)),
+                         [[table, "1", "shared.001", "2", "ambiguous"] for table in tables])
+        for table in tables:
+            self.assertEqual(self.values(table, self.src)[0][1], "shared.001")
+
+    def test_shared_namespace_uses_destination_collation_and_restored_case_in_preflight(self):
+        disk, html = o19billing.TABLES
+        self.seed(disk, [(1, "Éfile", "2020-01-01")])
+        self.seed(html, [(2, "efile ", "2021-01-01")])
+        destination = o19etl.introspect_columns(self.plain, self.dst)
+        actual = {disk: "Billing_on_diskname", html: "BILLING_ON_FILENAME"}
+        for table, spelling in actual.items():
+            self.plain("RENAME TABLE `{0}`.`{1}` TO `{0}`.`{2}`".format(self.src, table, spelling))
+        for table, spelling in actual.items():
+            self.assertEqual(o19billing.collision_count(
+                self.plain, table, self.src, destination[table][o19billing.TABLES[table][0]],
+                spelling, actual), 1)
+        for table, spelling in actual.items():
+            self.plain("RENAME TABLE `{0}`.`{1}` TO `{0}`.`{2}`".format(self.src, spelling, table))
+        for table in actual:
+            self.copy(table)
+        self.assertEqual(self.values(disk)[0][1], "o19-claim-2020-1-0.claim")
+        self.assertEqual(self.values(html)[0][1], "o19-html-2021-2-0.html")
+
     def test_preflight_counts_mixed_case_restored_table_before_normalization(self):
         table = "billing_on_diskname"
         self.seed(table, [(1, "same", "2020-01-01"), (2, "same", "2021-01-01")])

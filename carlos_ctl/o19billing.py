@@ -64,14 +64,26 @@ def key(expr, info):
     return "CONVERT({0} USING {1}) COLLATE {2}".format(expr, charset, collation)
 
 
-def ranked_sql(table, src, cols):
+def namespace_groups(src, info, sources):
+    """Count all references sharing a basename in the OHIP/HTML file namespace."""
+    names = " UNION ALL ".join(
+        "SELECT {0} AS filename FROM {1}.{2} s".format(
+            key("s." + ident(TABLES[table][0]), info), ident(src), ident(actual))
+        for table, actual in sources.items())
+    return ("SELECT filename, COUNT(*) AS group_size FROM ({0}) billing_names "
+            "WHERE filename IS NOT NULL GROUP BY filename".format(names))
+
+
+def ranked_sql(table, src, cols, sources=None):
     """Derive collision-group sizes and year tags without changing staging."""
     column, date, _ = TABLES[table]
     filename = "s." + ident(column)
     year = "COALESCE(YEAR(s.{0}), 'x')".format(ident(date)) if date in cols else "'x'"
+    groups = namespace_groups(src, cols[column], sources or {table: table})
     return ("SELECT s.`id` AS row_id, CONVERT({0} USING utf8mb4) AS original_filename, {1} AS year_tag, "
-            "CASE WHEN {0} IS NULL THEN 1 ELSE COUNT(*) OVER (PARTITION BY {2}) END AS group_size "
-            "FROM {3}.{4} s".format(filename, year, key(filename, cols[column]), ident(src), ident(table)))
+            "COALESCE(g.group_size, 1) AS group_size FROM {2}.{3} s LEFT JOIN ({4}) g "
+            "ON g.filename = {5}".format(filename, year, ident(src), ident(table), groups,
+                                         key(filename, cols[column])))
 
 
 def generated(table, alias="m"):
@@ -142,12 +154,14 @@ def collision_predicate(table, src, info, alias="m", sources=None):
     return "{0}.`group_size` > 1 AND ({1})".format(alias, " OR ".join(occupied))
 
 
-def collision_count(query, table, src, info, source_table=None):
+def collision_count(query, table, src, info, source_table=None, source_tables=None):
     """Count affected rows before P4 normalizes restored table-name case."""
     filename = "s." + ident(TABLES[table][0])
-    return int(query("SELECT COALESCE(SUM(n), 0) FROM (SELECT COUNT(*) AS n FROM {0}.{1} s "
-                     "WHERE {2} IS NOT NULL GROUP BY {3} HAVING COUNT(*) > 1) groups_to_rename".format(
-                         ident(src), ident(source_table or table), filename, key(filename, info)))[0][0])
+    sources = source_tables or {table: source_table or table}
+    groups = namespace_groups(src, info, sources)
+    return int(query("SELECT COUNT(*) FROM {0}.{1} s JOIN ({2}) g ON g.filename = {3} "
+                     "WHERE g.group_size > 1".format(ident(src), ident(source_table or sources[table]),
+                                                    groups, key(filename, info)))[0][0])
 
 
 def build(query, table, src, arch, src_cols, dst_cols):
@@ -168,11 +182,12 @@ def build(query, table, src, arch, src_cols, dst_cols):
           "group_size BIGINT NOT NULL, year_tag VARCHAR(8) NOT NULL, "
           "nonce BIGINT UNSIGNED NOT NULL, reason VARCHAR(32) NOT NULL) ENGINE=InnoDB".format(
               path, info["charset"], info["collation"]))
-    ranked = ranked_sql(table, src, _source_shape(table, src_cols, dst_cols))
+    sources = source_billing_tables(query, src)
+    ranked = ranked_sql(table, src, _source_shape(table, src_cols, dst_cols),
+                        {source: source for source in sources})
     query("INSERT INTO {0} SELECT row_id, original_filename, original_filename, group_size, "
           "year_tag, 0, IF(group_size > 1, 'collision', 'unchanged') FROM ({1}) r".format(path, ranked))
     query("UPDATE {0} m SET imported_filename = {1} WHERE group_size > 1".format(path, generated(table)))
-    sources = source_billing_tables(query, src)
     count = sum(int(query("SELECT COUNT(*) FROM {0}.{1}".format(ident(src), ident(source)))[0][0])
                 for source in sources)
     occupied = collision_predicate(table, src, info, sources=sources)
@@ -207,8 +222,9 @@ def check_helper(query, table, src, arch, src_cols, dst_cols, name=None):
     included in errors (filenames can identify a patient).
     """
     path = ident(arch) + "." + ident(name or helper(table))
-    rank = ranked_sql(table, src, _source_shape(table, src_cols, dst_cols))
     sources = source_billing_tables(query, src)
+    rank = ranked_sql(table, src, _source_shape(table, src_cols, dst_cols),
+                      {source: source for source in sources})
     source_count = " + ".join("(SELECT COUNT(*) FROM {0}.{1})".format(ident(src), ident(source))
                               for source in sources)
     checks = [

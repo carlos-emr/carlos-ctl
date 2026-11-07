@@ -1857,10 +1857,12 @@ def run_p2(ctx) -> Dict:
                       and o19billing.mapped(name, o19map_schema.TABLES.get(name, {}))]
     if active_billing and not billing_problems:
         target_columns = o19etl.introspect_columns(query, ctx["target_db"])
+        billing_sources = {name: staged_names[name.lower()] for name in active_billing}
         for table in active_billing:
             column = o19billing.TABLES[table][0]
             count = o19billing.collision_count(query, table, STAGING_SCHEMA,
-                                               target_columns[table][column], staged_names[table.lower()])
+                                               target_columns[table][column], staged_names[table.lower()],
+                                               billing_sources)
             if count:
                 report["findings"].append(o19_preflight.finding(
                     "historical-billing-filenames", o19_preflight.ADVISORY,
