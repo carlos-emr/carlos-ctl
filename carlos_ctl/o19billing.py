@@ -260,13 +260,13 @@ def check_audit(query, table, dst, arch):
             "a.group_size = m.group_size AND BINARY a.reason = BINARY m.reason")
     sql = ("SELECT COUNT(*) FROM {0} m LEFT JOIN {1} a ON a.source_table = {2} AND a.source_id = m.row_id "
            "WHERE a.source_id IS NULL OR NOT (({3})) OR "
-           "a.lastUpdateUser IS NULL OR TRIM(a.lastUpdateUser) = '' OR "
+           "a.lastUpdateUser IS NULL OR a.lastUpdateUser NOT REGEXP '[^[:space:]]' OR "
            "a.lastUpdateDate IS NULL OR YEAR(a.lastUpdateDate) = 0 OR "
            "(m.group_size = 1 AND a.file_status <> 'unchanged') OR "
            "(m.group_size > 1 AND a.file_status NOT IN ('ambiguous', 'reconciled')) OR "
            "(a.file_status = 'reconciled' AND (a.file_sha256 IS NULL "
            "OR BINARY a.file_sha256 NOT REGEXP '^[0-9a-f]{{64}}$' OR a.reconciled_at IS NULL "
-           "OR a.reconciled_by IS NULL OR TRIM(a.reconciled_by) = ''))".format(
+           "OR a.reconciled_by IS NULL OR a.reconciled_by NOT REGEXP '[^[:space:]]'))".format(
                mapping, audit, literal(table), same))
     extra = ("SELECT COUNT(*) FROM {0} a LEFT JOIN {1} m ON m.row_id = a.source_id "
              "WHERE a.source_table = {2} AND m.row_id IS NULL".format(audit, mapping, literal(table)))
