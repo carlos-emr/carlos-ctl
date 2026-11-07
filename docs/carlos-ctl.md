@@ -176,6 +176,14 @@ name back to it:
 sudo carlos-ctl destroy-data --confirm <server-name>
 ```
 
+## CDS export adapter
+
+`carlos-ctl cds-export --help` documents the export argument contract. Clinical
+execution requires the matching, qualified Java export engine; that engine and
+its installed qualification remain unfinished in this implementation branch.
+The [export command contract](cds-export-command.md) records the shared process
+transport, exact delegation scope, lifecycle, compatibility and completion rules.
+
 ## CDS import
 
 `carlos-ctl cds-import` runs the same CARLOS CDS import engine as the existing
