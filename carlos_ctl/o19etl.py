@@ -2966,7 +2966,8 @@ def etl_precheck_problems(ctx, plain, query, src_schema: str,
     src, arch = src_schema, arch_schema
     problems = []
     problems.extend(unknown_manifest_classes(o19map_schema.TABLES))
-    problems.extend(o19billing.precheck(query, src, dst_info, src_info, effective))
+    problems.extend(o19billing.precheck(query, src, dst_info, src_info, effective,
+                                      province=ctx.get("province", "on")))
     # only a ranked COPY applies the rule: a merge never builds the
     # helper, so a Consent entry of any other shape is refused too
     consent = effective.get(CONSENT_TABLE)

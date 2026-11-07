@@ -95,11 +95,11 @@ def generated(table, alias="m"):
             .format(token, alias, ".html" if token == "html" else ".claim"))
 
 
-def precheck(query, src, dst_info, src_info, entries):
+def precheck(query, src, dst_info, src_info, entries, province="on"):
     """Check mapped columns, original capacity and audit structure before writes."""
-    problems = manifest_problems(entries, src_info)
-    active = [t for t in TABLES if t in src_info and t in dst_info]
-    problems.extend(manifest_problems(entries, active, province="on"))
+    problems = manifest_problems(entries, src_info, province=province)
+    active = [t for t in TABLES if t in src_info and t in dst_info
+              and (province == "on" or entries.get(t, {}).get("class") == "copy")]
     if not active:
         return problems
     if AUDIT not in dst_info or not set(AUDIT_COLUMNS) <= set(dst_info[AUDIT]):

@@ -50,8 +50,22 @@ class TestBillingContract(unittest.TestCase):
                 self.assertTrue(o19billing.manifest_problems({table: dict(entry, **change)}, [table], "on"))
 
     def test_archived_ontario_tables_in_a_bc_profile_do_not_require_copy_helpers(self):
+        """BC archives ignore Ontario copy requirements even on a mixed development schema."""
         self.assertEqual(o19billing.manifest_problems(
             {"billing_on_diskname": {"class": "archive"}}, ["billing_on_diskname"], "bc"), [])
+        tables = {name: {} for name in o19billing.TABLES}
+        query = mock.Mock(side_effect=AssertionError("archived tables need no filename or audit queries"))
+        self.assertEqual(o19billing.precheck(query, "src", tables, tables, {}, province="bc"), [])
+        entries = {name: {"class": "archive"} for name in tables}
+        self.assertEqual(o19billing.precheck(query, "src", tables, tables, entries, province="bc"), [])
+        self.assertTrue(o19billing.precheck(query, "src", tables, tables, entries, province="on"))
+
+    def test_bc_explicit_copy_still_requires_the_audited_mapping(self):
+        """A BC override that requests a copy must not bypass the billing contract."""
+        table = "billing_on_diskname"
+        query = mock.Mock(side_effect=AssertionError("invalid column shape must fail before querying"))
+        self.assertTrue(o19billing.precheck(query, "src", {table: {}}, {table: {}},
+                                           {table: {"class": "copy"}}, province="bc"))
 
     def test_schema_envelope_requires_helper_aware_cli_protocol(self):
         self.assertEqual(o19manifest.manifest_format("o19map-schema"), 2)
