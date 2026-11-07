@@ -111,6 +111,28 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
                                  "WHERE source_table={2} ORDER BY source_id".format(
                                      self.dst, o19billing.AUDIT, o19billing.literal(table))),
                                  [["same", "ambiguous"], ["same", "ambiguous"]])
+                self.assertEqual(self.plain("SELECT lastUpdateUser, YEAR(lastUpdateDate) > 0 "
+                                 "FROM `{0}`.{1} WHERE source_table={2} ORDER BY source_id".format(
+                                     self.dst, o19billing.AUDIT, o19billing.literal(table))),
+                                 [["carlos-ctl/import-o19", "1"], ["carlos-ctl/import-o19", "1"]])
+
+    def test_update_actor_is_verified_without_freezing_later_reviewers(self):
+        """Missing provenance fails verification; a later named reviewer remains legitimate."""
+        table = "billing_on_diskname"
+        self.seed(table, [(1, "shared.001", "2020-01-01"), (2, "shared.001", "2021-01-01")])
+        self.copy(table)
+        for actor in ("", " ", "\t", " \t\r\n ", "\u2003", "\u00a0"):
+            with self.subTest(actor=repr(actor)):
+                self.plain("UPDATE `{0}`.{1} SET lastUpdateUser={2} WHERE source_id=1".format(
+                    self.dst, o19billing.AUDIT, o19billing.literal(actor)))
+                self.assertTrue(o19billing.check_audit(self.plain, table, self.dst, self.arch))
+        self.plain("UPDATE `{0}`.{1} SET lastUpdateUser='billing-reviewer', "
+                   "lastUpdateDate=CURRENT_TIMESTAMP WHERE source_id=1".format(self.dst, o19billing.AUDIT))
+        self.assertEqual(o19billing.check_audit(self.plain, table, self.dst, self.arch), [])
+        self.plain("SET SESSION sql_mode=''; UPDATE `{0}`.{1} "
+                   "SET lastUpdateDate='0000-00-00 00:00:00' WHERE source_id=1".format(
+                       self.dst, o19billing.AUDIT))
+        self.assertTrue(o19billing.check_audit(self.plain, table, self.dst, self.arch))
 
     def test_target_collation_not_source_collation_decides_groups(self):
         table = "billing_on_diskname"
@@ -298,6 +320,9 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
         self.plain("UPDATE `{0}`.{1} SET file_sha256=REPEAT('a',64), reconciled_by='reviewer', "
                    "reconciled_at='2021-02-03 04:05:06' WHERE source_id=1".format(self.dst, o19billing.AUDIT))
         self.assertEqual(o19billing.check_audit(self.plain, table, self.dst, self.arch), [])
+        self.plain("UPDATE `{0}`.{1} SET reconciled_by={2} WHERE source_id=1".format(
+            self.dst, o19billing.AUDIT, o19billing.literal("\t")))
+        self.assertTrue(o19billing.check_audit(self.plain, table, self.dst, self.arch))
 
     def test_canonical_audit_fixture_matches_application_migration(self):
         """The installed-package test schema must match the paired application migration bytes."""

@@ -72,6 +72,23 @@ class TestBillingContract(unittest.TestCase):
         self.assertEqual(o19manifest.manifest_format("o19map-props"), 1)
         self.assertEqual(o19manifest.manifest_format("o19-preflight"), 1)
 
+    def test_audit_provenance_columns_are_required_before_copy(self):
+        """A target missing either required update-audit column must fail before writes."""
+        table = "billing_on_diskname"
+        columns = {"id": {"type": "int"}, "ohipfilename": {
+            "char_len": 50, "charset": "utf8mb4", "collation": "utf8mb4_general_ci"}}
+        entry = {"class": "copy", "billing_filename": o19billing.RULE,
+                 "value_exprs": {"ohipfilename": o19billing.expression(table)}}
+        query = mock.Mock(return_value=[["0"]])
+        audit = {column: {} for column in o19billing.AUDIT_COLUMNS}
+        destination = {table: columns, o19billing.AUDIT: audit}
+        self.assertEqual(o19billing.precheck(query, "src", destination, {table: columns}, {table: entry}), [])
+        for column in ("lastUpdateUser", "lastUpdateDate"):
+            with self.subTest(column=column):
+                destination[o19billing.AUDIT] = {key: value for key, value in audit.items() if key != column}
+                self.assertTrue(any("audit schema" in problem for problem in o19billing.precheck(
+                    query, "src", destination, {table: columns}, {table: entry})))
+
     def test_helper_names_cannot_be_replaced_by_a_vendor_table(self):
         self.assertTrue(o19etl.reserved_helper_names([o19billing.helper("billing_on_filename")]))
 
