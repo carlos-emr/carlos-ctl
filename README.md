@@ -101,6 +101,10 @@ without capture and retires its own attestation after the engine exits.
 See [the operator reference](docs/carlos-ctl.md#cds-import) and
 `carlos-ctl cds-import --help` for flags and exit semantics.
 
+The companion `cds-export` command adapter is under development with the CARLOS
+exporter. It requires a matching qualified Java engine before clinical execution;
+see the [export command contract](docs/cds-export-command.md).
+
 ## Development
 
 ```bash

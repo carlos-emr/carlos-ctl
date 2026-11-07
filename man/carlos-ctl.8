@@ -510,6 +510,40 @@ Patient-level diagnostics, event/error logs and completeness receipts remain
 protected. Parsed bytes or a heartbeat do not establish clinical completion;
 inspect the recorded per-patient/category outcomes, outstanding review,
 attachments/contacts/routing/audit and report-delivery state.
+.SS CDS patient-data export
+.TP
+.B cds-export --provider ID --profile KEY --recipient KEY --audit-plan KEY
+The command adapter requires a compatible Java export engine that explicitly
+advertises the requested qualified profile. The Java engine and installed
+qualification are unfinished in this implementation branch; the adapter alone
+cannot produce a clinical export.
+.IP
+New requests select either
+.B --physicians ID[,ID]
+for every roster status or
+.B --patients-file PATH
+for a protected explicit selection. Categories default to all; an explicit
+.B --categories LIST
+must include Demographics. Encryption recipient and complete historical-audit
+access use server registry keys, never a command-line private key or password.
+.IP
+Existing-run operations are
+.BR "--status RUN_ID" ", " "--resume RUN_ID" ", " "--cancel RUN_ID" ", " "--report RUN_ID" ", " "--download RUN_ID" .
+They cannot replace accepted disclosure intent. Download additionally requires
+.B --artifact ID
+and
+.BR "--output PATH" .
+.B --status-submission KEY
+recovers the original accepted handle after a lost acknowledgment.
+.B --detach
+applies only to new submission or resume and requires an explicit durable-submit
+capability. Waiting for a worker and successful status/control are not clinical
+completion. Stopping a foreground wait does not itself request cancellation.
+The exact export ticket directory is
+.IR /run/carlos-cds-export-delegations .
+The engine must independently verify the root-issued exact-request ticket and
+current provider/patient/category rights. See docs/cds-export-command.md for the
+process contract and remaining installed-engine requirements.
 .SS Decommissioning
 .TP
 .BI "destroy-data --confirm " server-name
@@ -957,6 +991,11 @@ exits non\-zero when any check fails.
 reports its verdict as its status: 0 go, 1 go with acknowledgements, 2
 no\-go, and 3 when the tool itself failed \(em so 1 and 2 are answers, not
 errors.
+.B cds-export
+uses 0 for a completed export or successful observation/control, 1 for arguments,
+2 for configuration/runtime/compatibility failure, 3 for denied authority,
+4 for failed/review-required/incomplete execution, and 130 for interruption.
+A successful observation does not establish a completed export.
 .B cds-import
 uses 0 for a clean complete import, verified no-op or valid dry run; 1 for
 arguments; 2 for configuration/runtime/protocol failure; 3 for denied authority;
