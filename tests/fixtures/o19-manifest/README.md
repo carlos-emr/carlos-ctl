@@ -24,7 +24,3 @@ cp /path/to/carlos/debian/assets/o19-manifest/*.json tests/fixtures/o19-manifest
 Content-level integrity of the manifests (every table classified, every
 column grounded in the CARLOS schema) is tested in carlos, next to the
 generator: `scripts/migration/o19/tests/`.
-
-Snapshot refreshed from `carlos-emr/carlos` commit
-`e3791578ee577d78e99f03494d4542b64dc0e87b`, together with the standalone
-preflight data. The application CI separately tests its current exported data.

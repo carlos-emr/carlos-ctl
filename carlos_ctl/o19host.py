@@ -112,6 +112,10 @@ class Host(object):
             raise ValueError("invalid packaged pre-copy recovery contract")
         return document
 
+    def pre_billing_schema_contract(self, province: str):
+        from .schema_contract import pre_billing_contract
+        return pre_billing_contract("/usr/share/carlos-emr/schema", province)
+
     def db_ownership_lock_path(self) -> Optional[str]:
         """The lock every provisioning path on this host takes before it
         mutates the database, or None when there is none to share.

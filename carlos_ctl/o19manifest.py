@@ -42,6 +42,14 @@ MANIFEST_DIR_ENV = "CARLOS_CTL_O19_MANIFEST_DIR"
 #: MANIFEST_FORMAT into every file and bumps it only when a consumer could
 #: misread the previous shape
 MANIFEST_FORMAT = 1
+# Schema format 2 requires the billing helper lifecycle. A format-1 CLI
+# would evaluate the new expressions without building their helpers.
+SCHEMA_MANIFEST_FORMAT = 2
+
+
+def manifest_format(kind):
+    """Return the schema envelope version while preserving legacy props and preflight formats."""
+    return SCHEMA_MANIFEST_FORMAT if kind == "o19map-schema" else MANIFEST_FORMAT
 
 #: manifest kind -> file name (the kind is written into the file too)
 MANIFEST_FILES = {
@@ -134,19 +142,20 @@ def load(kind: str) -> Dict[str, Any]:
             path, data.get("kind"), kind))
     fmt = data.get("format")
     # `type is int`, not `==`: JSON true would otherwise pass as format 1
-    if type(fmt) is not int or fmt != MANIFEST_FORMAT:
+    expected_format = manifest_format(kind)
+    if type(fmt) is not int or fmt != expected_format:
         raise ManifestError(
             "{0}: manifest format {1!r}, but this carlos-ctl reads format "
             "{2}. Install the carlos-ctl release that matches the installed "
             "carlos-emr (dpkg -l carlos-emr carlos-ctl).".format(
-                path, fmt, MANIFEST_FORMAT))
+                path, fmt, expected_format))
     missing = [k for k in REQUIRED_KEYS[kind] if k not in data]
     if missing:
         raise ManifestError(
             "{0}: manifest is missing {1} -- not a complete format {2} "
             "{3} manifest. Reinstall carlos-emr (dpkg -l carlos-emr; apt "
             "reinstall carlos-emr).".format(
-                path, ", ".join(missing), MANIFEST_FORMAT, kind))
+                path, ", ".join(missing), expected_format, kind))
     return {k: v for k, v in data.items()
             if k not in ("format", "kind", "generator")}
 

@@ -1,10 +1,10 @@
 {
- "format": 1,
+ "format": 2,
  "kind": "o19map-schema",
  "generator": "scripts/migration/o19/generate_manifests.py",
- "SCHEMA_MAP_VERSION": "o19map-6+2740cda4",
+ "SCHEMA_MAP_VERSION": "o19map-7+81c32ac6",
  "O19_PROFILE": "on",
- "O19_SOURCE_COMMIT": "a7900d569d3faf741993e5e1da8c14021bbefede",
+ "O19_SOURCE_COMMIT": "unknown",
  "TABLES": {
   "AppDefinition": {
    "class": "copy",
@@ -98,8 +98,8 @@
     "deleted"
    ],
    "value_exprs": {
-    "optout": "IFNULL(s.`optout`, 1)",
-    "deleted": "IFNULL((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
+    "optout": "COALESCE(s.`optout`, 1)",
+    "deleted": "COALESCE((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
    },
    "fk_remap": {
     "consent_type_id": "consentType"
@@ -1199,7 +1199,11 @@
     "status",
     "total",
     "timestamp"
-   ]
+   ],
+   "value_exprs": {
+    "ohipfilename": "(SELECT f.`imported_filename` FROM {archive}.`billing_on_diskname__filenames` f WHERE f.`row_id` = s.`id`)"
+   },
+   "billing_filename": "o19-billing-v1"
   },
   "billing_on_eareport": {
    "class": "copy",
@@ -1268,7 +1272,11 @@
     "status",
     "total",
     "timestamp"
-   ]
+   ],
+   "value_exprs": {
+    "htmlfilename": "(SELECT f.`imported_filename` FROM {archive}.`billing_on_filename__filenames` f WHERE f.`row_id` = s.`id`)"
+   },
+   "billing_filename": "o19-billing-v1"
   },
   "billing_on_header": {
    "class": "copy",
@@ -13001,8 +13009,6 @@
    "lookupListId",
    "value",
    "label",
-   "icon",
-   "colour",
    "displayOrder",
    "active",
    "createdBy",
@@ -13249,7 +13255,6 @@
    "reasonCode",
    "reason",
    "location",
-   "locationCode",
    "resources",
    "type",
    "style",
@@ -13278,7 +13283,6 @@
    "notes",
    "reason",
    "location",
-   "locationCode",
    "resources",
    "type",
    "style",
@@ -22994,8 +22998,8 @@
   "scheduleholiday": 28,
   "scheduletemplate": 1,
   "scheduletemplatecode": 23,
-  "secObjPrivilege": 548,
-  "secObjectName": 140,
+  "secObjPrivilege": 514,
+  "secObjectName": 133,
   "secRole": 33,
   "secUserRole": 2,
   "security": 1,
@@ -24774,7 +24778,7 @@
  },
  "PROFILES": {
   "bc": {
-   "SCHEMA_MAP_VERSION": "o19map-6+5fe35f10",
+   "SCHEMA_MAP_VERSION": "o19map-7+e44c15d5",
    "O19_PROFILE": "bc",
    "TABLES": {
     "AppDefinition": {
@@ -24869,8 +24873,8 @@
       "deleted"
      ],
      "value_exprs": {
-      "optout": "IFNULL(s.`optout`, 1)",
-      "deleted": "IFNULL((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
+      "optout": "COALESCE(s.`optout`, 1)",
+      "deleted": "COALESCE((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
      },
      "fk_remap": {
       "consent_type_id": "consentType"
@@ -43062,8 +43066,6 @@
      "lookupListId",
      "value",
      "label",
-     "icon",
-     "colour",
      "displayOrder",
      "active",
      "createdBy",
@@ -43310,7 +43312,6 @@
      "reasonCode",
      "reason",
      "location",
-     "locationCode",
      "resources",
      "type",
      "style",
@@ -43339,7 +43340,6 @@
      "notes",
      "reason",
      "location",
-     "locationCode",
      "resources",
      "type",
      "style",
@@ -57411,8 +57411,8 @@
     "scheduleholiday": 28,
     "scheduletemplate": 1,
     "scheduletemplatecode": 23,
-    "secObjPrivilege": 550,
-    "secObjectName": 141,
+    "secObjPrivilege": 516,
+    "secObjectName": 134,
     "secRole": 33,
     "secUserRole": 2,
     "security": 1,

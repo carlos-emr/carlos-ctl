@@ -73,6 +73,22 @@ class TestPreCopyRecovery(unittest.TestCase):
                     "target_db": "carlos",
                     "query": lambda sql: [[o19import.o19map_schema.SEED_USER_NAME]]}
 
+    def test_additive_billing_transition_uses_exact_old_ledger_and_pristine_checks(self):
+        legacy = {"schema": metadata()}
+        self.ctx["schema_contract"]["schema"]["tables"] = [["billing_filename_import", "InnoDB", "Dynamic", "utf8mb4_general_ci"]]
+        self.ctx["previous_contract_sha256"] = hashlib.sha256(
+            json.dumps(legacy, sort_keys=True).encode()).hexdigest()
+        with mock.patch.object(o19import.HOST, "pre_copy_schema_contract", return_value=None), \
+                mock.patch.object(o19import.HOST, "pre_billing_schema_contract", return_value=legacy), \
+                mock.patch.object(o19import, "gather_copy_counts", return_value={}), \
+                mock.patch.object(o19import, "startup_row_counts", return_value={}), \
+                mock.patch.object(o19import.HOST, "backup_configured", return_value=True), \
+                mock.patch.object(o19import.HOST, "pre_import_backup", return_value=(True, "")), \
+                mock.patch.object(o19import.HOST, "import_schema_upgrade", return_value=0) as migrate:
+            o19import.prepare_pre_copy_upgrade(self.ctx, metadata())
+        migrate.assert_called_once_with()
+        self.assertEqual(self.ctx["state"]["inputs"]["target_contract_sha256"], "old")
+
     def test_known_consent_transition_requires_exact_recorded_and_physical_contract(self):
         legacy = {"schema": metadata()}
         self.ctx["schema_contract"]["schema"]["indexes"] = [["new Consent constraint"]]

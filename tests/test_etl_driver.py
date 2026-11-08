@@ -33,7 +33,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from carlos_ctl import o19etl, o19manifest, o19map_schema
+from carlos_ctl import o19billing, o19etl, o19manifest, o19map_schema
 
 SRC, DST, ARCH = "o19_import", "carlos", "o19_archive"
 
@@ -418,6 +418,18 @@ class TestAColumnCarlosAddedAfterTheFork(EtlDriverBase):
 
 class TestTheCopyPath(EtlDriverBase):
     """What reaches the database for each manifest class."""
+
+    def test_bc_archives_unknown_ontario_table_present_in_development_target(self):
+        """The P4 caller must pass the BC profile through to billing prechecks."""
+        table = "billing_on_diskname"
+        source = dict(SRC_COLUMNS, **{table: ["id", "ohipfilename"]})
+        target = dict(DST_COLUMNS, **{table: ["id", "ohipfilename"]})
+        db, _lines, _counts = self.run_etl(
+            src_columns=source, dst_columns=target, counts={(SRC, table): 2},
+            ctx_over={"province": "bc", "accepted": {"unknown-as-archive"}})
+        self.assertIn("INSERT INTO `o19_archive`.`billing_on_diskname__new` SELECT * "
+                      "FROM `o19_import`.`billing_on_diskname`", db.writes)
+        self.assertEqual(self.writes_matching(db, r"^INSERT INTO `carlos`\.`billing_on_diskname`"), [])
 
     def test_a_copy_table_is_inserted_from_staging(self):
         db, _lines, counts = self.run_etl()
@@ -1027,6 +1039,41 @@ class TestThePreChecks(EtlDriverBase):
             [w for w in db.writes if w.startswith(("INSERT", "DELETE",
                                                    "UPDATE"))], [],
             "a pre-check refusal wrote to the database")
+
+    def test_missing_billing_update_audit_columns_refuses_before_persistent_writes(self):
+        """Both missing provenance fields must stop the whole driver before persistent DDL/DML."""
+        table = "billing_on_diskname"
+
+        class BillingDb(FakeDb):
+            def _information_schema(self, sql):
+                """Give the billing identity and filename their canonical metadata."""
+                rows = super()._information_schema(sql)
+                for row in rows:
+                    if row[0] == table and row[1] == "id":
+                        row[2:4] = ["int", "int(11)"]
+                        row[5], row[8] = 0, 0
+                    elif row[0] == table and row[1] == "ohipfilename":
+                        row[3], row[5], row[8] = "varchar(50)", 50, 200
+                        row.extend(["utf8mb4", "utf8mb4_general_ci"])
+                return rows
+
+        source = dict(SRC_COLUMNS, **{table: ["id", "ohipfilename"]})
+        manifest = dict(MANIFEST, **{table: {
+            "class": "copy", "cols": ["id", "ohipfilename"], "billing_filename": o19billing.RULE,
+            "value_exprs": {"ohipfilename": o19billing.expression(table)}}})
+        for column in ("lastUpdateUser", "lastUpdateDate"):
+            with self.subTest(column=column):
+                target = dict(DST_COLUMNS, **{table: ["id", "ohipfilename"],
+                    o19billing.AUDIT: [name for name in o19billing.AUDIT_COLUMNS if name != column]})
+                db = BillingDb(src_columns=source, dst_columns=target)
+                error = io.StringIO()
+                with mock.patch.object(o19map_schema, "TABLES", manifest), \
+                        contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
+                    self.run_etl(db=db, ctx_over={"province": "on"})
+                self.assertIn("audit schema", error.getvalue())
+                self.assertEqual([write for write in db.writes if write.startswith(
+                    ("INSERT", "DELETE", "UPDATE", "CREATE", "DROP", "TRUNCATE", "RENAME", "ALTER"))
+                    and "__o19_twin_probe" not in write], [], db.writes)
 
     def test_a_fork_table_whose_preserved_name_would_not_fit_is_refused(
             self):
