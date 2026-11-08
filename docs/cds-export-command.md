@@ -1,11 +1,19 @@
 # CDS export command contract
 
-The implementation branch provides `carlos-ctl cds-export` argument handling and
-process transport. The matching Java25 entry point, minimal Spring context, durable
-metadata/control service and asynchronous browser MVC integration are implemented.
-Installed configuration/delegation/status/cancel checks pass against the packaged app.
-Clinical mapping, artifact publication and full clinical qualification remain unfinished;
-no export profile is currently advertised as qualified.
+The implementation provides `carlos-ctl cds-export` beside `cds-import`.
+The matching Java 25 engine uses the same clinical job service for foreground
+execution and durable asynchronous browser work. OntarioMD 5.2 is registered;
+PCON is not advertised.
+
+The actual root-delegated CLI has exported a native chart with no import metadata,
+observed its durable job from independent processes, downloaded the encrypted
+artifact, and refused an existing output destination. An independent recipient
+recovered the exact validated ZIP and all thirteen expected clinical facts.
+Status and diagnostics remained available with invalid active export settings.
+This establishes that installed checkpoint, not browser end-to-end qualification.
+The application PR remains a draft while authenticated browser and final
+integration checks are completed:
+[carlos-emr/carlos#5706](https://github.com/carlos-emr/carlos/pull/5706).
 
 Import and export share `cdsruntime.py` for Java launch selection, bounded capability
 probes, root-issued delegation tickets, signal forwarding and process outcomes.
