@@ -116,15 +116,26 @@ def _manifest(root, overlay):
 
 
 def _migration(root):
-    """Recognize the single audited Consent migration by its structural rules."""
+    """Validate one historical migration or the exact reviewed published pair."""
     directory = root / "database/mysql/migration/common"
     found = sorted(p for p in directory.iterdir()
                    if p.name.endswith("one_live_consent_per_type.sql"))
     if not found:
         return False
-    if len(found) != 1:
-        raise ConsentFeatureError("migration: expected exactly one one-live Consent migration")
-    sql = re.sub(r"/\*.*?\*/|--[^\n]*|#[^\n]*", " ", _read(found[0]), flags=re.S)
+    reviewed_pair = {
+        "V1.0.59.30__one_live_consent_per_type.sql",
+        "V1.0.77__one_live_consent_per_type.sql",
+    }
+    if len(found) != 1 and {p.name for p in found} != reviewed_pair:
+        raise ConsentFeatureError("migration: unreviewed duplicate one-live Consent migrations")
+    for path in found:
+        _validate_migration(path)
+    return True
+
+
+def _validate_migration(path):
+    """Require the generated column and non-dropped unique guard in each file."""
+    sql = re.sub(r"/\*.*?\*/|--[^\n]*|#[^\n]*", " ", _read(path), flags=re.S)
     sql = re.sub(r"\s+", " ", sql.replace("`", "")).lower()
     statements = sql.split(";")
     alters = [s for s in statements

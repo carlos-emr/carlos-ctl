@@ -266,6 +266,23 @@ class TestConsentFeature(unittest.TestCase):
         with self.assertRaises(ConsentFeatureError):
             classify(self.root)
 
+    def test_only_the_reviewed_published_pair_is_accepted_and_both_guards_are_required(self):
+        names = ("V1.0.59.30__one_live_consent_per_type.sql",
+                 "V1.0.77__one_live_consent_per_type.sql")
+        for damaged in (None, *names, "V100__one_live_consent_per_type.sql"):
+            with self.subTest(damaged=damaged):
+                self.fixture(True, True, False)
+                for name in names:
+                    sql = SQL.replace("UNIQUE KEY", "KEY") if name == damaged else SQL
+                    (self.migrations / name).write_text(sql, encoding="utf-8")
+                if damaged == "V100__one_live_consent_per_type.sql":
+                    (self.migrations / damaged).write_text(SQL, encoding="utf-8")
+                if damaged is None:
+                    self.assertTrue(classify(self.root))
+                else:
+                    with self.assertRaises(ConsentFeatureError):
+                        classify(self.root)
+
     def test_missing_generated_or_unique_contract_is_an_error(self):
         for sql in (SQL.replace("GENERATED ALWAYS AS", "DEFAULT"),
                     SQL.replace("UNIQUE KEY", "KEY"),

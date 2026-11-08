@@ -1,3 +1,14 @@
+carlos-ctl (1.3.2) resolute; urgency=medium
+
+  * Add cds-export beside cds-import, with argument-bound root delegation,
+    capability negotiation, signal propagation, durable job controls and
+    atomic authorized output download through the shared Java engine.
+  * Qualify each migration in the exact reviewed Consent history pair and
+    reject unknown duplicates or incomplete generated-column/unique guards.
+  * Refresh standalone assessment data from the current application manifest.
+
+ -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Sun, 08 Nov 2026 06:53:00 -0500
+
 carlos-ctl (1.3.1) resolute; urgency=medium
 
   * Recover verified pre-copy OSCAR imports after the supported application
