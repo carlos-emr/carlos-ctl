@@ -12,7 +12,7 @@ import os
 import re
 import sys
 from typing import List, Sequence
-from . import dbops, util, cdsruntime
+from . import cdsruntime, dbops as dbops, util as util
 
 # Retain the established internal testing/integration patch points while sharing the
 # actual transport implementation with export. These modules hold no user identity.

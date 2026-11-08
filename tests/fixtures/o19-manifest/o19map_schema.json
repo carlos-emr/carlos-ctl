@@ -2,7 +2,7 @@
  "format": 1,
  "kind": "o19map-schema",
  "generator": "scripts/migration/o19/generate_manifests.py",
- "SCHEMA_MAP_VERSION": "o19map-6+cccc8801",
+ "SCHEMA_MAP_VERSION": "o19map-6+2740cda4",
  "O19_PROFILE": "on",
  "O19_SOURCE_COMMIT": "a7900d569d3faf741993e5e1da8c14021bbefede",
  "TABLES": {
@@ -98,8 +98,8 @@
     "deleted"
    ],
    "value_exprs": {
-    "optout": "COALESCE(s.`optout`, 1)",
-    "deleted": "COALESCE((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
+    "optout": "IFNULL(s.`optout`, 1)",
+    "deleted": "IFNULL((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
    },
    "fk_remap": {
     "consent_type_id": "consentType"
@@ -13001,6 +13001,8 @@
    "lookupListId",
    "value",
    "label",
+   "icon",
+   "colour",
    "displayOrder",
    "active",
    "createdBy",
@@ -13247,6 +13249,7 @@
    "reasonCode",
    "reason",
    "location",
+   "locationCode",
    "resources",
    "type",
    "style",
@@ -13275,6 +13278,7 @@
    "notes",
    "reason",
    "location",
+   "locationCode",
    "resources",
    "type",
    "style",
@@ -22990,8 +22994,8 @@
   "scheduleholiday": 28,
   "scheduletemplate": 1,
   "scheduletemplatecode": 23,
-  "secObjPrivilege": 514,
-  "secObjectName": 133,
+  "secObjPrivilege": 548,
+  "secObjectName": 140,
   "secRole": 33,
   "secUserRole": 2,
   "security": 1,
@@ -24770,7 +24774,7 @@
  },
  "PROFILES": {
   "bc": {
-   "SCHEMA_MAP_VERSION": "o19map-6+e44c15d5",
+   "SCHEMA_MAP_VERSION": "o19map-6+5fe35f10",
    "O19_PROFILE": "bc",
    "TABLES": {
     "AppDefinition": {
@@ -24865,8 +24869,8 @@
       "deleted"
      ],
      "value_exprs": {
-      "optout": "COALESCE(s.`optout`, 1)",
-      "deleted": "COALESCE((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
+      "optout": "IFNULL(s.`optout`, 1)",
+      "deleted": "IFNULL((SELECT r.`deleted` FROM {archive}.`Consent__live` r WHERE r.`id` = s.`id`), 1)"
      },
      "fk_remap": {
       "consent_type_id": "consentType"
@@ -43058,6 +43062,8 @@
      "lookupListId",
      "value",
      "label",
+     "icon",
+     "colour",
      "displayOrder",
      "active",
      "createdBy",
@@ -43304,6 +43310,7 @@
      "reasonCode",
      "reason",
      "location",
+     "locationCode",
      "resources",
      "type",
      "style",
@@ -43332,6 +43339,7 @@
      "notes",
      "reason",
      "location",
+     "locationCode",
      "resources",
      "type",
      "style",
@@ -57403,8 +57411,8 @@
     "scheduleholiday": 28,
     "scheduletemplate": 1,
     "scheduletemplatecode": 23,
-    "secObjPrivilege": 516,
-    "secObjectName": 134,
+    "secObjPrivilege": 550,
+    "secObjectName": 141,
     "secRole": 33,
     "secUserRole": 2,
     "security": 1,
