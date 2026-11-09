@@ -115,7 +115,7 @@ def parser():
     modes.add_argument("--status-submission", action=_Once, type=_identifier, metavar="KEY",
                        help="recover the accepted handle after a lost acknowledgement")
     ap.add_argument("--artifact", action=_Once, type=_identifier, metavar="ID",
-                    help="opaque encrypted artifact ID, for download only")
+                    help="encrypted artifact identifier (use 'package' with the current engine), for download only")
     ap.add_argument("--output", action=_Once, metavar="PATH",
                     help="new private destination within the configured delivery root, for download only")
     return ap

@@ -52,7 +52,7 @@ durable acceptance, so later path changes cannot replace the accepted patient ID
 
 Existing jobs accept their original intent only. Status, resume, cancel, report and
 download cannot replace selection, categories, profile or recipient. Downloads require
-an opaque artifact ID and an owned, new protected destination. `--detach` is accepted
+`--artifact package` and an owned, new protected destination. `--detach` is accepted
 only for new submission/resume; acceptance must report waiting when no persistent
 compatible worker exists. Stopping a foreground wait is distinct from durable cancellation.
 
