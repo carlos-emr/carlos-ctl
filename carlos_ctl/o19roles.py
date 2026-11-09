@@ -2344,6 +2344,44 @@ def roles_rich_text_letter(run: 'RolesRun', ctx) -> None:
                      "scripts": scripts, "outcome": outcome})
 
 
+def roles_eform_image_paths(run: 'RolesRun') -> None:
+    """Remove the extra separator after the legacy image marker.
+
+    ``${oscar_image_path}`` expands to an ``imagefile=`` query prefix,
+    not a directory. A following slash becomes part of the query value
+    and the asset servlet rejects it. The replacement is narrow,
+    idempotent, ledgered, and independently checked against staging at P7.
+    """
+    if run.ledger.get("eform_image_paths"):
+        return
+    marker = "${oscar_image_path}/"
+    replacement = "${oscar_image_path}"
+    # No user-supplied SQL: these fixed strings contain no quote.
+    source_count = run.n(
+        "SELECT COUNT(*) FROM `{0}`.eform WHERE LOCATE(BINARY '{1}', "
+        "BINARY form_html) > 0".format(run.src, marker))
+    target_sql = ("SELECT COUNT(*) FROM `{0}`.eform WHERE LOCATE(BINARY '{1}', "
+                  "BINARY form_html) > 0".format(run.dst, marker))
+    target_count = run.n(target_sql)
+    if not source_count and not target_count:
+        return
+    if target_count:
+        run.query(
+            "UPDATE `{0}`.eform SET form_html = REPLACE(form_html, "
+            "'{1}', '{2}') WHERE LOCATE(BINARY '{1}', BINARY form_html) > 0"
+            .format(run.dst, marker, replacement))
+    remaining = run.n(
+        target_sql)
+    if remaining:
+        from .util import die
+        die("{0} eForm(s) still use the unroutable image-path separator "
+            "after the targeted rewrite".format(remaining))
+    run.report("roles: {0} eForm(s) with a leading image-path slash "
+               "normalised; original HTML remains in staging"
+               .format(source_count))
+    run.mark("eform_image_paths", {"source_rows": source_count})
+
+
 def run_roles(ctx, progress: Dict, save: Callable[[], None]) -> None:
     """The post-copy step, ledger-marked per sub-step under progress['roles'].
     ctx carries the ETL executors (query_etl with the bulk-copy prelude,
@@ -2413,6 +2451,7 @@ def run_roles(ctx, progress: Dict, save: Callable[[], None]) -> None:
     roles_report_appointment_programs(run)
     roles_prevention_types(run)
     roles_rich_text_letter(run, ctx)
+    roles_eform_image_paths(run)
 
 
 def _fmt_templates(mapping: Dict[str, str]) -> str:

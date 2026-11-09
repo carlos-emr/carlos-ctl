@@ -198,6 +198,32 @@ Schema manifest format 2 and ETL contract 4 require the matched package pair.
 A beta6 import that already copied data uses the tested restore-and-restart
 procedure; a changed package contract cannot be resumed across a partial copy.
 
+## OSCAR 19 beta8 import compatibility
+
+The beta8 pair (`carlos-ctl` 1.3.3, schema manifest format 3 and ETL contract
+6) preserves `DigitalSignature.demographicId=-1` without rewriting the stored
+value. Preflight refuses other invalid patient references and unsupported
+module values. P4 freezes a unique owner inferred from the staged source into
+an app-owned receipt; P7 verifies that receipt against the source again. A
+form submitted after import cannot claim an unassigned signature, and one
+without a unique source owner remains stored but unreadable. For eForms, the
+receipt considers only saved source `signatureValue` and Rich Text `Letter`
+fields, and rejects conflicting patients or modules. The document phase
+handles the three known stock Rich Text
+Letter assets according to package ownership, normalizes the exact legacy
+`${oscar_image_path}/` marker, and ignores comments and script bodies when
+enumerating static eForm assets. It checks that every referenced clinic
+document and eForm asset came from the source tar, so a nonempty target
+placeholder does not hide missing source material. Final verification repeats
+the source and service-account readability checks. Verified private snapshots
+are reused between assessment and the real import to reduce disk use.
+
+A beta7 import that has already copied rows cannot resume under beta8.
+Restore its pre-import database, document tree and import state, then run a
+fresh assessment and import with the matched packages. The
+[application runbook](https://github.com/carlos-emr/carlos/blob/main/docs/o19-import-deb.md#beta8-package-pair-and-a-beta7-import-already-in-progress)
+has the complete recovery sequence.
+
 ## CDS import
 
 `carlos-ctl cds-import` runs the same CARLOS CDS import engine as the existing

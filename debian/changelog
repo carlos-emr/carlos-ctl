@@ -1,3 +1,17 @@
+carlos-ctl (1.3.3~dev1) resolute; urgency=medium
+
+  * Preserve OSCAR 19 digital signatures with demographicId=-1 exactly and
+    refuse ambiguous or orphaned patient references before copying. Require
+    schema manifest format 3 and ETL contract 6 for this transition.
+  * Reconcile stock eForm collisions with a recorded source and package asset
+    policy; correct only the known legacy image-path marker. Ignore HTML
+    comments and dynamic script bodies during static asset checking.
+  * Verify source document membership again after resume, test files under
+    the service account, and reuse checked input snapshots to reduce disk
+    pressure before the real import.
+
+ -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Mon, 09 Nov 2026 13:00:00 +0000
+
 carlos-ctl (1.3.2~dev1) resolute; urgency=medium
 
   * Import historical Ontario billing filename collisions without dropping

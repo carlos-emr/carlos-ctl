@@ -30,8 +30,32 @@ QUOTING_MODES = re.compile(
     rb"\b(?:ANSI_QUOTES|NO_BACKSLASH_ESCAPES|ANSI|DB2|MAXDB|MSSQL|ORACLE|POSTGRESQL)\b", re.I)
 
 
-def snapshot_file(path, destination):
-    """Copy an opened input atomically, including when source equals destination."""
+def snapshot_matches(path, expected_sha, allow_symlink=False):
+    """A private snapshot may be reused only when its bytes still match."""
+    if (not expected_sha or (not allow_symlink and os.path.islink(path))
+            or not os.path.isfile(path)):
+        return False
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest() == expected_sha
+
+
+def snapshot_file(path, destination, expected_sha=None):
+    """Copy atomically, or reuse a verified immutable private snapshot.
+
+    The caller hashes the external source first. Recheck it even when the
+    destination is reusable, so a source modified between selection and
+    preparation is never silently replaced by an older private copy.
+    """
+    if snapshot_matches(destination, expected_sha):
+        # The initial copy follows a caller-supplied symlink to a regular
+        # source file. Reuse checks that same source byte stream, while the
+        # private destination must still be a real file.
+        if not snapshot_matches(path, expected_sha, allow_symlink=True):
+            raise ValueError("an input changed while its private snapshot was prepared")
+        return expected_sha
     incoming = destination + ".incoming"
     digest = hashlib.sha256()
     try:
@@ -315,7 +339,7 @@ def preparation_footprint(path):
     return position + count, largest if largest > STATEMENT_SPOOL_LIMIT else 0
 
 
-def prepare_dump_set(paths, workdir):
+def prepare_dump_set(paths, workdir, expected_digests=None):
     """Snapshot, inventory and combine two or more dumps; return paths/provenance.
 
     A single dump retains the established interface. For multiple dumps the
@@ -333,10 +357,11 @@ def prepare_dump_set(paths, workdir):
     duplicates = []
     for number, path in enumerate(paths):
         size = os.path.getsize(path)
-        if shutil.disk_usage(workdir).free < size:
-            raise ValueError("insufficient disk to snapshot the complete SQL dump set")
         snapshot = os.path.join(workdir, "part-{0:03d}.sql{1}".format(number, ".gz" if path.endswith(".gz") else ""))
-        digest = snapshot_file(path, snapshot)
+        expected = expected_digests[number] if expected_digests is not None else None
+        if not snapshot_matches(snapshot, expected) and shutil.disk_usage(workdir).free < size:
+            raise ValueError("insufficient disk to snapshot the complete SQL dump set")
+        digest = snapshot_file(path, snapshot, expected)
         parts.append({"name": os.path.basename(path), "sha256": digest,
                       "snapshot": snapshot})
     if len(paths) == 1:
@@ -413,7 +438,7 @@ def prepared_document_member(member, name):
     return member
 
 
-def prepare_documents(paths, workdir):
+def prepare_documents(paths, workdir, expected_digests=None):
     """Combine full plus incremental document archives in explicit input order.
 
     The last occurrence of a path wins, as in OSCAR's documented restore.
@@ -426,10 +451,11 @@ def prepare_documents(paths, workdir):
     snapshots = []
     parts = []
     for number, path in enumerate(paths):
-        if shutil.disk_usage(workdir).free < os.path.getsize(path):
-            raise ValueError("insufficient disk to snapshot the documents backup set")
         snapshot = os.path.join(workdir, "documents-{0:03d}.tar{1}".format(number, ".gz" if path.endswith(".gz") else ""))
-        digest = snapshot_file(path, snapshot)
+        expected = expected_digests[number] if expected_digests is not None else None
+        if not snapshot_matches(snapshot, expected) and shutil.disk_usage(workdir).free < os.path.getsize(path):
+            raise ValueError("insufficient disk to snapshot the documents backup set")
+        digest = snapshot_file(path, snapshot, expected)
         snapshots.append(snapshot)
         parts.append({"name": os.path.basename(path), "sha256": digest})
     paths = snapshots
