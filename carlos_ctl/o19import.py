@@ -2350,6 +2350,18 @@ def run_p4(ctx) -> None:
             "report.txt with the mismatch list.".format(
                 len(bad), ctx["state_dir"],
                 rollback_hint(ctx["state"]).capitalize()))
+    from . import o19signatures
+    try:
+        frozen, unresolved = o19signatures.install_owners(
+            ctx["query_etl"], STAGING_SCHEMA, ctx["target_db"])
+    except (RuntimeError, ValueError, IndexError) as exc:
+        die("could not freeze imported -1 signature ownership from the "
+            "staged source: {0}; the ETL phase is incomplete and --resume "
+            "will retry before go-live".format(o19etl._query_reason(exc)))
+    report_append(ctx["state_dir"], "P4 signature ownership",
+                  "{0} source-proven owner(s) frozen; {1} unassigned "
+                  "signature(s) remain unreadable without a unique source "
+                  "reference".format(frozen, unresolved))
     mark_done(ctx["state_dir"], ctx["state"], "etl")
     log("etl complete — row parity clean for {0} table(s)"
         .format(len(ok)))
@@ -2789,6 +2801,13 @@ def run_p7(ctx) -> None:
                 problems.append("{0} unassigned digital signature(s) have a "
                                 "non-NULL foreign-key projection"
                                 .format(sentinel_projection))
+            from . import o19signatures
+            owner_problem = o19signatures.verification_problem(query, src, dst)
+            if owner_problem:
+                problems.append(owner_problem)
+            else:
+                lines.append("imported unassigned-signature owners match "
+                             "the staged source")
         except (RuntimeError, ValueError, IndexError) as exc:
             problems.append("digital signature integrity could not be checked: {0}"
                             .format(o19etl._query_reason(exc)))

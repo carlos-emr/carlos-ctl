@@ -201,9 +201,13 @@ procedure; a changed package contract cannot be resumed across a partial copy.
 ## OSCAR 19 beta8 import compatibility
 
 The beta8 pair (`carlos-ctl` 1.3.3, schema manifest format 3 and ETL contract
-5) preserves `DigitalSignature.demographicId=-1` without rewriting the stored
+6) preserves `DigitalSignature.demographicId=-1` without rewriting the stored
 value. Preflight refuses other invalid patient references and unsupported
-module values. The document phase handles the three known stock Rich Text
+module values. P4 freezes a unique owner inferred from the staged source into
+an app-owned receipt; P7 verifies that receipt against the source again. A
+form submitted after import cannot claim an unassigned signature, and one
+without a unique source owner remains stored but unreadable. The document
+phase handles the three known stock Rich Text
 Letter assets according to package ownership, normalizes the exact legacy
 `${oscar_image_path}/` marker, and ignores comments and script bodies when
 enumerating static eForm assets. It checks that every referenced clinic
