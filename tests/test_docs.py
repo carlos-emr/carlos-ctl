@@ -588,6 +588,40 @@ class TestStockEformCollisionPolicy(unittest.TestCase):
         self.assertEqual(o19docs.stock_collision_problems(
             self.state, "abc", self.target, {"blank.rtl"}), [])
 
+    def test_unreadable_stock_inventory_is_a_reportable_verification_error(self):
+        os.unlink(os.path.join(self.manifests, "stock-eform-assets.json"))
+        with self.assertRaisesRegex(ValueError, "inventory is unavailable"):
+            o19docs.stock_collision_problems(self.state, "abc", self.target,
+                                             {"blank.rtl"})
+
+
+class TestServiceAccountDocumentReadability(unittest.TestCase):
+    def test_a_referenced_fifo_is_reported_without_blocking_the_probe(self):
+        with tempfile.TemporaryDirectory(prefix="o19-readability-") as root:
+            doc_dir = os.path.join(root, "document")
+            os.makedirs(doc_dir)
+            os.mkfifo(os.path.join(doc_dir, "pipe"))
+            Path(doc_dir, "regular.pdf").write_bytes(b"document")
+
+            def query(sql):
+                if "SELECT docfilename" in sql:
+                    return [["pipe"], ["regular.pdf"]]
+                return []
+
+            real_run = subprocess.run
+
+            def run_probe(command, **kwargs):
+                self.assertEqual(command[:4], ["runuser", "-u", "unused", "--"])
+                # Exercise the actual child probe as this test's own user.
+                # A regression to blocking FIFO open fails in three seconds.
+                kwargs["timeout"] = 3
+                return real_run([sys.executable, "-c", command[-1]], **kwargs)
+
+            with mock.patch.object(o19docs.subprocess, "run", side_effect=run_probe):
+                self.assertEqual(o19docs.service_readability_problems(
+                    query, "carlos", root, "unused"),
+                    [os.path.join(doc_dir, "pipe")])
+
 
 class TestMoveIntoPlace(unittest.TestCase):
 

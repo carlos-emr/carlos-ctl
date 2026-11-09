@@ -109,7 +109,7 @@ class FakeDb(object):
     # -- the plain client: reads
     def plain(self, sql, db=None):
         a = self.answers
-        if ".eform WHERE LOCATE('${oscar_image_path}/', form_html) > 0" in sql:
+        if ".eform WHERE LOCATE(BINARY '${oscar_image_path}/', BINARY form_html) > 0" in sql:
             return [["0"]]
         for table, n in a["twinless"].items():
             if sql == o19etl.appended_row_count_sql(table, SRC, DST):

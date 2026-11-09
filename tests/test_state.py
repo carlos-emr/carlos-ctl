@@ -2935,6 +2935,50 @@ class TestVerifyPhaseFiles(unittest.TestCase):
                     "dump_sha256": self.DUMP_SHA256}}},
                 "query": query, "target_db": "carlos"}
 
+    def test_absent_source_signatures_are_explicitly_not_applicable(self):
+        ctx = self._ctx()
+        ctx["dev_target"] = True
+        ctx["state"]["phases"]["documents"] = {"skipped": "no-documents"}
+        original_query = ctx["query"]
+
+        def query(sql, db=None):
+            if "information_schema.TABLES" in sql and "DigitalSignature" in sql:
+                return [["0"]]
+            if "`DigitalSignature` s" in sql:
+                self.fail("an absent source signature table was queried")
+            return original_query(sql, db)
+
+        ctx["query"] = query
+        o19import.run_p7(ctx)
+        with open(os.path.join(self.state_dir, "report.txt"), encoding="utf-8") as fh:
+            self.assertIn("source DigitalSignature table absent; source value "
+                          "comparison not applicable", fh.read())
+
+    def test_corrupt_document_tar_becomes_a_reported_p7_problem(self):
+        ctx = self._ctx()
+        ctx["dev_target"] = True
+        ctx["documents"] = "source.tar"
+        original_query = ctx["query"]
+
+        def query(sql, db=None):
+            if "information_schema.TABLES" in sql and "DigitalSignature" in sql:
+                return [["0"]]
+            return original_query(sql, db)
+
+        ctx["query"] = query
+        with mock.patch.object(o19import.o19bundle, "read_tar_entries",
+                               side_effect=o19import.o19bundle.tarfile.ReadError(
+                                   "truncated archive")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                o19import.run_p7(ctx)
+        with open(os.path.join(self.state_dir, o19import.VERIFY_PROBLEMS),
+                  encoding="utf-8") as fh:
+            self.assertIn("final document verification could not run", fh.read())
+        with open(os.path.join(self.state_dir, "import-report.txt"),
+                  encoding="utf-8") as fh:
+            self.assertIn("final document verification could not run", fh.read())
+
     def test_private_files_carry_the_identifiers_and_report_the_counts(
             self):
         ctx = self._ctx()

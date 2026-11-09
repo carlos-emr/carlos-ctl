@@ -2358,17 +2358,17 @@ def roles_eform_image_paths(run: 'RolesRun') -> None:
     replacement = "${oscar_image_path}"
     # No user-supplied SQL: these fixed strings contain no quote.
     source_count = run.n(
-        "SELECT COUNT(*) FROM `{0}`.eform WHERE LOCATE('{1}', "
-        "form_html) > 0".format(run.src, marker))
-    target_sql = ("SELECT COUNT(*) FROM `{0}`.eform WHERE LOCATE('{1}', "
-                  "form_html) > 0".format(run.dst, marker))
+        "SELECT COUNT(*) FROM `{0}`.eform WHERE LOCATE(BINARY '{1}', "
+        "BINARY form_html) > 0".format(run.src, marker))
+    target_sql = ("SELECT COUNT(*) FROM `{0}`.eform WHERE LOCATE(BINARY '{1}', "
+                  "BINARY form_html) > 0".format(run.dst, marker))
     target_count = run.n(target_sql)
     if not source_count and not target_count:
         return
     if target_count:
         run.query(
             "UPDATE `{0}`.eform SET form_html = REPLACE(form_html, "
-            "'{1}', '{2}') WHERE LOCATE('{1}', form_html) > 0"
+            "'{1}', '{2}') WHERE LOCATE(BINARY '{1}', BINARY form_html) > 0"
             .format(run.dst, marker, replacement))
     remaining = run.n(
         target_sql)

@@ -48,6 +48,25 @@ class TestCompleteBackupSet(unittest.TestCase):
             o19sources.snapshot_file(str(source), str(destination), expected)
         self.assertEqual(hashlib.sha256(destination.read_bytes()).hexdigest(), expected)
 
+    def test_unchanged_symlinked_source_can_reuse_a_real_private_snapshot(self):
+        source = Path(self.dump("source.sql"))
+        link = self.root / "selected.sql"
+        link.symlink_to(source)
+        destination = self.root / "private.sql"
+        expected = hashlib.sha256(source.read_bytes()).hexdigest()
+
+        self.assertEqual(o19sources.snapshot_file(str(link), str(destination), expected),
+                         expected)
+        inode = destination.stat().st_ino
+        self.assertEqual(o19sources.snapshot_file(str(link), str(destination), expected),
+                         expected)
+        self.assertEqual(destination.stat().st_ino, inode)
+        self.assertFalse(destination.is_symlink())
+
+        source.write_bytes(source.read_bytes() + b"changed")
+        with self.assertRaisesRegex(ValueError, "input changed"):
+            o19sources.snapshot_file(str(link), str(destination), expected)
+
     def test_complementary_main_and_myisam_parts(self):
         paths = [self.dump("OscarBackup.sql"), self.dump("MyISAMBackup.sql.gz", "b", engine="MyISAM")]
         result = o19sources.prepare_dump_set(paths, self.work)

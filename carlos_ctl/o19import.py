@@ -2749,23 +2749,30 @@ def run_p7(ctx) -> None:
         # are a stronger contract: no coercion is authorized. Check the raw
         # values independently, including after a resume that skipped P4.
         try:
-            module_column = query(
-                "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE "
-                "TABLE_SCHEMA = '{0}' AND TABLE_NAME = 'DigitalSignature' "
-                "AND LOWER(COLUMN_NAME) = 'moduletype'".format(src))[0][0]
-            module_mismatch = ("NOT (BINARY s.`ModuleType` <=> BINARY d.`ModuleType`)"
-                               if int(module_column) else "d.`ModuleType` IS NOT NULL")
-            signature_mismatches = int(query(
-                "SELECT COUNT(*) FROM `{0}`.`DigitalSignature` s LEFT JOIN "
-                "`{1}`.`DigitalSignature` d ON s.`id` = d.`id` WHERE "
-                "d.`id` IS NULL OR NOT (s.`demographicId` <=> d.`demographicId`) "
-                "OR {2}".format(src, dst, module_mismatch))[0][0])
-            if signature_mismatches:
-                problems.append("{0} digital signature(s) do not preserve the "
-                                "source patient and module values exactly"
-                                .format(signature_mismatches))
+            source_signatures = int(query(
+                "SELECT COUNT(*) FROM information_schema.TABLES WHERE "
+                "TABLE_SCHEMA = '{0}' AND TABLE_NAME = 'DigitalSignature'"
+                .format(src))[0][0])
+            if source_signatures:
+                module_column = query(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE "
+                    "TABLE_SCHEMA = '{0}' AND TABLE_NAME = 'DigitalSignature' "
+                    "AND LOWER(COLUMN_NAME) = 'moduletype'".format(src))[0][0]
+                module_mismatch = ("NOT (BINARY s.`ModuleType` <=> BINARY d.`ModuleType`)"
+                                   if int(module_column) else "d.`ModuleType` IS NOT NULL")
+                signature_mismatches = int(query(
+                    "SELECT COUNT(*) FROM `{0}`.`DigitalSignature` s LEFT JOIN "
+                    "`{1}`.`DigitalSignature` d ON s.`id` = d.`id` WHERE "
+                    "d.`id` IS NULL OR NOT (s.`demographicId` <=> d.`demographicId`) "
+                    "OR {2}".format(src, dst, module_mismatch))[0][0])
+                if signature_mismatches:
+                    problems.append("{0} digital signature(s) do not preserve the "
+                                    "source patient and module values exactly"
+                                    .format(signature_mismatches))
+                else:
+                    lines.append("digital signature patient and module values preserved exactly")
             else:
-                lines.append("digital signature patient and module values preserved exactly")
+                lines.append("source DigitalSignature table absent; source value comparison not applicable")
             sentinel_projection = int(query(
                 "SELECT COUNT(*) FROM `{0}`.`DigitalSignature` WHERE "
                 "`demographicId` = -1 AND `demographicFkId` IS NOT NULL"
@@ -2790,8 +2797,9 @@ def run_p7(ctx) -> None:
             html_mismatches = int(query(
                 "SELECT COUNT(*) FROM `{0}`.eform s LEFT JOIN `{1}`.eform d "
                 "ON s.fid = d.fid WHERE d.fid IS NULL OR "
-                "(NOT (({2}) OR ({3})) AND NOT (BINARY REPLACE(s.form_html, "
-                "'{4}', '{5}') <=> BINARY d.form_html))".format(
+                "(NOT (({2}) OR ({3})) AND NOT (BINARY REPLACE(CONVERT(s.form_html "
+                "USING utf8mb4), '{4}', '{5}') <=> "
+                "BINARY CONVERT(d.form_html USING utf8mb4)))".format(
                     src, dst, canonical.replace("form_name", "s.form_name").replace("subject", "s.subject"),
                     canonical.replace("form_name", "d.form_name").replace("subject", "d.subject"),
                     marker, bare))[0][0])
@@ -2857,7 +2865,7 @@ def run_p7(ctx) -> None:
                                         .format(len(unreadable)))
                     else:
                         lines.append("referenced clinical files readable as the service account")
-            except (RuntimeError, OSError, ValueError) as exc:
+            except (RuntimeError,) + o19bundle.ARCHIVE_ERRORS as exc:
                 problems.append("final document verification could not run: {0}"
                                 .format(o19etl._query_reason(exc)))
 

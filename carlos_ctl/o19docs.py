@@ -715,10 +715,10 @@ def _stock_asset_inventory() -> Tuple[dict, str]:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError) as exc:
-        die("stock eForm asset inventory is unavailable or malformed: {0}"
-            .format(exc))
+        raise ValueError("stock eForm asset inventory is unavailable or malformed: {0}"
+                         .format(exc)) from exc
     if not isinstance(data, dict):
-        die("stock eForm asset inventory has an unsupported contract")
+        raise ValueError("stock eForm asset inventory has an unsupported contract")
     rules = data.get("assets", {})
     deployed = data.get("deployed", [])
     if (data.get("format") != 1 or data.get("kind") != "o19-stock-eform-assets"
@@ -735,7 +735,7 @@ def _stock_asset_inventory() -> Tuple[dict, str]:
                    or not isinstance(rule.get("sha256"), str)
                    or not re.fullmatch(r"[0-9a-f]{64}", rule["sha256"])
                    for rule in rules.values())):
-        die("stock eForm asset inventory has an unsupported contract")
+        raise ValueError("stock eForm asset inventory has an unsupported contract")
     stock_dir = os.environ.get("CARLOS_CTL_O19_STOCK_ASSETS_DIR",
                                os.path.join(os.path.dirname(manifest_dir),
                                             "o19-stock-assets"))
@@ -743,8 +743,8 @@ def _stock_asset_inventory() -> Tuple[dict, str]:
         stock = os.path.join(stock_dir, name)
         if (os.path.islink(stock) or not os.path.isfile(stock)
                 or _sha256(stock) != rule["sha256"]):
-            die("packaged stock eForm asset {0} differs from its inventory; "
-                "reinstall the compatible carlos-emr package".format(name))
+            raise ValueError("packaged stock eForm asset {0} differs from its inventory; "
+                             "reinstall the compatible carlos-emr package".format(name))
     return rules, stock_dir
 
 
@@ -814,7 +814,10 @@ def prepare_stock_collisions(source_ctx: str, target_ctx: str,
     if not any(os.path.lexists(os.path.join(src_images, name))
                for name in ("blank.rtl", "editControl2.js", "editor_help.html")):
         return []
-    rules, stock_dir = _stock_asset_inventory()
+    try:
+        rules, stock_dir = _stock_asset_inventory()
+    except ValueError as exc:
+        die(str(exc))
     os.makedirs(dst_images, exist_ok=True)
     root_fd = os.open(target_ctx, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -1373,19 +1376,24 @@ def service_readability_problems(query, dst_schema: str, ctx_root: str,
     if not paths:
         return []
     script = (
-        "import json, os, sys\n"
+        "import json, os, stat, sys\n"
         "bad = []\n"
         "for path in json.load(sys.stdin):\n"
         "    try:\n"
-        "        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)\n"
-        "        try: os.read(fd, 1)\n"
+        "        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)\n"
+        "        try:\n"
+        "            if not stat.S_ISREG(os.fstat(fd).st_mode): raise OSError()\n"
+        "            os.read(fd, 1)\n"
         "        finally: os.close(fd)\n"
         "    except OSError: bad.append(path)\n"
         "json.dump(bad, sys.stdout)\n")
-    proc = subprocess.run(
-        ["runuser", "-u", account, "--", "python3", "-c", script],
-        input=json.dumps(sorted(paths)), text=True, capture_output=True,
-        check=False)
+    try:
+        proc = subprocess.run(
+            ["runuser", "-u", account, "--", "python3", "-c", script],
+            input=json.dumps(sorted(paths)), text=True, capture_output=True,
+            check=False, timeout=3600)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("service-account file check timed out") from exc
     if proc.returncode:
         raise RuntimeError("service-account file check failed (exit {0}): {1}"
                            .format(proc.returncode, proc.stderr.strip()[:200]))

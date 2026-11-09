@@ -30,9 +30,10 @@ QUOTING_MODES = re.compile(
     rb"\b(?:ANSI_QUOTES|NO_BACKSLASH_ESCAPES|ANSI|DB2|MAXDB|MSSQL|ORACLE|POSTGRESQL)\b", re.I)
 
 
-def snapshot_matches(path, expected_sha):
+def snapshot_matches(path, expected_sha, allow_symlink=False):
     """A private snapshot may be reused only when its bytes still match."""
-    if not expected_sha or os.path.islink(path) or not os.path.isfile(path):
+    if (not expected_sha or (not allow_symlink and os.path.islink(path))
+            or not os.path.isfile(path)):
         return False
     digest = hashlib.sha256()
     with open(path, "rb") as source:
@@ -49,7 +50,10 @@ def snapshot_file(path, destination, expected_sha=None):
     preparation is never silently replaced by an older private copy.
     """
     if snapshot_matches(destination, expected_sha):
-        if not snapshot_matches(path, expected_sha):
+        # The initial copy follows a caller-supplied symlink to a regular
+        # source file. Reuse checks that same source byte stream, while the
+        # private destination must still be a real file.
+        if not snapshot_matches(path, expected_sha, allow_symlink=True):
             raise ValueError("an input changed while its private snapshot was prepared")
         return expected_sha
     incoming = destination + ".incoming"
