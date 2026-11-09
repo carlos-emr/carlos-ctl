@@ -18,7 +18,7 @@ SIGNATURE_URL_ID = re.compile(
 REFERENCE_TABLES = {
     "consultationRequests": ("signature_img", "demographicNo", "CONSULTATION"),
     "consultationRequestsArchive": ("signature_img", "demographicNo", "CONSULTATION"),
-    "consultationResponse": ("signature_img", "demographicNo", "CONSULTATION"),
+    "consultationResponse": ("signatureImg", "demographicNo", "CONSULTATION"),
     "prescription": ("digital_signature_id", "demographic_no", "PRESCRIPTION"),
 }
 
@@ -40,6 +40,22 @@ def _source_tables(query, source: str) -> Set[str]:
     return {str(row[0]) for row in rows if row}
 
 
+def _source_columns(query, source: str, tables: Set[str]) -> Dict[str, Set[str]]:
+    columns: Dict[str, Set[str]] = {table: set() for table in tables}
+    for row in query("SELECT TABLE_NAME, COLUMN_NAME FROM "
+                     "information_schema.COLUMNS WHERE TABLE_SCHEMA = '{0}' "
+                     "AND TABLE_NAME IN ('DigitalSignature', "
+                     "'consultationRequests', 'consultationRequestsArchive', "
+                     "'consultationResponse', 'prescription', 'eform_values')"
+                     .format(source)):
+        if len(row) >= 2 and row[0] in columns:
+            columns[row[0]].add(str(row[1]))
+    for table, names in columns.items():
+        if not names:
+            raise ValueError("source column metadata unavailable for " + table)
+    return columns
+
+
 def expected_owners(query, source: str) -> Tuple[Dict[int, Tuple[int, str]], int]:
     """Return unique (patient, module) decisions and unresolved -1 count.
 
@@ -50,18 +66,20 @@ def expected_owners(query, source: str) -> Tuple[Dict[int, Tuple[int, str]], int
     tables = _source_tables(query, source)
     if "DigitalSignature" not in tables:
         return {}, 0
-    module_column = int(query(
-        "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE "
-        "TABLE_SCHEMA = '{0}' AND TABLE_NAME = 'DigitalSignature' AND "
-        "LOWER(COLUMN_NAME) = 'moduletype'".format(source))[0][0])
-    module_sql = "`ModuleType`" if module_column else "NULL"
+    columns = _source_columns(query, source, tables)
+    if not {"id", "demographicId"} <= columns["DigitalSignature"]:
+        raise ValueError("source DigitalSignature id/patient columns unavailable")
+    module_sql = ("`ModuleType`" if any(
+        name.lower() == "moduletype" for name in columns["DigitalSignature"])
+        else "NULL")
     signatures = {}
     for row in query("SELECT `id`, {1} FROM `{0}`.`DigitalSignature` WHERE "
                      "`demographicId` = -1".format(source, module_sql)):
         signature_id = _positive_int(row[0])
         if signature_id is None:
             raise ValueError("source DigitalSignature has an invalid unassigned id")
-        signatures[signature_id] = row[1] if len(row) > 1 else None
+        module = row[1] if len(row) > 1 else None
+        signatures[signature_id] = None if module in (None, "NULL", "") else module
     if not signatures:
         return {}, 0
 
@@ -76,13 +94,20 @@ def expected_owners(query, source: str) -> Tuple[Dict[int, Tuple[int, str]], int
     for table, (reference, patient, module) in REFERENCE_TABLES.items():
         if table not in tables:
             continue
+        if reference not in columns[table]:
+            continue  # this OSCAR patch predates the signature field
+        if patient not in columns[table]:
+            raise ValueError("source patient column unavailable for " + table)
         for row in query("SELECT `{0}`, `{1}` FROM `{2}`.`{3}` WHERE "
                          "`{0}` IS NOT NULL".format(
                              reference, patient, source, table)):
             if len(row) >= 2:
                 add(row[0], row[1], module)
 
-    if "eform_values" in tables:
+    if ("eform_values" in tables
+            and {"var_name", "var_value"} <= columns["eform_values"]):
+        if "demographic_no" not in columns["eform_values"]:
+            raise ValueError("source eForm patient column unavailable")
         for row in query("SELECT `var_value`, `demographic_no` FROM "
                          "`{0}`.`eform_values` WHERE `var_name` = "
                          "'signatureValue' AND `var_value` LIKE "

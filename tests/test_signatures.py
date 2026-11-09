@@ -20,19 +20,28 @@ class SourceAndTarget:
         ]
         self.source_consults = [("43", "9"), ("45", "9")]
         self.source_prescriptions = [("45", "9")]
+        self.columns = {
+            "DigitalSignature": {"id", "demographicId", "ModuleType"},
+            "consultationRequests": {"requestId", "signature_img", "demographicNo"},
+            "consultationResponse": {"responseId", "signatureImg", "demographicNo"},
+            "prescription": {"script_no", "digital_signature_id", "demographic_no"},
+            "eform_values": {"id", "var_name", "var_value", "demographic_no"},
+        }
         self.recorded = {}
 
     def query(self, sql):
         if "information_schema.TABLES" in sql:
             return [(name,) for name in
-                    ("DigitalSignature", "consultationRequests", "prescription",
-                     "eform_values")]
+                    self.columns]
         if "information_schema.COLUMNS" in sql:
-            return [("1",)]
+            return [(table, column) for table, names in self.columns.items()
+                    for column in names]
         if "FROM `o19_import`.`DigitalSignature`" in sql:
             return self.source_signatures
         if "FROM `o19_import`.`consultationRequests`" in sql:
             return self.source_consults
+        if "FROM `o19_import`.`consultationResponse`" in sql:
+            return [("43", "9")]
         if "FROM `o19_import`.`prescription`" in sql:
             return self.source_prescriptions
         if "FROM `o19_import`.`eform_values`" in sql:
@@ -86,6 +95,29 @@ class TestImportedSignatureOwnership(unittest.TestCase):
         self.assertEqual(fixture.recorded[42], (7, "E_FORM"))
         self.assertIsNone(o19signatures.verification_problem(
             fixture.query, "o19_import", "carlos"))
+
+    def test_older_prescription_without_signature_column_is_supported(self):
+        fixture = SourceAndTarget()
+        fixture.columns["prescription"].remove("digital_signature_id")
+        owners, unresolved = o19signatures.expected_owners(
+            fixture.query, "o19_import")
+        self.assertEqual(owners, {42: (7, "E_FORM"),
+                                  43: (9, "CONSULTATION"),
+                                  45: (9, "CONSULTATION")})
+        self.assertEqual(unresolved, 1)
+
+    def test_sql_null_module_allows_unique_source_owner(self):
+        fixture = SourceAndTarget()
+        fixture.source_signatures[0] = ("42", "NULL")
+        owners, _ = o19signatures.expected_owners(fixture.query, "o19_import")
+        self.assertEqual(owners[42], (7, "E_FORM"))
+
+    def test_missing_module_column_allows_unique_source_owner(self):
+        fixture = SourceAndTarget()
+        fixture.columns["DigitalSignature"].remove("ModuleType")
+        fixture.source_signatures[0] = ("42", "NULL")
+        owners, _ = o19signatures.expected_owners(fixture.query, "o19_import")
+        self.assertEqual(owners[42], (7, "E_FORM"))
 
 
 if __name__ == "__main__":
