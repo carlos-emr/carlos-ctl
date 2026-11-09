@@ -181,7 +181,7 @@ sudo carlos-ctl destroy-data --confirm <server-name>
 `carlos-ctl cds-export --help` documents the export argument contract. Clinical
 execution requires the matching Java export engine and an advertised qualified
 profile. The OntarioMD engine has passed installed root-delegated clinical
-export/download checks; authenticated browser qualification remains pending.
+export/download and authenticated asynchronous browser qualification checks.
 The [export command contract](cds-export-command.md) records the shared process
 transport, exact delegation scope, lifecycle, compatibility and completion rules.
 

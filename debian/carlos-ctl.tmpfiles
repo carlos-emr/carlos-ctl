@@ -4,3 +4,4 @@
 # application-owned carlos group exists. 'e' only cleans an existing directory;
 # installing the independent CLI package never creates an application identity.
 e /run/carlos-cds-delegations - - - 10m
+e /run/carlos-cds-export-delegations - - - 10m

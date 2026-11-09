@@ -10,9 +10,10 @@ observed its durable job from independent processes, downloaded the encrypted
 artifact, and refused an existing output destination. An independent recipient
 recovered the exact validated ZIP and all thirteen expected clinical facts.
 Status and diagnostics remained available with invalid active export settings.
-This establishes that installed checkpoint, not browser end-to-end qualification.
-The application PR remains a draft while authenticated browser and final
-integration checks are completed:
+The later paired CLI/browser workflow also passed with this CLI implementation,
+matching fourteen independent native facts and rejecting four schema-valid
+clinical mutants for each transport. The application PR remains a draft pending
+its current-head resource and security verification:
 [carlos-emr/carlos#5706](https://github.com/carlos-emr/carlos/pull/5706).
 
 Import and export share `cdsruntime.py` for Java launch selection, bounded capability
@@ -35,6 +36,9 @@ arguments/provider/operation and expires within 300 seconds. The environment var
 export verifier must require that exact export directory and verify root ownership,
 permissions, process identity, expiry, nonce and argument digest. An import ticket
 cannot supply export authority. The service process runs as `carlos`.
+Normal completion removes the owned ticket. The installed tmpfiles rules also
+retire orphan import/export tickets older than ten minutes when the system's
+cleanup timer runs; package installation does not create application identities.
 
 New requests require an explicit provider, profile, encryption recipient registry key,
 verified audit-plan registry key, and either physician roster IDs or a protected patient

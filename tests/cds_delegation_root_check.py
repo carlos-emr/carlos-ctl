@@ -13,6 +13,7 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
+import tempfile
 
 from carlos_ctl import cdsimport, cdsexport, cdsruntime
 
@@ -41,7 +42,8 @@ def main():
                                       lifetime=300)
     check_ticket(ticket, args.provider, args.operation, arguments, cdsexport.TICKET_DIRECTORY)
     assert cdsimport.TICKET_DIRECTORY != cdsexport.TICKET_DIRECTORY
-    print("CDS import/export delegation ownership, digest, service read/tamper denial and owned cleanup passed")
+    check_expiry_cleanup("--installed" in sys.argv)
+    print("CDS import/export delegation identity, ownership, digest, tamper denial and cleanup passed")
 
 
 def check_ticket(ticket, provider, operation, arguments, directory):
@@ -54,6 +56,9 @@ def check_ticket(ticket, provider, operation, arguments, directory):
         assert stat.S_IMODE(actual.st_mode) == 0o640
         assert stat.S_IMODE(path.parent.stat().st_mode) == 0o750
         body = json.loads(path.read_text())
+        assert body["operator"] == "root"
+        assert type(body["operatorUid"]) is int and body["operatorUid"] == 0
+        assert type(body["protocol"]) is int and body["protocol"] == 1
         assert body["provider"] == provider
         assert body["operation"] == operation
         assert body["argvSha256"] == cdsruntime.arguments_digest(arguments)
@@ -71,6 +76,51 @@ for target in (p,p.parent/'forged-integration-ticket.json'):
     finally:
         assert ticket.remove()
     assert not path.exists()
+
+
+def check_expiry_cleanup(installed):
+    source = (Path("/usr/lib/tmpfiles.d/carlos-ctl.conf") if installed else
+              Path(__file__).resolve().parents[1] / "debian/carlos-ctl.tmpfiles")
+    configuration = source.read_text()
+    directories = (cdsimport.TICKET_DIRECTORY, cdsexport.TICKET_DIRECTORY)
+    with tempfile.TemporaryDirectory(prefix="cds-delegation-expiry-") as temporary:
+        root = Path(temporary)
+        config = root / "delegations.conf"
+        config.write_text(configuration)
+
+        def run_tmpfiles(operation):
+            subprocess.run(["/usr/bin/systemd-tmpfiles", operation, "--root", str(root), str(config)], check=True)
+
+        run_tmpfiles("--create")
+        assert all(not (root / "run" / directory).exists() for directory in directories)
+        files = []
+        for directory in directories:
+            parent = root / "run" / directory
+            parent.mkdir(parents=True, mode=0o750)
+            ticket = parent / "synthetic-orphan.json"
+            ticket.write_text("{}")
+            ticket.chmod(0o640)
+            files.append(ticket)
+        unrelated = root / "run" / "unrelated.json"
+        unrelated.write_text("retain")
+        run_tmpfiles("--clean")
+        assert all(path.exists() for path in files), "Fresh tickets must survive ordinary cleanup"
+
+        # Changing only the test copy's age avoids waiting for the filesystem ctime
+        # to age. The installed paths/directives must actually remove old files.
+        expired = []
+        for line in configuration.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[1] in {"/run/" + directory for directory in directories}:
+                assert len(fields) == 6 and fields[0] == "e" and fields[5] == "10m"
+                fields[5] = "0s"
+                line = " ".join(fields)
+            expired.append(line)
+        config.write_text("\n".join(expired) + "\n")
+        run_tmpfiles("--clean")
+        assert all(not path.exists() and path.parent.is_dir() for path in files), "Orphans must retire, keeping directories"
+        assert unrelated.read_text() == "retain", "Expiry cleanup must stay inside delegation directories"
+    print("Import/export expiry cleanup retains fresh tickets and removes orphan files without creating identities")
 
 
 if __name__ == "__main__":

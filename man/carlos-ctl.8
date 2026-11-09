@@ -514,9 +514,8 @@ attachments/contacts/routing/audit and report-delivery state.
 .TP
 .B cds-export --provider ID --profile KEY --recipient KEY --audit-plan KEY
 The command adapter requires a compatible Java export engine that explicitly
-advertises the requested qualified profile. The Java engine and installed
-qualification are unfinished in this implementation branch; the adapter alone
-cannot produce a clinical export.
+advertises the requested qualified profile. Without that engine the adapter
+refuses before creating a delegation and cannot produce a clinical export.
 .IP
 New requests select either
 .B --physicians ID[,ID]
