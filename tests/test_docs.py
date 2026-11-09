@@ -596,6 +596,36 @@ class TestStockEformCollisionPolicy(unittest.TestCase):
 
 
 class TestServiceAccountDocumentReadability(unittest.TestCase):
+    def test_present_asset_with_query_suffix_stays_report_only(self):
+        with tempfile.TemporaryDirectory(prefix="o19-readability-") as root:
+            image_dir = os.path.join(root, "eform", "images")
+            os.makedirs(image_dir)
+            Path(image_dir, "logo.png").write_bytes(b"image")
+            html = '<img src="${oscar_image_path}logo.png?v=2">'
+
+            def query(sql):
+                if "SELECT fid, form_name, form_html" in sql:
+                    return [("7", "Consent", html)]
+                if "SELECT form_html" in sql:
+                    return [(html,)]
+                return []
+
+            problems, lines, private = o19docs.reconcile(
+                query, "carlos", root)
+            self.assertEqual(problems, [])
+            self.assertTrue(any("cannot route to" in line for line in lines))
+            self.assertTrue(any("query suffix" in line for line in private))
+
+            real_run = subprocess.run
+
+            def run_probe(command, **kwargs):
+                self.assertEqual(command[:4], ["runuser", "-u", "unused", "--"])
+                return real_run([sys.executable, "-c", command[-1]], **kwargs)
+
+            with mock.patch.object(o19docs.subprocess, "run", side_effect=run_probe):
+                self.assertEqual(o19docs.service_readability_problems(
+                    query, "carlos", root, "unused"), [])
+
     def test_a_referenced_fifo_is_reported_without_blocking_the_probe(self):
         with tempfile.TemporaryDirectory(prefix="o19-readability-") as root:
             doc_dir = os.path.join(root, "document")

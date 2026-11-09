@@ -1371,8 +1371,16 @@ def service_readability_problems(query, dst_schema: str, ctx_root: str,
                      "form_html LIKE '%oscar_image_path%'".format(dst_schema)):
         if row:
             for name in image_refs(row[0]):
-                if contained(image_dir, name):
-                    paths.add(os.path.join(image_dir, name))
+                if not name or not contained(image_dir, name):
+                    continue  # empty is inert; an escape is already blocking in reconcile
+                if "/" in name or "\\" in name:
+                    continue  # a present subdirectory asset is report-only in reconcile
+                path = os.path.join(image_dir, name)
+                bare = name.split("?", 1)[0] if "?" in name else ""
+                if (not os.path.isfile(path) and bare
+                        and os.path.isfile(os.path.join(image_dir, bare))):
+                    continue  # the present bare asset makes this a report-only URL defect
+                paths.add(path)
     if not paths:
         return []
     script = (
@@ -1785,15 +1793,18 @@ def run_docs(ctx) -> None:
             "{1}) — the clinical record must not go live with unreadable "
             "documents. If the file was in the source tar, restore its exact "
             "bytes under {2} and re-run with --resume. If it was absent "
-            "from the source tar, recover the original, restore the "
-            "pre-import snapshot, rebuild the tar and start again; a "
+            "from the source tar, recover the original, rebuild the tar "
+            "and start again from stock; a "
             "target-side placeholder cannot satisfy source provenance. An eForm "
             "image reference that ESCAPES eform/images is not a missing "
-            "file and no tar can clear it: correct that form's form_html "
-            "in the target, then --resume. (Disabling the form does not "
-            "clear it — the check reads every eform row that mentions "
-            "oscar_image_path, whatever its status.)"
-            .format(len(problems), details_path, ctx_root))
+            "file: correct the source form, re-export the complete source "
+            "set and start a fresh import from stock. "
+            "A target form_html edit followed by --resume fails the P7 "
+            "source-integrity check. (Disabling the form does not clear "
+            "it — every eform row that mentions oscar_image_path is checked.) "
+            "To start again from stock: {3}."
+            .format(len(problems), details_path, ctx_root,
+                    o19import.rollback_hint(state)))
     o19import.mark_done(state_dir, state, "documents", tar_sha256=tar_sha,
                         restored=True)
     log("documents restored and reconciled clean")
