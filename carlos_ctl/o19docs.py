@@ -50,8 +50,9 @@ IMAGE_TOKEN_RE = re.compile(
 # dynamically (for example consult_sig_ + provider + '.png'); a bare prefix
 # inside their source is not a filename. Keep these regions out of the static
 # asset inventory instead of asking operators to create fake files.
-NONSTATIC_HTML_RE = re.compile(
-    r"<!--.*?(?:-->|$)|<script\b[^>]*>.*?(?:</script\s*>|$)",
+HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
+SCRIPT_ELEMENT_RE = re.compile(
+    r"<script\b(?:\"[^\"]*\"|'[^']*'|[^'\">])*>(?P<body>.*?)(?:</script\s*>|$)",
     re.IGNORECASE | re.DOTALL)
 
 # an OscarDocument context directory is a plain directory basename; the
@@ -259,7 +260,11 @@ def image_refs(form_html: str) -> List[str]:
     blocking "missing image asset" that CARLOS would in fact serve, and
     an asset literally named `logo+.png` passed while CARLOS 404s it."""
     refs = set()
-    nonstatic = [(m.start(), m.end()) for m in NONSTATIC_HTML_RE.finditer(form_html)]
+    nonstatic = [(m.start(), m.end()) for m in HTML_COMMENT_RE.finditer(form_html)]
+    # The opening <script> tag can itself request a static asset via src=.
+    # Ignore only the body, where strings may be constructed at runtime.
+    nonstatic.extend((m.start("body"), m.end("body"))
+                     for m in SCRIPT_ELEMENT_RE.finditer(form_html))
     for m in IMAGE_TOKEN_RE.finditer(form_html):
         if any(start <= m.start() < end for start, end in nonstatic):
             continue
@@ -712,9 +717,12 @@ def _stock_asset_inventory() -> Tuple[dict, str]:
     except (OSError, ValueError) as exc:
         die("stock eForm asset inventory is unavailable or malformed: {0}"
             .format(exc))
+    if not isinstance(data, dict):
+        die("stock eForm asset inventory has an unsupported contract")
     rules = data.get("assets", {})
     deployed = data.get("deployed", [])
     if (data.get("format") != 1 or data.get("kind") != "o19-stock-eform-assets"
+            or not isinstance(rules, dict)
             or set(rules) != {"blank.rtl", "editControl2.js", "editor_help.html"}
             or not isinstance(deployed, list)
             or any(not isinstance(name, str)
@@ -722,8 +730,10 @@ def _stock_asset_inventory() -> Tuple[dict, str]:
                    for name in deployed)
             or len(deployed) != len(set(deployed))
             or not set(rules).issubset(deployed)
-            or any(rule.get("policy") not in ("seeded", "managed")
-                   or not re.fullmatch(r"[0-9a-f]{64}", rule.get("sha256", ""))
+            or any(not isinstance(rule, dict)
+                   or rule.get("policy") not in ("seeded", "managed")
+                   or not isinstance(rule.get("sha256"), str)
+                   or not re.fullmatch(r"[0-9a-f]{64}", rule["sha256"])
                    for rule in rules.values())):
         die("stock eForm asset inventory has an unsupported contract")
     stock_dir = os.environ.get("CARLOS_CTL_O19_STOCK_ASSETS_DIR",
@@ -755,6 +765,8 @@ def packaged_eform_asset_names() -> Set[str]:
     except (OSError, ValueError) as exc:
         raise ValueError("stock eForm asset inventory is unavailable or malformed: {0}"
                          .format(exc)) from exc
+    if not isinstance(data, dict):
+        raise ValueError("stock eForm asset inventory has an unsupported contract")
     names = data.get("deployed")
     if (data.get("kind") != "o19-stock-eform-assets"
             or data.get("format") != 1 or not isinstance(names, list)
@@ -873,7 +885,13 @@ def prepare_stock_collisions(source_ctx: str, target_ctx: str,
             lines.append("managed eForm asset {0}: source archived; packaged "
                          "asset retained".format(name))
         elif target_sha:
-            if target_sha == source_sha and os.path.isfile(target_archive):
+            if (target_sha == source_sha and old
+                    and old.get("archived_stock") is False):
+                # The target had no stock file on the first pass. A crash
+                # after merge installed the source copy but created no
+                # .stock archive; the signed receipt binds that history.
+                pass
+            elif target_sha == source_sha and os.path.isfile(target_archive):
                 if _sha256(target_archive) != rule["sha256"]:
                     die("archived stock eForm asset {0} has changed".format(name))
                 # Resume after the earlier merge: the source file in this
@@ -931,6 +949,8 @@ def stock_collision_problems(state_dir: str, tar_sha: str, ctx_root: str,
     except (OSError, ValueError) as exc:
         return ["stock eForm collision receipt is missing or unreadable: {0}"
                 .format(exc)]
+    if not isinstance(receipt, dict):
+        return ["stock eForm collision receipt has an unsupported contract"]
     if (receipt.get("format") != 1 or receipt.get("tar_sha256") != tar_sha
             or not isinstance(receipt.get("items"), dict)
             or set(receipt["items"]) != required):

@@ -440,6 +440,12 @@ class TestImageRefs(unittest.TestCase):
                 '<img src="${oscar_image_path}NDDS.png">')
         self.assertEqual(o19docs.image_refs(html), ["NDDS.png"])
 
+    def test_script_src_is_static_even_when_the_body_builds_dynamic_names(self):
+        html = ('<script data-note="a > b" src="${oscar_image_path}clinic.js">'
+                'var sig = "${oscar_image_path}consult_sig_" + provider;'
+                '</script>')
+        self.assertEqual(o19docs.image_refs(html), ["clinic.js"])
+
     def test_source_tar_provenance_cannot_be_satisfied_by_a_placeholder(self):
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root)
@@ -563,6 +569,24 @@ class TestStockEformCollisionPolicy(unittest.TestCase):
                                              self.state, "abc")
         self.assertEqual(Path(self.target, "eform", "images", "blank.rtl").read_bytes(),
                          b"unknown target")
+
+    def test_resume_seeded_asset_that_had_no_initial_stock_copy(self):
+        self.write(self.source, "blank.rtl", b"clinic letterhead")
+        o19docs.prepare_stock_collisions(self.source, self.target,
+                                         self.state, "abc")
+        o19docs.merge_move(self.source, self.target)
+        self.assertEqual(Path(self.target, "eform", "images", "blank.rtl").read_bytes(),
+                         b"clinic letterhead")
+        self.assertFalse(Path(self.state, o19docs.STOCK_COLLISION_DIR,
+                              "blank.rtl.stock").exists())
+        # Re-extraction of the same tar after an interrupted merge.
+        os.makedirs(os.path.join(self.source, "eform", "images"), exist_ok=True)
+        self.write(self.source, "blank.rtl", b"clinic letterhead")
+        o19docs.prepare_stock_collisions(self.source, self.target,
+                                         self.state, "abc", resume=True)
+        o19docs.merge_move(self.source, self.target, resume=True)
+        self.assertEqual(o19docs.stock_collision_problems(
+            self.state, "abc", self.target, {"blank.rtl"}), [])
 
 
 class TestMoveIntoPlace(unittest.TestCase):
