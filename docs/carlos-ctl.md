@@ -206,8 +206,10 @@ value. Preflight refuses other invalid patient references and unsupported
 module values. P4 freezes a unique owner inferred from the staged source into
 an app-owned receipt; P7 verifies that receipt against the source again. A
 form submitted after import cannot claim an unassigned signature, and one
-without a unique source owner remains stored but unreadable. The document
-phase handles the three known stock Rich Text
+without a unique source owner remains stored but unreadable. For eForms, the
+receipt considers only saved source `signatureValue` and Rich Text `Letter`
+fields, and rejects conflicting patients or modules. The document phase
+handles the three known stock Rich Text
 Letter assets according to package ownership, normalizes the exact legacy
 `${oscar_image_path}/` marker, and ignores comments and script bodies when
 enumerating static eForm assets. It checks that every referenced clinic

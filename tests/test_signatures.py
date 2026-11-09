@@ -13,10 +13,10 @@ class SourceAndTarget:
         self.source_signatures = [("42", None), ("43", "CONSULTATION"),
                                   ("44", None), ("45", None)]
         self.source_eforms = [
-            ("/imageRenderingServlet?source=signature_stored&amp;digitalSignatureId=42", "7"),
-            ("/imageRenderingServlet?digitalSignatureId=420", "8"),
-            ("/imageRenderingServlet?digitalSignatureId=44", "7"),
-            ("/imageRenderingServlet?digitalSignatureId=44", "8"),
+            ("signatureValue", "/imageRenderingServlet?source=signature_stored&amp;digitalSignatureId=42", "7"),
+            ("signatureValue", "/imageRenderingServlet?digitalSignatureId=420", "8"),
+            ("signatureValue", "/imageRenderingServlet?digitalSignatureId=44", "7"),
+            ("signatureValue", "/imageRenderingServlet?digitalSignatureId=44", "8"),
         ]
         self.source_consults = [("43", "9"), ("45", "9")]
         self.source_prescriptions = [("45", "9")]
@@ -50,7 +50,10 @@ class SourceAndTarget:
         if "FROM `o19_import`.`prescription`" in sql:
             return self.source_prescriptions
         if "FROM `o19_import`.`eform_values`" in sql:
-            return self.source_eforms
+            assert "('signatureValue', 'Letter')" in sql
+            return [(value, patient) for name, value, patient in self.source_eforms
+                    if name in {"signatureValue", "Letter"}
+                    and "digitalSignatureId=" in value]
         if sql.startswith("DELETE FROM `carlos`.`o19_imported_signature_owner`"):
             self.recorded.clear()
             return []
@@ -100,6 +103,20 @@ class TestImportedSignatureOwnership(unittest.TestCase):
         self.assertEqual(fixture.recorded[42], (7, "E_FORM"))
         self.assertIsNone(o19signatures.verification_problem(
             fixture.query, "o19_import", "carlos"))
+
+    def test_saved_letter_reference_can_establish_one_source_owner(self):
+        fixture = SourceAndTarget()
+        fixture.source_signatures = [("42", None), ("420", None)]
+        fixture.source_eforms = [
+            ("Letter", '<img src="/imageRenderingServlet?digitalSignatureId=42">', "7"),
+            ("Letter", '<img src="/imageRenderingServlet?digitalSignatureId=420">', "8"),
+            ("other", "/imageRenderingServlet?digitalSignatureId=42", "99"),
+        ]
+
+        owners, unresolved = o19signatures.expected_owners(fixture.query, "o19_import")
+
+        self.assertEqual(owners, {42: (7, "E_FORM"), 420: (8, "E_FORM")})
+        self.assertEqual(unresolved, 0)
 
     def test_older_prescription_without_signature_column_is_supported(self):
         fixture = SourceAndTarget()

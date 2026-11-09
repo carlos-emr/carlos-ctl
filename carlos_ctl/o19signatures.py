@@ -109,8 +109,8 @@ def expected_owners(query, source: str) -> Tuple[Dict[int, Tuple[int, str]], int
         if "demographic_no" not in columns["eform_values"]:
             raise ValueError("source eForm patient column unavailable")
         for row in query("SELECT `var_value`, `demographic_no` FROM "
-                         "`{0}`.`eform_values` WHERE `var_name` = "
-                         "'signatureValue' AND `var_value` LIKE "
+                         "`{0}`.`eform_values` WHERE `var_name` IN "
+                         "('signatureValue', 'Letter') AND `var_value` LIKE "
                          "'%digitalSignatureId=%'".format(source)):
             if len(row) < 2 or not row[0]:
                 continue
