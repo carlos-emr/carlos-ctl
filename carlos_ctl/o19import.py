@@ -2772,7 +2772,15 @@ def run_p7(ctx) -> None:
                 else:
                     lines.append("digital signature patient and module values preserved exactly")
             else:
-                lines.append("source DigitalSignature table absent; source value comparison not applicable")
+                target_signatures = int(query(
+                    "SELECT COUNT(*) FROM `{0}`.`DigitalSignature`"
+                    .format(dst))[0][0])
+                if target_signatures:
+                    problems.append("source DigitalSignature table absent but "
+                                    "{0} target signature(s) exist"
+                                    .format(target_signatures))
+                else:
+                    lines.append("source DigitalSignature table absent; target signature table empty")
             sentinel_projection = int(query(
                 "SELECT COUNT(*) FROM `{0}`.`DigitalSignature` WHERE "
                 "`demographicId` = -1 AND `demographicFkId` IS NOT NULL"
@@ -2866,8 +2874,12 @@ def run_p7(ctx) -> None:
                     else:
                         lines.append("referenced clinical files readable as the service account")
             except (RuntimeError,) + o19bundle.ARCHIVE_ERRORS as exc:
-                problems.append("final document verification could not run: {0}"
-                                .format(o19etl._query_reason(exc)))
+                reason = "final document verification could not run: {0}".format(
+                    o19etl._query_reason(exc))
+                write_private(os.path.join(ctx["state_dir"], "verify-documents-details.txt"),
+                              reason + "\n")
+                problems.append("final document verification could not run — see "
+                                "verify-documents-details.txt")
 
     ok, bad = _row_parity(ctx)
     # three counts, never one: NOT CHECKED lines and acknowledged

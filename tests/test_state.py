@@ -2951,8 +2951,29 @@ class TestVerifyPhaseFiles(unittest.TestCase):
         ctx["query"] = query
         o19import.run_p7(ctx)
         with open(os.path.join(self.state_dir, "report.txt"), encoding="utf-8") as fh:
-            self.assertIn("source DigitalSignature table absent; source value "
-                          "comparison not applicable", fh.read())
+            self.assertIn("source DigitalSignature table absent; target signature "
+                          "table empty", fh.read())
+
+    def test_target_signatures_without_a_source_table_fail_verification(self):
+        ctx = self._ctx()
+        ctx["dev_target"] = True
+        ctx["state"]["phases"]["documents"] = {"skipped": "no-documents"}
+        original_query = ctx["query"]
+
+        def query(sql, db=None):
+            if "information_schema.TABLES" in sql and "DigitalSignature" in sql:
+                return [["0"]]
+            if sql == "SELECT COUNT(*) FROM `carlos`.`DigitalSignature`":
+                return [["2"]]
+            return original_query(sql, db)
+
+        ctx["query"] = query
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                o19import.run_p7(ctx)
+        with open(os.path.join(self.state_dir, o19import.VERIFY_PROBLEMS),
+                  encoding="utf-8") as fh:
+            self.assertIn("2 target signature(s) exist", fh.read())
 
     def test_corrupt_document_tar_becomes_a_reported_p7_problem(self):
         ctx = self._ctx()
@@ -2975,6 +2996,9 @@ class TestVerifyPhaseFiles(unittest.TestCase):
         with open(os.path.join(self.state_dir, o19import.VERIFY_PROBLEMS),
                   encoding="utf-8") as fh:
             self.assertIn("final document verification could not run", fh.read())
+        with open(os.path.join(self.state_dir, "verify-documents-details.txt"),
+                  encoding="utf-8") as fh:
+            self.assertIn("truncated archive", fh.read())
         with open(os.path.join(self.state_dir, "import-report.txt"),
                   encoding="utf-8") as fh:
             self.assertIn("final document verification could not run", fh.read())
