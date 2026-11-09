@@ -24,6 +24,7 @@ REFERENCE_TABLES = {
 
 
 def _positive_int(value) -> Optional[int]:
+    """Accept only positive identifiers from the source query result."""
     try:
         number = int(value)
     except (TypeError, ValueError):
@@ -32,6 +33,7 @@ def _positive_int(value) -> Optional[int]:
 
 
 def _source_tables(query, source: str) -> Set[str]:
+    """List the source tables that may contain a signature or its reference."""
     rows = query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE "
                  "TABLE_SCHEMA = '{0}' AND TABLE_NAME IN "
                  "('DigitalSignature', 'consultationRequests', "
@@ -41,6 +43,7 @@ def _source_tables(query, source: str) -> Set[str]:
 
 
 def _source_columns(query, source: str, tables: Set[str]) -> Dict[str, Set[str]]:
+    """Require column metadata for every discovered reference table."""
     columns: Dict[str, Set[str]] = {table: set() for table in tables}
     for row in query("SELECT TABLE_NAME, COLUMN_NAME FROM "
                      "information_schema.COLUMNS WHERE TABLE_SCHEMA = '{0}' "
@@ -86,6 +89,7 @@ def expected_owners(query, source: str) -> Tuple[Dict[int, Tuple[int, str]], int
     candidates: Dict[int, Set[Tuple[int, str]]] = {}
 
     def add(signature_id, patient, module):
+        """Record a positive patient claim for a signature in this source export."""
         sid = _positive_int(signature_id)
         demographic = _positive_int(patient)
         if sid in signatures and demographic is not None:

@@ -9,7 +9,10 @@ from carlos_ctl import o19signatures
 
 
 class SourceAndTarget:
+    """Model staged OSCAR rows and the target's frozen-owner receipt."""
+
     def __init__(self):
+        """Seed source rows with unique, conflicting and absent references."""
         self.source_signatures = [("42", None), ("43", "CONSULTATION"),
                                   ("44", None), ("45", None)]
         self.source_eforms = [
@@ -30,6 +33,7 @@ class SourceAndTarget:
         self.recorded = {}
 
     def query(self, sql):
+        """Respond to the ownership queries with this fixture's source rows."""
         if "information_schema.TABLES" in sql:
             return [(name,) for name in
                     self.columns]
@@ -69,7 +73,10 @@ class SourceAndTarget:
 
 
 class TestImportedSignatureOwnership(unittest.TestCase):
+    """Check source-only ownership inference and P7 receipt verification."""
+
     def test_only_unique_source_references_become_owners(self):
+        """Freeze only unique patient/module pairs with exact signature IDs."""
         fixture = SourceAndTarget()
         owners, unresolved = o19signatures.expected_owners(
             fixture.query, "o19_import")
@@ -80,6 +87,7 @@ class TestImportedSignatureOwnership(unittest.TestCase):
         self.assertEqual(unresolved, 2)
 
     def test_receipt_is_replaced_on_resume_and_verified_against_source(self):
+        """Replace a partial P4 receipt and reject a later altered owner."""
         fixture = SourceAndTarget()
         fixture.recorded[999] = (3, "E_FORM")
         self.assertEqual(o19signatures.install_owners(
@@ -94,6 +102,7 @@ class TestImportedSignatureOwnership(unittest.TestCase):
                           fixture.query, "o19_import", "carlos"))
 
     def test_later_live_form_cannot_change_imported_owner(self):
+        """Keep target form submissions out of the source ownership decision."""
         fixture = SourceAndTarget()
         o19signatures.install_owners(fixture.query, "o19_import", "carlos")
         # A user can submit a new target eFormValue, but the receipt
@@ -105,6 +114,7 @@ class TestImportedSignatureOwnership(unittest.TestCase):
             fixture.query, "o19_import", "carlos"))
 
     def test_saved_letter_reference_can_establish_one_source_owner(self):
+        """Accept exact saved Letter URLs but ignore unrelated eForm fields."""
         fixture = SourceAndTarget()
         fixture.source_signatures = [("42", None), ("420", None)]
         fixture.source_eforms = [
@@ -119,6 +129,7 @@ class TestImportedSignatureOwnership(unittest.TestCase):
         self.assertEqual(unresolved, 0)
 
     def test_older_prescription_without_signature_column_is_supported(self):
+        """Handle an older source schema without a prescription signature ID."""
         fixture = SourceAndTarget()
         fixture.columns["prescription"].remove("digital_signature_id")
         owners, unresolved = o19signatures.expected_owners(
@@ -129,17 +140,20 @@ class TestImportedSignatureOwnership(unittest.TestCase):
         self.assertEqual(unresolved, 1)
 
     def test_sql_null_module_allows_unique_source_owner(self):
+        """Permit a NULL source module when one source reference proves it."""
         fixture = SourceAndTarget()
         owners, _ = o19signatures.expected_owners(fixture.query, "o19_import")
         self.assertEqual(owners[42], (7, "E_FORM"))
 
     def test_missing_module_column_allows_unique_source_owner(self):
+        """Infer the module when the source predates the module column."""
         fixture = SourceAndTarget()
         fixture.columns["DigitalSignature"].remove("ModuleType")
         owners, _ = o19signatures.expected_owners(fixture.query, "o19_import")
         self.assertEqual(owners[42], (7, "E_FORM"))
 
     def test_literal_null_module_does_not_claim_unique_source_owner(self):
+        """Keep a literal NULL string distinct from a SQL NULL module."""
         fixture = SourceAndTarget()
         fixture.source_signatures[0] = ("42", "NULL")
         owners, unresolved = o19signatures.expected_owners(
