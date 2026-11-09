@@ -10,13 +10,17 @@ Run (from the repository root):
 
 import contextlib
 import csv
+import hashlib
 import io
+import json
 import os
 import shutil
 import sys
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
+from pathlib import Path
 
 from carlos_ctl import o19bundle, o19docs
 
@@ -429,6 +433,136 @@ class TestImageRefs(unittest.TestCase):
                 "<img src='${oscar_image_path}sig.jpg'>"
                 '<img src="${oscar_image_path}logo.png"/>')
         self.assertEqual(o19docs.image_refs(html), ["logo.png", "sig.jpg"])
+
+    def test_ignores_browser_comments_and_runtime_script_prefixes(self):
+        html = ('<!-- ${oscar_image_path}--> -->'
+                '<script>var sig = "${oscar_image_path}consult_sig_" + provider;</script>'
+                '<img src="${oscar_image_path}NDDS.png">')
+        self.assertEqual(o19docs.image_refs(html), ["NDDS.png"])
+
+    def test_source_tar_provenance_cannot_be_satisfied_by_a_placeholder(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        os.makedirs(os.path.join(root, "document"))
+        os.makedirs(os.path.join(root, "eform", "images"))
+        with open(os.path.join(root, "document", "missing.pdf"), "wb") as fh:
+            fh.write(b"PLACEHOLDER")
+        def query(sql):
+            return [["9", "missing.pdf"]] if ".document" in sql else []
+        problems, _lines, _private = o19docs.reconcile(
+            query, "carlos", root, source_document_names=set())
+        self.assertTrue(any("source documents tar" in p for p in problems))
+
+    def test_source_document_names_accept_only_flat_files_in_context(self):
+        entries = [
+            (o19bundle.TAR_TYPE_FILE, "./oscar/document/good.pdf", 1),
+            (o19bundle.TAR_TYPE_FILE, "oscar/document/sub/nested.pdf", 1),
+            (o19bundle.TAR_TYPE_FILE, "oscar/hrm/good.pdf", 1),
+        ]
+        self.assertEqual(o19docs.source_document_names(entries, "oscar"),
+                         {"good.pdf"})
+
+    def test_target_only_eform_placeholder_cannot_satisfy_source_asset(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        os.makedirs(os.path.join(root, "document"))
+        images = os.path.join(root, "eform", "images")
+        os.makedirs(images)
+        Path(images, "lost.png").write_bytes(b"placeholder (test migration)")
+        Path(images, "BNK.png").write_bytes(b"packaged asset")
+
+        def query(sql):
+            if ".eform" in sql:
+                return [("5", "Chart", '<img src="${oscar_image_path}lost.png">'
+                         '<img src="${oscar_image_path}BNK.png">')]
+            return []
+
+        problems, _lines, _private = o19docs.reconcile(
+            query, "carlos", root, source_document_names=set(),
+            source_asset_names=set(), packaged_asset_names={"BNK.png"})
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("lost.png has no file in the source documents tar", problems[0])
+
+    def test_source_eform_names_accept_only_flat_files_in_context(self):
+        entries = [
+            (o19bundle.TAR_TYPE_FILE, "./oscar/eform/images/real.png", 1),
+            (o19bundle.TAR_TYPE_FILE, "oscar/eform/images/sub/nested.png", 1),
+            (o19bundle.TAR_TYPE_FILE, "oscar/document/real.png", 1),
+        ]
+        self.assertEqual(o19docs.source_eform_asset_names(entries, "oscar"),
+                         {"real.png"})
+
+
+class TestStockEformCollisionPolicy(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root)
+        self.source = os.path.join(self.root, "incoming", "oscar")
+        self.target = os.path.join(self.root, "target", "carlos")
+        self.state = os.path.join(self.root, "state")
+        self.stock = os.path.join(self.root, "stock")
+        self.manifests = os.path.join(self.root, "manifests")
+        for path in (os.path.join(self.source, "eform", "images"),
+                     os.path.join(self.target, "eform", "images"),
+                     self.state, self.stock, self.manifests):
+            os.makedirs(path)
+        rules = {}
+        for name, policy in (("blank.rtl", "seeded"),
+                             ("editor_help.html", "seeded"),
+                             ("editControl2.js", "managed")):
+            data = ("packaged " + name).encode()
+            with open(os.path.join(self.stock, name), "wb") as fh:
+                fh.write(data)
+            rules[name] = {"policy": policy,
+                           "sha256": hashlib.sha256(data).hexdigest()}
+        with open(os.path.join(self.manifests, "stock-eform-assets.json"), "w") as fh:
+            json.dump({"format": 1, "kind": "o19-stock-eform-assets",
+                       "assets": rules, "deployed": sorted(rules)}, fh)
+        patch = mock.patch.dict(os.environ, {
+            "CARLOS_CTL_O19_MANIFEST_DIR": self.manifests,
+            "CARLOS_CTL_O19_STOCK_ASSETS_DIR": self.stock})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def write(self, tree, name, content):
+        with open(os.path.join(tree, "eform", "images", name), "wb") as fh:
+            fh.write(content)
+
+    def test_seeded_source_wins_and_managed_package_wins_with_receipts(self):
+        for name in ("blank.rtl", "editControl2.js"):
+            shutil.copyfile(os.path.join(self.stock, name),
+                            os.path.join(self.target, "eform", "images", name))
+            self.write(self.source, name, ("clinic " + name).encode())
+        marks = []
+        lines = o19docs.prepare_stock_collisions(
+            self.source, self.target, self.state, "abc", mark_started=lambda: marks.append(1))
+        self.assertEqual(len(marks), 1)
+        self.assertEqual(len(lines), 2)
+        archive = os.path.join(self.state, o19docs.STOCK_COLLISION_DIR)
+        self.assertFalse(os.path.exists(os.path.join(self.target, "eform", "images", "blank.rtl")))
+        self.assertEqual(Path(archive, "blank.rtl.stock").read_bytes(),
+                         b"packaged blank.rtl")
+        self.assertEqual(Path(archive, "editControl2.js.source").read_bytes(),
+                         b"clinic editControl2.js")
+        self.assertEqual(Path(self.target, "eform", "images", "editControl2.js").read_bytes(),
+                         b"packaged editControl2.js")
+        o19docs.merge_move(self.source, self.target)
+        self.assertEqual(o19docs.stock_collision_problems(
+            self.state, "abc", self.target, {"blank.rtl", "editControl2.js"}), [])
+        os.unlink(os.path.join(archive, "blank.rtl.stock"))
+        self.assertTrue(any("private stock eForm archive" in problem for problem in
+                            o19docs.stock_collision_problems(
+                                self.state, "abc", self.target,
+                                {"blank.rtl", "editControl2.js"})))
+
+    def test_altered_target_is_refused_before_any_stock_file_moves(self):
+        self.write(self.source, "blank.rtl", b"clinic")
+        self.write(self.target, "blank.rtl", b"unknown target")
+        with self.assertRaises(SystemExit):
+            o19docs.prepare_stock_collisions(self.source, self.target,
+                                             self.state, "abc")
+        self.assertEqual(Path(self.target, "eform", "images", "blank.rtl").read_bytes(),
+                         b"unknown target")
 
 
 class TestMoveIntoPlace(unittest.TestCase):

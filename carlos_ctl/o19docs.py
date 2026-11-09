@@ -21,15 +21,17 @@ import csv
 import errno
 import hashlib
 import html as html_module
+import json
 import os
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 import urllib.parse
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from . import o19bundle, o19digest, o19etl
+from . import o19bundle, o19digest, o19etl, o19manifest
 from .util import STATE, die, log, run, sql_escape, warn
 
 DOCUMENTS_ROOT = os.path.join(STATE, "CarlosDocument")
@@ -43,6 +45,14 @@ CACHE_DIR_NAMES = {"document_cache", ".o19-incoming"}
 # the URL-encoded spellings CARLOS also honours ($%7B...%7D, %24%7B...%7D)
 IMAGE_TOKEN_RE = re.compile(
     r"(?:\$\{|\$%7[Bb]|%24%7[Bb])oscar_image_path(?:\}|%7[Dd])")
+
+# Browser comments make no request. Script bodies can construct a request
+# dynamically (for example consult_sig_ + provider + '.png'); a bare prefix
+# inside their source is not a filename. Keep these regions out of the static
+# asset inventory instead of asking operators to create fake files.
+NONSTATIC_HTML_RE = re.compile(
+    r"<!--.*?(?:-->|$)|<script\b[^>]*>.*?(?:</script\s*>|$)",
+    re.IGNORECASE | re.DOTALL)
 
 # an OscarDocument context directory is a plain directory basename; the
 # name is interpolated into SQL (HRM path rewrite) and into filesystem
@@ -249,7 +259,10 @@ def image_refs(form_html: str) -> List[str]:
     blocking "missing image asset" that CARLOS would in fact serve, and
     an asset literally named `logo+.png` passed while CARLOS 404s it."""
     refs = set()
+    nonstatic = [(m.start(), m.end()) for m in NONSTATIC_HTML_RE.finditer(form_html)]
     for m in IMAGE_TOKEN_RE.finditer(form_html):
+        if any(start <= m.start() < end for start, end in nonstatic):
+            continue
         start = m.end()
         quote = form_html[m.start() - 1] if m.start() > 0 else ""
         if quote in ("\"", "'"):
@@ -685,6 +698,271 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
+STOCK_COLLISION_DIR = "o19-stock-eform-collisions"
+STOCK_COLLISION_RECEIPT = "receipt.json"
+
+
+def _stock_asset_inventory() -> Tuple[dict, str]:
+    manifest_dir = os.environ.get(o19manifest.MANIFEST_DIR_ENV,
+                                  o19manifest.MANIFEST_DIR)
+    path = os.path.join(manifest_dir, "stock-eform-assets.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        die("stock eForm asset inventory is unavailable or malformed: {0}"
+            .format(exc))
+    rules = data.get("assets", {})
+    deployed = data.get("deployed", [])
+    if (data.get("format") != 1 or data.get("kind") != "o19-stock-eform-assets"
+            or set(rules) != {"blank.rtl", "editControl2.js", "editor_help.html"}
+            or not isinstance(deployed, list)
+            or any(not isinstance(name, str)
+                   or not re.fullmatch(r"[A-Za-z0-9_.-]+", name)
+                   for name in deployed)
+            or len(deployed) != len(set(deployed))
+            or not set(rules).issubset(deployed)
+            or any(rule.get("policy") not in ("seeded", "managed")
+                   or not re.fullmatch(r"[0-9a-f]{64}", rule.get("sha256", ""))
+                   for rule in rules.values())):
+        die("stock eForm asset inventory has an unsupported contract")
+    stock_dir = os.environ.get("CARLOS_CTL_O19_STOCK_ASSETS_DIR",
+                               os.path.join(os.path.dirname(manifest_dir),
+                                            "o19-stock-assets"))
+    for name, rule in rules.items():
+        stock = os.path.join(stock_dir, name)
+        if (os.path.islink(stock) or not os.path.isfile(stock)
+                or _sha256(stock) != rule["sha256"]):
+            die("packaged stock eForm asset {0} differs from its inventory; "
+                "reinstall the compatible carlos-emr package".format(name))
+    return rules, stock_dir
+
+
+def packaged_eform_asset_names() -> Set[str]:
+    """Names the installed CARLOS asset deployer can legitimately supply.
+
+    The inventory is part of the installed application package. A target-only
+    file with any other name cannot prove that the OSCAR backup contained the
+    clinical form's asset, even if somebody placed a nonempty placeholder on
+    the destination before the importer ran.
+    """
+    manifest_dir = os.environ.get(o19manifest.MANIFEST_DIR_ENV,
+                                  o19manifest.MANIFEST_DIR)
+    path = os.path.join(manifest_dir, "stock-eform-assets.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise ValueError("stock eForm asset inventory is unavailable or malformed: {0}"
+                         .format(exc)) from exc
+    names = data.get("deployed")
+    if (data.get("kind") != "o19-stock-eform-assets"
+            or data.get("format") != 1 or not isinstance(names, list)
+            or any(not isinstance(name, str)
+                   or not re.fullmatch(r"[A-Za-z0-9_.-]+", name)
+                   for name in names)
+            or len(names) != len(set(names))):
+        raise ValueError("stock eForm asset inventory has an unsupported contract")
+    return set(names)
+
+
+def _atomic_private_copy(source: str, destination: str) -> None:
+    """Copy into a private archive or target without exposing partial bytes."""
+    parent = os.path.dirname(destination)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".o19-copy-", dir=parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as out, open(source, "rb") as src:
+            shutil.copyfileobj(src, out, 1 << 20)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, destination)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def prepare_stock_collisions(source_ctx: str, target_ctx: str,
+                             state_dir: str, tar_sha: str,
+                             resume: bool = False,
+                             private: Optional[Callable[[List[str]], None]] = None,
+                             mark_started: Optional[Callable[[], None]] = None
+                             ) -> List[str]:
+    """Resolve only the three known stock eForm paths before merging.
+
+    Unknown collisions, symlinks and changed target stock remain blockers.
+    The managed JavaScript from OSCAR is archived; the WAR's version stays
+    authoritative. A pristine seeded file yields to the clinic's source
+    copy, with the stock bytes retained in a private archive. Every step
+    is idempotent after a crash between archive and move.
+    """
+    src_images = os.path.join(source_ctx, "eform", "images")
+    dst_images = os.path.join(target_ctx, "eform", "images")
+    if not any(os.path.lexists(os.path.join(src_images, name))
+               for name in ("blank.rtl", "editControl2.js", "editor_help.html")):
+        return []
+    rules, stock_dir = _stock_asset_inventory()
+    os.makedirs(dst_images, exist_ok=True)
+    root_fd = os.open(target_ctx, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        collisions = []
+        for child in sorted(os.listdir(source_ctx)):
+            if child not in CACHE_DIR_NAMES:
+                collisions.extend(_collisions(
+                    os.path.join(source_ctx, child),
+                    os.path.join(target_ctx, child), resume, root_fd))
+    finally:
+        os.close(root_fd)
+    permitted = {"'{0}' already exists".format(os.path.join(dst_images, name))
+                 for name in rules}
+    unexpected = [problem for problem in collisions if problem not in permitted]
+    if unexpected:
+        if private:
+            private(["unknown documents tree collisions:"] + unexpected)
+        die("refusing to merge the documents tree: {0} unknown path "
+            "collision(s) remain (see documents-details.txt)"
+            .format(len(unexpected)))
+    if mark_started:
+        mark_started()
+    archive_dir = os.path.join(state_dir, STOCK_COLLISION_DIR)
+    os.makedirs(archive_dir, mode=0o700, exist_ok=True)
+    receipt_path = os.path.join(archive_dir, STOCK_COLLISION_RECEIPT)
+    previous = {}
+    if os.path.isfile(receipt_path):
+        try:
+            with open(receipt_path, encoding="utf-8") as fh:
+                previous = json.load(fh)
+        except (OSError, ValueError) as exc:
+            die("stock collision receipt is unreadable: {0}".format(exc))
+        if previous.get("format") != 1 or previous.get("tar_sha256") != tar_sha:
+            die("stock collision receipt belongs to a different documents tar")
+    items = dict(previous.get("items", {}))
+    lines = []
+    for name, rule in sorted(rules.items()):
+        source = os.path.join(src_images, name)
+        if not os.path.lexists(source):
+            continue
+        target = os.path.join(dst_images, name)
+        if os.path.islink(source) or not os.path.isfile(source):
+            die("source stock eForm path {0} is not a regular file".format(name))
+        if os.path.lexists(target) and (os.path.islink(target)
+                                          or not os.path.isfile(target)):
+            die("target stock eForm path {0} is not a regular file".format(name))
+        source_sha = _sha256(source)
+        target_sha = _sha256(target) if os.path.isfile(target) else None
+        old = items.get(name)
+        if old and (old.get("source_sha256") != source_sha
+                    or old.get("policy") != rule["policy"]):
+            die("stock eForm collision receipt for {0} disagrees with "
+                "the source tar".format(name))
+        source_archive = os.path.join(archive_dir, name + ".source")
+        target_archive = os.path.join(archive_dir, name + ".stock")
+        if rule["policy"] == "managed":
+            if target_sha and target_sha != rule["sha256"]:
+                die("target managed eForm asset {0} differs from the "
+                    "packaged stock; resolve it before import".format(name))
+            if os.path.exists(source_archive):
+                if _sha256(source_archive) != source_sha:
+                    die("archived source eForm asset {0} has changed".format(name))
+            else:
+                _atomic_private_copy(source, source_archive)
+            os.unlink(source)
+            if target_sha is None:
+                _atomic_private_copy(os.path.join(stock_dir, name), target)
+            lines.append("managed eForm asset {0}: source archived; packaged "
+                         "asset retained".format(name))
+        elif target_sha:
+            if target_sha == source_sha and os.path.isfile(target_archive):
+                if _sha256(target_archive) != rule["sha256"]:
+                    die("archived stock eForm asset {0} has changed".format(name))
+                # Resume after the earlier merge: the source file in this
+                # extraction is identical to the installed clinic file.
+            else:
+                if target_sha != rule["sha256"]:
+                    die("target seeded eForm asset {0} differs from pristine "
+                        "stock; resolve its ownership before import".format(name))
+                if os.path.isfile(target_archive):
+                    if _sha256(target_archive) != target_sha:
+                        die("archived stock eForm asset {0} has changed".format(name))
+                else:
+                    _atomic_private_copy(target, target_archive)
+                os.unlink(target)
+            lines.append("seeded eForm asset {0}: pristine stock archived; "
+                         "clinic source retained".format(name))
+        items[name] = {"policy": rule["policy"],
+                       "source_sha256": source_sha,
+                       "stock_sha256": rule["sha256"],
+                       "archived_stock": os.path.isfile(target_archive)
+                       if rule["policy"] == "seeded" else False}
+        fd, tmp = tempfile.mkstemp(prefix=".stock-receipt-", dir=archive_dir)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"format": 1, "tar_sha256": tar_sha,
+                           "items": items}, fh, sort_keys=True, indent=2)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, receipt_path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    return lines
+
+
+def stock_collision_problems(state_dir: str, tar_sha: str, ctx_root: str,
+                             source_assets: Set[str]) -> List[str]:
+    """Verify the private collision receipt and both surviving byte copies.
+
+    This is read-only and runs at P7, including when a resumed import skips
+    the already-completed documents phase. The managed source asset is kept
+    only in the private archive, so its deletion would otherwise be silent.
+    """
+    rules, _stock_dir = _stock_asset_inventory()
+    required = set(rules).intersection(source_assets)
+    if not required:
+        return []
+    archive_dir = os.path.join(state_dir, STOCK_COLLISION_DIR)
+    receipt_path = os.path.join(archive_dir, STOCK_COLLISION_RECEIPT)
+    try:
+        with open(receipt_path, encoding="utf-8") as fh:
+            receipt = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return ["stock eForm collision receipt is missing or unreadable: {0}"
+                .format(exc)]
+    if (receipt.get("format") != 1 or receipt.get("tar_sha256") != tar_sha
+            or not isinstance(receipt.get("items"), dict)
+            or set(receipt["items"]) != required):
+        return ["stock eForm collision receipt does not bind this source tar"]
+    problems = []
+    for name in sorted(required):
+        item = receipt["items"][name]
+        rule = rules[name]
+        source_sha = item.get("source_sha256") if isinstance(item, dict) else None
+        if (not isinstance(source_sha, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", source_sha)
+                or item.get("policy") != rule["policy"]
+                or item.get("stock_sha256") != rule["sha256"]
+                or type(item.get("archived_stock")) is not bool):
+            problems.append("stock eForm receipt entry for {0} is invalid".format(name))
+            continue
+        target = os.path.join(ctx_root, "eform", "images", name)
+        expected = rule["sha256"] if rule["policy"] == "managed" else source_sha
+        if (os.path.islink(target) or not os.path.isfile(target)
+                or _sha256(target) != expected):
+            problems.append("restored stock eForm asset {0} differs from its receipt"
+                            .format(name))
+        archive = os.path.join(archive_dir, name + (".source" if rule["policy"] == "managed" else ".stock"))
+        if rule["policy"] == "managed" or item["archived_stock"]:
+            archive_sha = source_sha if rule["policy"] == "managed" else rule["sha256"]
+            if (os.path.islink(archive) or not os.path.isfile(archive)
+                    or _sha256(archive) != archive_sha):
+                problems.append("private stock eForm archive for {0} is missing or altered"
+                                .format(name))
+    return problems
+
+
 def relocate_hrm_reports(ctx_root: str,
                          private: Optional[Callable[[List[str]], None]] = None,
                          reserved: Optional[Set[str]] = None
@@ -875,7 +1153,10 @@ def apply_ownership(root: str, dev_target: bool) -> None:
 # reconciliation + CSV export drivers
 # --------------------------------------------------------------------------
 
-def reconcile(query, dst_schema: str, ctx_root: str
+def reconcile(query, dst_schema: str, ctx_root: str,
+              source_document_names: Optional[Set[str]] = None,
+              source_asset_names: Optional[Set[str]] = None,
+              packaged_asset_names: Optional[Set[str]] = None
               ) -> Tuple[List[str], List[str], List[str]]:
     """(blocking_problems, report_lines, private_lines) for the restored
     tree. File and form names can carry a patient's or a clinician's
@@ -893,6 +1174,16 @@ def reconcile(query, dst_schema: str, ctx_root: str
     missing, empty = classify_document_files(rows, doc_dir)
     problems.extend("missing file for " + m for m in missing)
     problems.extend("empty file for " + e for e in empty)
+    if source_document_names is not None:
+        # A nonempty placeholder placed in the target can satisfy the
+        # filesystem check above but cannot make a source tar contain a
+        # file it never held. Refuse every such substitution, including
+        # deleted document rows, until a separately audited loss policy
+        # is present; P7 repeats this check after a checkpointed P5.
+        for doc_no, filename in rows:
+            if filename and filename not in source_document_names:
+                problems.append("document {0}: {1} has no file in the "
+                                "source documents tar".format(doc_no, filename))
 
     _, hrm_select = hrm_rewrite_sql(dst_schema, os.path.dirname(ctx_root))
     hrm_rows = [(r[0], r[1]) for r in query(hrm_select)
@@ -958,6 +1249,13 @@ def reconcile(query, dst_schema: str, ctx_root: str
                     problems.append(
                         "eForm '{0}' (fid {1}) references missing image "
                         "asset: {2}".format(form_name, fid, ref))
+            elif (source_asset_names is not None
+                  and asset not in source_asset_names
+                  and asset not in (packaged_asset_names or set())):
+                problems.append(
+                    "eForm '{0}' (fid {1}) asset {2} has no file in the "
+                    "source documents tar and is not a packaged CARLOS "
+                    "asset".format(form_name, fid, asset))
     lines.append("{0} eForm image reference(s) checked".format(checked))
     if unroutable:
         # These two shapes are the form HTML addressing a PRESENT image
@@ -987,6 +1285,94 @@ def reconcile(query, dst_schema: str, ctx_root: str
     lines.append("{0} HRM report row(s) reconciled against {1}".format(
         len(hrm_rows), doc_dir))
     return problems, lines, private
+
+
+def source_document_names(entries: List[Tuple[str, str, int]],
+                          context: str) -> Set[str]:
+    """Exact flat document filenames actually carried by the source tar."""
+    prefix = context + "/document/"
+    names = set()
+    for kind, raw, _size in entries:
+        if kind != o19bundle.TAR_TYPE_FILE:
+            continue
+        clean = os.path.normpath(raw)
+        while clean.startswith("./"):
+            clean = clean[2:]
+        if clean.startswith(prefix):
+            name = clean[len(prefix):]
+            if name and "/" not in name:
+                names.add(name)
+    return names
+
+
+def source_eform_asset_names(entries: List[Tuple[str, str, int]],
+                             context: str) -> Set[str]:
+    """Exact flat eForm asset names actually carried by the source tar."""
+    prefix = context + "/eform/images/"
+    names = set()
+    for kind, raw, _size in entries:
+        if kind != o19bundle.TAR_TYPE_FILE:
+            continue
+        clean = os.path.normpath(raw)
+        while clean.startswith("./"):
+            clean = clean[2:]
+        if clean.startswith(prefix):
+            name = clean[len(prefix):]
+            if name and "/" not in name:
+                names.add(name)
+    return names
+
+
+def service_readability_problems(query, dst_schema: str, ctx_root: str,
+                                 account: str) -> List[str]:
+    """Open every referenced clinical file as the running service account.
+
+    Root's successful stat in ``reconcile`` does not prove Tomcat can read
+    the bytes. Send the path inventory over a pipe (never argv or logs) to
+    one short-lived, unprivileged process. This is read-only and runs again
+    at P7, including when P5 was marked complete on a prior invocation.
+    """
+    doc_dir = os.path.join(ctx_root, "document")
+    image_dir = os.path.join(ctx_root, "eform", "images")
+    paths = set()
+    for row in query("SELECT docfilename FROM `{0}`.document".format(dst_schema)):
+        if row and row[0] and contained(doc_dir, row[0]):
+            paths.add(os.path.join(doc_dir, row[0]))
+    _, hrm_sql = hrm_rewrite_sql(dst_schema, os.path.dirname(ctx_root))
+    for row in query(hrm_sql):
+        if len(row) >= 2 and row[1]:
+            name = served_name(row[1])
+            if contained(doc_dir, name):
+                paths.add(os.path.join(doc_dir, name))
+    for row in query("SELECT form_html FROM `{0}`.eform WHERE "
+                     "form_html LIKE '%oscar_image_path%'".format(dst_schema)):
+        if row:
+            for name in image_refs(row[0]):
+                if contained(image_dir, name):
+                    paths.add(os.path.join(image_dir, name))
+    if not paths:
+        return []
+    script = (
+        "import json, os, sys\n"
+        "bad = []\n"
+        "for path in json.load(sys.stdin):\n"
+        "    try:\n"
+        "        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)\n"
+        "        try: os.read(fd, 1)\n"
+        "        finally: os.close(fd)\n"
+        "    except OSError: bad.append(path)\n"
+        "json.dump(bad, sys.stdout)\n")
+    proc = subprocess.run(
+        ["runuser", "-u", account, "--", "python3", "-c", script],
+        input=json.dumps(sorted(paths)), text=True, capture_output=True,
+        check=False)
+    if proc.returncode:
+        raise RuntimeError("service-account file check failed (exit {0}): {1}"
+                           .format(proc.returncode, proc.stderr.strip()[:200]))
+    try:
+        return json.loads(proc.stdout)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("service-account file check returned invalid data") from exc
 
 
 ARCHIVE_EXPORT_README = "README.txt"
@@ -1292,6 +1678,10 @@ def run_docs(ctx) -> None:
             log("documents: completing the interrupted restore of the same "
                 "tar (files already in place are verified, not replaced)")
         try:
+            stock_lines = prepare_stock_collisions(
+                os.path.join(incoming, old_ctx), ctx_root, state_dir,
+                tar_sha, resume=bool(resuming_merge), private=private,
+                mark_started=_mark_restoring)
             move_lines = merge_move(os.path.join(incoming, old_ctx),
                                     ctx_root,
                                     resume=bool(resuming_merge),
@@ -1308,8 +1698,15 @@ def run_docs(ctx) -> None:
             "restored": True, "old_ctx": old_ctx}
         o19import.save_state(state_dir, state)
         o19import.report_append(state_dir, "P5 documents restore",
-                                "\n".join(move_lines))
+                                "\n".join(stock_lines + move_lines))
     else:
+        try:
+            entries = o19bundle.read_tar_entries(tar_path, tar_path.endswith(".gz"))
+            typed = [(kind, name) for kind, name, _ in entries]
+            o19bundle.validate_tar_members(typed, allow_dirs=True)
+            old_ctx = detect_context_dir(typed)
+        except (ValueError,) + o19bundle.ARCHIVE_ERRORS as exc:
+            die("cannot recheck source documents tar: {0}".format(str(exc)[:300]))
         log("documents: tree already restored (sha256 match) — "
             "re-running ownership repair and reconciliation")
 
@@ -1334,8 +1731,11 @@ def run_docs(ctx) -> None:
     update_sql, _ = hrm_rewrite_sql(ctx["target_db"], documents_root)
     query(update_sql)  # idempotent: basename into DOCUMENT_DIR
 
-    problems, lines, private_lines = reconcile(query, ctx["target_db"],
-                                               ctx_root)
+    problems, lines, private_lines = reconcile(
+        query, ctx["target_db"], ctx_root,
+        source_document_names(entries, old_ctx),
+        source_eform_asset_names(entries, old_ctx),
+        packaged_eform_asset_names() if not ctx["dev_target"] else set())
     from . import o19billing
     lines.extend(o19billing.inventory(ctx, ctx_root))
     if private_lines:
@@ -1355,9 +1755,11 @@ def run_docs(ctx) -> None:
             "(root-only)".format(len(problems)))
         die("documents reconciliation FAILED ({0} problem(s), itemised in "
             "{1}) — the clinical record must not go live with unreadable "
-            "documents. For a missing file, fix the tree in place (add it "
-            "under {2}) and re-run with --resume; to restore a different "
-            "tar instead, restore the pre-import snapshot first. An eForm "
+            "documents. If the file was in the source tar, restore its exact "
+            "bytes under {2} and re-run with --resume. If it was absent "
+            "from the source tar, recover the original, restore the "
+            "pre-import snapshot, rebuild the tar and start again; a "
+            "target-side placeholder cannot satisfy source provenance. An eForm "
             "image reference that ESCAPES eform/images is not a missing "
             "file and no tar can clear it: correct that form's form_html "
             "in the target, then --resume. (Disabling the form does not "

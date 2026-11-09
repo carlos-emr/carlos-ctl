@@ -166,6 +166,37 @@ class TestVerdicts(unittest.TestCase):
         self.assertEqual(report["exit_code"], 0)
         self.assertEqual(report["required_accepts"], [])
 
+    def test_unassigned_signatures_are_reported_without_changing_their_values(self):
+        db = FakeDb(base_tables(DigitalSignature=7),
+                    where_counts={("DigitalSignature", "`demographicId` = -1"): 7})
+        report = pf.run_checks(db, properties=clean_props())
+        self.assertEqual(report["verdict"], "go")
+        self.assertTrue(any(f["id"] == "signature-unassigned" and
+                            "7 unassigned" in f["title"]
+                            for f in report["findings"]))
+
+    def test_signature_values_that_would_be_coerced_are_hard_blockers(self):
+        db = FakeDb(base_tables(DigitalSignature=3),
+                    columns={"DigitalSignature": ["ModuleType"]},
+                    where_counts={
+                        ("DigitalSignature", "`demographicId` IS NULL"): 1,
+                        ("DigitalSignature", "`demographicId` <> -1 AND NOT"): 1,
+                        ("DigitalSignature", "BINARY `ModuleType` NOT IN"): 1,
+                    })
+        report = pf.run_checks(db, properties=clean_props())
+        self.assertEqual(report["verdict"], "no-go")
+        self.assertTrue({"signature-null-patient", "signature-invalid-patient",
+                         "signature-module-type"}.issubset(
+                             {f["id"] for f in report["findings"]}))
+
+    def test_real_demographic_minus_one_blocks_sentinel_projection(self):
+        db = FakeDb(base_tables(DigitalSignature=1),
+                    where_counts={("demographic", "`demographic_no` = -1"): 1})
+        report = pf.run_checks(db, properties=clean_props())
+        self.assertEqual(report["verdict"], "no-go")
+        self.assertIn("signature-sentinel-ambiguous",
+                      {f["id"] for f in report["findings"]})
+
     def test_patient_data_table_blocks_with_accept_flag(self):
         db = FakeDb(base_tables(formONAR=12))
         report = pf.run_checks(db, properties=clean_props())

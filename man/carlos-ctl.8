@@ -552,9 +552,13 @@ locations separately, especially with \-\-skip-documents.
 Original names remain reserved.
 Ambiguous historical downloads and regeneration require file reconciliation;
 the report and root\-only billing-files-details.txt identify the work.
-The beta7 package pair requires schema manifest format 2 and ETL contract 4.
-A beta6 partial copy must be restored to its pre\-import backup before an
-upgrade and fresh import; see the application migration runbook.
+The beta8 package pair requires schema manifest format 3 and ETL contract 5.
+It preserves OSCAR's unassigned digital signatures with patient sentinel \-1,
+and independently checks their original patient and module values.
+Known stock eForm collisions are reconciled with private receipts; missing
+source documents and clinic eForm assets cannot be covered by target-side
+placeholders. A beta7 partial copy must be restored to its pre\-import
+backup before an upgrade and fresh import; see the application runbook.
 .TP
 .B import-o19 (experimental)
 Import an OSCAR 19 clinic backup into a STOCK initial deploy (a fresh
