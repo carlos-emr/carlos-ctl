@@ -37,7 +37,12 @@ class SourceAndTarget:
             return [(table, column) for table, names in self.columns.items()
                     for column in names]
         if "FROM `o19_import`.`DigitalSignature`" in sql:
-            return self.source_signatures
+            if "IFNULL(`ModuleType`, '')" in sql:
+                return [(sid, "" if module is None else module)
+                        for sid, module in self.source_signatures]
+            if "SELECT `id`, ''" in sql:
+                return [(sid, "") for sid, _module in self.source_signatures]
+            raise AssertionError(sql)
         if "FROM `o19_import`.`consultationRequests`" in sql:
             return self.source_consults
         if "FROM `o19_import`.`consultationResponse`" in sql:
@@ -108,16 +113,22 @@ class TestImportedSignatureOwnership(unittest.TestCase):
 
     def test_sql_null_module_allows_unique_source_owner(self):
         fixture = SourceAndTarget()
-        fixture.source_signatures[0] = ("42", "NULL")
         owners, _ = o19signatures.expected_owners(fixture.query, "o19_import")
         self.assertEqual(owners[42], (7, "E_FORM"))
 
     def test_missing_module_column_allows_unique_source_owner(self):
         fixture = SourceAndTarget()
         fixture.columns["DigitalSignature"].remove("ModuleType")
-        fixture.source_signatures[0] = ("42", "NULL")
         owners, _ = o19signatures.expected_owners(fixture.query, "o19_import")
         self.assertEqual(owners[42], (7, "E_FORM"))
+
+    def test_literal_null_module_does_not_claim_unique_source_owner(self):
+        fixture = SourceAndTarget()
+        fixture.source_signatures[0] = ("42", "NULL")
+        owners, unresolved = o19signatures.expected_owners(
+            fixture.query, "o19_import")
+        self.assertNotIn(42, owners)
+        self.assertEqual(unresolved, 3)
 
 
 if __name__ == "__main__":

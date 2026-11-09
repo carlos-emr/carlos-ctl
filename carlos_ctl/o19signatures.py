@@ -69,9 +69,9 @@ def expected_owners(query, source: str) -> Tuple[Dict[int, Tuple[int, str]], int
     columns = _source_columns(query, source, tables)
     if not {"id", "demographicId"} <= columns["DigitalSignature"]:
         raise ValueError("source DigitalSignature id/patient columns unavailable")
-    module_sql = ("`ModuleType`" if any(
+    module_sql = ("IFNULL(`ModuleType`, '')" if any(
         name.lower() == "moduletype" for name in columns["DigitalSignature"])
-        else "NULL")
+        else "''")
     signatures = {}
     for row in query("SELECT `id`, {1} FROM `{0}`.`DigitalSignature` WHERE "
                      "`demographicId` = -1".format(source, module_sql)):
@@ -79,7 +79,7 @@ def expected_owners(query, source: str) -> Tuple[Dict[int, Tuple[int, str]], int
         if signature_id is None:
             raise ValueError("source DigitalSignature has an invalid unassigned id")
         module = row[1] if len(row) > 1 else None
-        signatures[signature_id] = None if module in (None, "NULL", "") else module
+        signatures[signature_id] = None if module in (None, "") else module
     if not signatures:
         return {}, 0
 
