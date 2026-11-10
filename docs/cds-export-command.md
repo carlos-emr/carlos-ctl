@@ -5,15 +5,10 @@ The matching Java 25 engine uses the same clinical job service for foreground
 execution and durable asynchronous browser work. OntarioMD 5.2 is registered;
 PCON is not advertised.
 
-The actual root-delegated CLI has exported a native chart with no import metadata,
-observed its durable job from independent processes, downloaded the encrypted
-artifact, and refused an existing output destination. An independent recipient
-recovered the exact validated ZIP and all thirteen expected clinical facts.
-Status and diagnostics remained available with invalid active export settings.
-The later paired CLI/browser workflow also passed with this CLI implementation,
-matching fourteen independent native facts and rejecting four schema-valid
-clinical mutants for each transport. The application PR remains a draft pending
-its current-head resource and security verification:
+The command supports foreground and detached jobs, independent status and
+submission recovery, and recipient-encrypted downloads into new output files.
+The matching web application submits durable jobs asynchronously. Qualification
+evidence for the paired revisions is recorded in
 [carlos-emr/carlos#5706](https://github.com/carlos-emr/carlos/pull/5706).
 
 Import and export share `cdsruntime.py` for Java launch selection, bounded capability
