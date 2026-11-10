@@ -1,3 +1,13 @@
+carlos-ctl (1.3.4) resolute; urgency=medium
+
+  * Give the release/2026.08 CDS export companion a distinct candidate
+    version from main's 1.3.3 importer protocol transition. Retain schema
+    manifest format 2, ETL contract 4 and released billing/audit safeguards.
+  * Preserve the verified shared import/export transport, root delegation
+    and orphan-ticket cleanup in the release package.
+
+ -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Tue, 10 Nov 2026 01:48:00 +0000
+
 carlos-ctl (1.3.3) resolute; urgency=medium
 
   * Retain released billing-filename and audit-provenance safeguards.
