@@ -1,3 +1,16 @@
+carlos-ctl (1.3.5) resolute; urgency=medium
+
+  * Add `cds-import --abandon --run RUN_ID --confirm RUN_ID --reason TEXT`,
+    the audited way to close a stopped, cancelled CDS import that cannot
+    complete. It passes the request to the CARLOS engine under the usual
+    exact-argument root delegation and runs only when the engine advertises
+    the abandon operation; other operations keep working with older engines.
+    The engine releases the run's held charts incomplete without changing
+    clinical data and reopens the maintenance window; the command always
+    exits 4.
+
+ -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Fri, 13 Nov 2026 20:30:00 +0000
+
 carlos-ctl (1.3.4) resolute; urgency=medium
 
   * Give the release/2026.08 CDS export companion a distinct candidate

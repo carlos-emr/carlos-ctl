@@ -35,6 +35,10 @@ PROTOCOL = 1
 CAPABILITY_BYTES = 64 * 1024
 CAPABILITY_TIMEOUT = 30.0
 OPERATIONS = frozenset({"import", "status", "resume", "cancel", "report"})
+# Advertised by engines that offer the audited abandon. It is required only for an abandon
+# request, so this release keeps working with engines that predate it.
+ABANDON = "abandon"
+MAX_REASON = 1000
 MIN_HEAP_MIB = 128
 MAX_HEAP_MIB = 16 * 1024
 TICKET_PARENT = "/run"
@@ -79,6 +83,15 @@ def _provider(value: str) -> str:
     return value
 
 
+def _reason(value: str) -> str:
+    # The stated reason travels only to the engine's protected record. It is a single
+    # bounded line; control and line-separator characters are refused.
+    if not value.strip() or len(value) > MAX_REASON or any(
+            ord(char) < 32 or 127 <= ord(char) < 160 or char in "\u2028\u2029" for char in value):
+        raise argparse.ArgumentTypeError("invalid reason")
+    return value
+
+
 def _shift(value: str) -> int:
     if not re.fullmatch(r"-?[0-9]{1,10}", value, flags=re.ASCII):
         raise argparse.ArgumentTypeError("invalid shift")
@@ -99,7 +112,8 @@ def parser() -> argparse.ArgumentParser:
                 "1 arguments; 2 configuration/runtime; 3 denied; 4 refused/busy/failed/"
                 "partial/uncertain; 130 interrupted. Status/report success does not mean "
                 "the recorded import is complete. A nonzero result can coexist with "
-                "committed clinical data; resume/reconcile by run ID."),
+                "committed clinical data; resume/reconcile by run ID. An abandon always "
+                "exits 4: an abandoned import is never complete."),
     )
     ap.add_argument("--input", action=_Once, metavar="PATH",
                     help="source XML, ZIP or directory within the configured allowed root")
@@ -128,16 +142,39 @@ def parser() -> argparse.ArgumentParser:
                            metavar="RUN_ID", help=operation + " an existing durable run")
     modes.add_argument("--status-submission", action=_Once, type=_identifier, metavar="KEY",
                        help="recover a run handle from its printed submission key without resubmitting")
+    modes.add_argument("--abandon", action=_Once, nargs=0, const=True, default=False,
+                       help=("close a stopped, already cancelled import that cannot complete: its "
+                             "held charts are released incomplete, no clinical data changes, and "
+                             "the EMR reopens once no other import holds a chart; requires --run, "
+                             "--confirm and --reason; always exits 4"))
+    ap.add_argument("--run", action=_Once, type=_identifier, metavar="RUN_ID",
+                    help="the run to abandon")
+    ap.add_argument("--confirm", action=_Once, type=_identifier, metavar="RUN_ID",
+                    help="the same run ID again, confirming the abandon")
+    ap.add_argument("--reason", action=_Once, type=_reason, metavar="TEXT",
+                    help=("why the import is abandoned, one line of at most 1000 characters, "
+                          "kept in the run's protected record; never name a patient"))
     return ap
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     ap = parser()
     args = ap.parse_args(list(argv))
+    provided = getattr(args, "_provided", set())
+    if args.abandon:
+        if provided - {"provider", "abandon", "run", "confirm", "reason"} \
+                or not (args.run and args.confirm and args.reason):
+            ap.error("an abandon takes only --provider, --run, --confirm and --reason")
+        if args.confirm != args.run:
+            ap.error("the confirmation must repeat the run ID")
+        args.operation = ABANDON
+        args.run_id = args.run
+        return args
+    if provided & {"run", "confirm", "reason"}:
+        ap.error("--run, --confirm and --reason belong to --abandon")
     selected = [name for name in OPERATIONS - {"import"} if getattr(args, name)]
     args.operation = "status" if args.status_submission else (selected[0] if selected else "import")
     args.run_id = getattr(args, selected[0]) if selected else None
-    provided = getattr(args, "_provided", set())
     if args.operation != "import":
         if provided - {"provider", "status_submission" if args.status_submission else args.operation}:
             ap.error("existing jobs cannot change input or options")
@@ -160,6 +197,8 @@ def engine_arguments(args: argparse.Namespace) -> List[str]:
     result = ["--operation", args.operation, "--provider", args.provider]
     if args.status_submission:
         return result + ["--submission-key", args.status_submission]
+    if args.operation == ABANDON:
+        return result + ["--run", args.run_id, "--confirm", args.confirm, "--reason", args.reason]
     if args.operation != "import":
         return result + ["--run", args.run_id]
     result += ["--input", args.input, "--source-namespace", args.source_namespace,
@@ -218,6 +257,8 @@ def cmd_cds_import(argv: Sequence[str]) -> int:
         capabilities = _probe(command, env)
         if args.status_submission and capabilities.get("submissionLookup") is not True:
             raise CdsCommandError("CDS_HANDSHAKE: deploy a matching CARLOS release with submission lookup", 2)
+        if args.operation == ABANDON and ABANDON not in capabilities.get("operations", []):
+            raise CdsCommandError("CDS_HANDSHAKE: deploy a CARLOS release whose import engine offers --abandon", 2)
         # Java's real Properties loader selects the server launch budget. Do not
         # duplicate its escaping/separator/continuation semantics in Python.
         command = ["-Xmx" + str(capabilities["cliHeapMiB"]) + "m"
