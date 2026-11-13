@@ -176,6 +176,15 @@ name back to it:
 sudo carlos-ctl destroy-data --confirm <server-name>
 ```
 
+## CDS export adapter
+
+`carlos-ctl cds-export --help` documents the export argument contract. Clinical
+execution requires the matching Java export engine and an advertised qualified
+profile. The OntarioMD engine has passed installed root-delegated clinical
+export/download and authenticated asynchronous browser qualification checks.
+The [export command contract](cds-export-command.md) records the shared process
+transport, exact delegation scope, lifecycle, compatibility and completion rules.
+
 ## OSCAR 19 historical billing files
 
 The beta7 package pair (carlos-ctl 1.3.2) imports repeated Ontario billing
@@ -197,6 +206,32 @@ export, and the live `billing_filename_import` table. See the application's
 Schema manifest format 2 and ETL contract 4 require the matched package pair.
 A beta6 import that already copied data uses the tested restore-and-restart
 procedure; a changed package contract cannot be resumed across a partial copy.
+
+## OSCAR 19 beta8 import compatibility
+
+The beta8 pair (`carlos-ctl` 1.3.3, schema manifest format 3 and ETL contract
+6) preserves `DigitalSignature.demographicId=-1` without rewriting the stored
+value. Preflight refuses other invalid patient references and unsupported
+module values. P4 freezes a unique owner inferred from the staged source into
+an app-owned receipt; P7 verifies that receipt against the source again. A
+form submitted after import cannot claim an unassigned signature, and one
+without a unique source owner remains stored but unreadable. For eForms, the
+receipt considers only saved source `signatureValue` and Rich Text `Letter`
+fields, and rejects conflicting patients or modules. The document phase
+handles the three known stock Rich Text
+Letter assets according to package ownership, normalizes the exact legacy
+`${oscar_image_path}/` marker, and ignores comments and script bodies when
+enumerating static eForm assets. It checks that every referenced clinic
+document and eForm asset came from the source tar, so a nonempty target
+placeholder does not hide missing source material. Final verification repeats
+the source and service-account readability checks. Verified private snapshots
+are reused between assessment and the real import to reduce disk use.
+
+A beta7 import that has already copied rows cannot resume under beta8.
+Restore its pre-import database, document tree and import state, then run a
+fresh assessment and import with the matched packages. The
+[application runbook](https://github.com/carlos-emr/carlos/blob/main/docs/o19-import-deb.md#beta8-package-pair-and-a-beta7-import-already-in-progress)
+has the complete recovery sequence.
 
 ## CDS import
 
@@ -238,6 +273,7 @@ delegation. `sudo` does not grant clinical attribution by itself.
 | `--synthetic`, `--course ID`, `--timeshift DAYS` | Approved synthetic/anonymized workflow; course/nonzero shift require synthetic mode, which cannot merge real charts |
 | `--status-submission KEY` | Read-only recovery after acceptance output loss; same verified OS operator and selected provider; unknown outcome remains uncertain, never resubmits |
 | `--status RUN_ID`, `--resume RUN_ID`, `--cancel RUN_ID`, `--report RUN_ID` | Mutually exclusive existing-run operations, always with `--provider ID`; source/import options cannot be replaced |
+| `--abandon --run RUN_ID --confirm RUN_ID --reason TEXT` | Close a stopped, already cancelled import that cannot complete; see below. Always with `--provider ID`; always exits `4` |
 
 The foreground import command streams the engine's safe progress and waits for
 its outcome. It does not capture batch output in memory. The engine retains
@@ -263,6 +299,31 @@ A nonzero result can coexist with committed clinical data. Never automatically
 resubmit a failed input; inspect and resume/reconcile the recorded run.
 Report-delivery or cleanup failure is separate from the actual clinical commit
 outcome and must not be treated as proof of rollback.
+
+A stopped import that has written charts keeps them held, and the EMR closed
+for ordinary clinical work, until it completes. When it cannot complete (the
+same defect stops every resume, or an upgrade changed the ruleset it is bound
+to), its own operator closes it with an audited abandon after cancelling it:
+
+```bash
+sudo carlos-ctl cds-import --cancel RUN_ID --provider 999998
+sudo carlos-ctl cds-import --abandon --run RUN_ID --confirm RUN_ID \
+  --reason "defect stops every resume; vendor ticket 1234" --provider 999998
+```
+
+The engine refuses, and changes nothing, unless the run is stopped after
+writing, cancelled and free of a pending resume or review, and the operator
+and provider are the run's own. No clinical data is deleted or changed: each
+held chart's committed rows are checked against their sealed receipts, the
+charts are released incomplete and marked `ABANDONED`, the run becomes
+`ABANDONED` for good, and the maintenance window reopens once no other import
+holds a chart. The reason (one line, at most 1000 characters) goes to the
+run's protected record and is never printed; like any argument it is briefly
+visible to other administrators on the host, so never name a patient in it.
+The command always exits `4`, and every released chart needs clinical
+reconciliation. It needs a CARLOS release whose engine advertises the abandon
+operation (`CDS_HANDSHAKE` otherwise); see the CARLOS CDS import operator
+guide for the full procedure.
 
 Only `/etc/carlos-emr/carlos.properties` is selected by this host adapter; no
 credential is placed in argv. The root wrapper records the verified invoking

@@ -42,9 +42,9 @@ MANIFEST_DIR_ENV = "CARLOS_CTL_O19_MANIFEST_DIR"
 #: MANIFEST_FORMAT into every file and bumps it only when a consumer could
 #: misread the previous shape
 MANIFEST_FORMAT = 1
-# Schema format 2 requires the billing helper lifecycle. A format-1 CLI
-# would evaluate the new expressions without building their helpers.
-SCHEMA_MANIFEST_FORMAT = 2
+# Schema format 3 requires sentinel-preserving signature mapping and the
+# document/source provenance checks. Earlier CLIs must refuse these rules.
+SCHEMA_MANIFEST_FORMAT = 3
 
 
 def manifest_format(kind):

@@ -489,6 +489,22 @@ They use the run's recorded source/options and cannot replace those options.
 An interrupted/failed command can already have committed clinical units:
 inspect its durable outcome and resume/reconcile the same run instead of
 resubmitting the input.
+.TP
+.B --abandon --run RUN_ID --confirm RUN_ID --reason TEXT --provider ID
+Close a stopped import that has written charts and cannot complete, for
+example because the same defect stops every resume or an upgrade changed the
+ruleset it is bound to. Cancel the run first; the engine refuses an abandon
+of a run that is not stopped and cancelled, has a pending resume or review,
+or belongs to another operator or provider, and then changes nothing. The run
+ID is typed twice. The reason, one line of at most 1000 characters, is kept
+in the run's protected record and never printed; like every argument it is
+briefly visible to other administrators on the host, so never name a patient
+in it. No clinical data is deleted or changed: each held chart's committed
+rows are checked against their sealed receipts, the charts are released
+incomplete and marked ABANDONED, the run becomes ABANDONED for good, and the
+maintenance window reopens once no other import holds a chart. The command
+always exits 4; the released charts need clinical reconciliation. It requires
+a CARLOS engine that advertises the abandon operation.
 .IP
 The wrapper verifies a bounded version/capability handshake before execution,
 requires Java 25 and runs the engine as the carlos service account with the
@@ -510,6 +526,48 @@ Patient-level diagnostics, event/error logs and completeness receipts remain
 protected. Parsed bytes or a heartbeat do not establish clinical completion;
 inspect the recorded per-patient/category outcomes, outstanding review,
 attachments/contacts/routing/audit and report-delivery state.
+.SS CDS patient-data export
+.TP
+.B cds-export --provider ID --profile KEY --recipient KEY --audit-plan KEY
+The command adapter requires a compatible Java export engine that explicitly
+advertises the requested qualified profile. Without that engine the adapter
+refuses before creating a delegation and cannot produce a clinical export.
+.IP
+New requests select either
+.B --physicians ID[,ID]
+for every roster status or
+.B --patients-file PATH
+for a protected explicit selection. Categories default to all; an explicit
+.B --categories LIST
+must include Demographics. Encryption recipient and complete historical-audit
+access use server registry keys, never a command-line private key or password.
+.IP
+Existing-run operations are
+.BR "--status RUN_ID" ", " "--resume RUN_ID" ", " "--cancel RUN_ID" ", " "--report RUN_ID" ", " "--download RUN_ID" .
+.B --facility ID
+names the facility the export is made under; with facility filtering on, note and
+program access are checked against it.
+.B --submission-key KEY
+gives a new request a replay-safe identity: repeating it with the same key never
+starts a second job.
+Existing-run operations take the canonical run UUID and cannot replace accepted
+disclosure intent. Download additionally requires
+.B --artifact package
+and
+.BR "--output PATH" ,
+a new file inside the configured delivery root that receives the
+recipient-encrypted package; an existing file is refused unchanged.
+.B --status-submission KEY
+recovers the original accepted handle after a lost acknowledgment.
+.B --detach
+applies only to new submission or resume and requires an explicit durable-submit
+capability. Waiting for a worker and successful status/control are not clinical
+completion. Stopping a foreground wait does not itself request cancellation.
+The exact export ticket directory is
+.IR /run/carlos-cds-export-delegations .
+The engine must independently verify the root-issued exact-request ticket and
+current provider/patient/category rights. See docs/cds-export-command.md for the
+process contract and remaining installed-engine requirements.
 .SS Decommissioning
 .TP
 .BI "destroy-data --confirm " server-name
@@ -552,9 +610,13 @@ locations separately, especially with \-\-skip-documents.
 Original names remain reserved.
 Ambiguous historical downloads and regeneration require file reconciliation;
 the report and root\-only billing-files-details.txt identify the work.
-The beta7 package pair requires schema manifest format 2 and ETL contract 4.
-A beta6 partial copy must be restored to its pre\-import backup before an
-upgrade and fresh import; see the application migration runbook.
+The beta8 package pair requires schema manifest format 3 and ETL contract 6.
+It preserves OSCAR's unassigned digital signatures with patient sentinel \-1,
+and independently checks their original patient and module values.
+Known stock eForm collisions are reconciled with private receipts; missing
+source documents and clinic eForm assets cannot be covered by target-side
+placeholders. A beta7 partial copy must be restored to its pre\-import
+backup before an upgrade and fresh import; see the application runbook.
 .TP
 .B import-o19 (experimental)
 Import an OSCAR 19 clinic backup into a STOCK initial deploy (a fresh
@@ -949,6 +1011,10 @@ the derived
 fragment, the root\-only
 .I documents-details.txt
 and the root\-only
+.I verify-documents-details.txt
+(P7's document source-provenance, stock collision, or service-account read
+failures, with the affected paths),
+and the root\-only
 .I billing-files-details.txt
 and
 .I o19-archive-export/
@@ -972,10 +1038,21 @@ exits non\-zero when any check fails.
 reports its verdict as its status: 0 go, 1 go with acknowledgements, 2
 no\-go, and 3 when the tool itself failed \(em so 1 and 2 are answers, not
 errors.
+.B cds-export
+uses 0 for a completed export or successful observation/control, 1 for arguments,
+2 for configuration/runtime/compatibility failure, an unconfirmed result
+(CDS_EXPORT_UNCERTAIN; inspect the original job) or a command that changed no job
+(CDS_EXPORT_NOT_STARTED), 3 for denied authority,
+4 for failed/review-required/incomplete execution, 5 for a ready package that
+leaves out held patients (not a complete migration), and 130 or 143 for an
+interrupted or terminated wait, which does not cancel the job.
+A successful observation does not establish a completed export.
 .B cds-import
 uses 0 for a clean complete import, verified no-op or valid dry run; 1 for
 arguments; 2 for configuration/runtime/protocol failure; 3 for denied authority;
-4 for refused/busy/failed/partial/uncertain or incomplete import. An interrupted
+4 for refused/busy/failed/partial/uncertain or incomplete import, and for every
+.B --abandon
+(an abandoned import is never complete). An interrupted
 process may use 130 or the conventional signal status. For
 .B --status
 or

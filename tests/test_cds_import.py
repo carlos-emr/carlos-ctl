@@ -83,6 +83,66 @@ class TestArguments(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(cdsimport.CdsCommandError):
                 cdsimport.parse_args(["--status-submission", "submission-123", "--provider", "4", *extra])
 
+    def test_abandon_reaches_the_engine_with_the_run_twice_and_the_stated_reason(self):
+        args = cdsimport.parse_args([
+            "--abandon", "--run", "run-123", "--confirm", "run-123",
+            "--reason", "defect stops every resume; see ticket 42", "--provider", "T099"])
+        self.assertEqual(args.operation, "abandon")
+        self.assertEqual(args.run_id, "run-123")
+        self.assertEqual(cdsimport.engine_arguments(args), [
+            "--operation", "abandon", "--provider", "T099", "--run", "run-123",
+            "--confirm", "run-123", "--reason", "defect stops every resume; see ticket 42"])
+
+    def test_abandon_refuses_without_an_exact_confirmation_and_a_one_line_reason(self):
+        base = ["--abandon", "--provider", "4"]
+        invalid = [
+            base + ["--run", "run-1", "--reason", "stated"],
+            base + ["--run", "run-1", "--confirm", "run-1"],
+            base + ["--confirm", "run-1", "--reason", "stated"],
+            base + ["--run", "run-1", "--confirm", "run-2", "--reason", "stated"],
+            base + ["--run", "run-1", "--confirm", "run-1", "--reason", " "],
+            base + ["--run", "run-1", "--confirm", "run-1", "--reason", "two\nlines"],
+            base + ["--run", "run-1", "--confirm", "run-1", "--reason", "a\u2028b"],
+            base + ["--run", "run-1", "--confirm", "run-1", "--reason", "x" * 1001],
+            base + ["--run", "../run", "--confirm", "../run", "--reason", "stated"],
+            base + ["--run", "run-1", "--confirm", "run-1", "--reason", "stated",
+                    "--input", "/allowed/new.xml"],
+            base + ["--run", "run-1", "--confirm", "run-1", "--reason", "stated",
+                    "--status", "run-1"],
+            ["--resume", "run-1", "--provider", "4", "--reason", "stated"],
+            ["--cancel", "run-1", "--provider", "4", "--run", "run-1"],
+            IMPORT + ["--confirm", "run-1"],
+        ]
+        for argv in invalid:
+            with self.subTest(argv=argv):
+                with self.assertRaises(cdsimport.CdsCommandError) as error:
+                    cdsimport.parse_args(argv)
+                self.assertEqual(error.exception.code, 1)
+
+    def test_abandon_runs_only_on_an_engine_that_offers_it(self):
+        request = ["--abandon", "--run", "run-1", "--confirm", "run-1",
+                   "--reason", "stated", "--provider", "4"]
+        for operations, expected in ((CAPS["operations"], 2),
+                                     (CAPS["operations"] + ["abandon"], 4)):
+            with self.subTest(operations=operations), \
+                    mock.patch.object(cdsimport.os, "geteuid", return_value=0), \
+                    mock.patch.object(cdsimport, "_operator", return_value=("root", 0)), \
+                    mock.patch.object(cdsimport, "_java_command", return_value=["/java"]), \
+                    mock.patch.object(cdsimport, "_probe",
+                                      return_value={**CAPS, "operations": operations}), \
+                    mock.patch.object(cdsimport, "_create_ticket",
+                                      return_value=SimpleNamespace(path="/ticket", remove=lambda: True)) as ticket, \
+                    mock.patch.object(cdsimport, "_run_engine", return_value=4) as execute, \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(cdsimport.cmd_cds_import(request), expected)
+                self.assertEqual(ticket.called, expected == 4)
+                self.assertEqual(execute.called, expected == 4)
+                if expected == 2:
+                    self.assertIn("CDS_HANDSHAKE", err.getvalue())
+                else:
+                    self.assertEqual(ticket.call_args.args[2].operation, "abandon")
+                    self.assertEqual(execute.call_args.args[1][-2:], ["--reason", "stated"])
+
     def test_synthetic_course_and_shift_are_explicit_and_repeatable(self):
         argv = IMPORT + ["--synthetic", "--course", "9", "--timeshift", "-365"]
         first = cdsimport.engine_arguments(cdsimport.parse_args(argv))
@@ -131,7 +191,8 @@ class TestArguments(unittest.TestCase):
             with self.assertRaises(SystemExit) as exit_:
                 cli.main(["cds-import", "--help"])
         self.assertEqual(exit_.exception.code, 0)
-        for item in ("--source-profile", "--merge-existing", "--resume", "130", "committed"):
+        for item in ("--source-profile", "--merge-existing", "--resume", "130", "committed",
+                     "--abandon", "--confirm", "--reason"):
             self.assertIn(item, stdout.getvalue())
 
 

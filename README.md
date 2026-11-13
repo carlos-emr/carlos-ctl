@@ -101,6 +101,12 @@ without capture and retires its own attestation after the engine exits.
 See [the operator reference](docs/carlos-ctl.md#cds-import) and
 `carlos-ctl cds-import --help` for flags and exit semantics.
 
+`carlos-ctl cds-export` runs OntarioMD CDS exports through the same durable CARLOS
+jobs as the browser: foreground or detached, with status, resume, cancel, report and
+recipient-encrypted download. It requires a matching qualified Java engine before
+clinical execution; see the [export command contract](docs/cds-export-command.md),
+`carlos-ctl cds-export --help` and carlos-ctl(8).
+
 ## Development
 
 ```bash

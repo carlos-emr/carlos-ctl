@@ -71,7 +71,7 @@ import subprocess
 import sys
 
 # === BEGIN GENERATED DATA (generate_manifests.py) ===
-SCHEMA_MAP_VERSION = 'o19map-7+81c32ac6'
+SCHEMA_MAP_VERSION = 'o19map-8+3dce0b8d'
 O19_PROFILE = 'on'
 SUPPORTED_PROVINCES = ['on', 'bc']
 REQUIRED_TABLES = [
@@ -918,7 +918,7 @@ LEGACY_PREVENTION_TYPES = [
     'fIPV',
 ]
 PROFILE_BC = {
-    'SCHEMA_MAP_VERSION': 'o19map-7+e44c15d5',
+    'SCHEMA_MAP_VERSION': 'o19map-8+783f30f4',
     'O19_PROFILE': 'bc',
     'PATIENT_DATA_TABLES': [
         'DrugDispensing',
@@ -3010,6 +3010,79 @@ def check_required_tables(c):
             data=dict((t, "absent") for t in missing_required)))
 
 
+def check_digital_signatures(c):
+    """Validate the one OSCAR patient sentinel without coercing any data.
+
+    The target's generated FK projects -1 to NULL. Every other stored
+    demographicId must still name a patient. The generic ETL can coerce a
+    source NULL in a NOT NULL column and an unknown enum member, so refuse
+    both before the copy rather than treating its transformed parity as
+    evidence that the original value survived.
+    """
+    if "DigitalSignature" not in c.tables:
+        return
+    if "demographic" not in c.tables:
+        c.findings.append(finding(
+            "signature-patients-unavailable", BLOCKER,
+            "digital signatures cannot be checked without demographic",
+            "Restore the complete source dump; no --accept flag exists."))
+        return
+    count = c.count_live
+    if count("demographic", "`demographic_no` = -1"):
+        c.findings.append(finding(
+            "signature-sentinel-ambiguous", BLOCKER,
+            "source demographic -1 exists",
+            "The -1 signature sentinel would also name a real patient. "
+            "Resolve this ambiguity in the source; no --accept flag exists."))
+    nulls = count("DigitalSignature", "`demographicId` IS NULL")
+    if nulls:
+        c.findings.append(finding(
+            "signature-null-patient", BLOCKER,
+            "{0} signature(s) have a NULL demographicId".format(nulls),
+            "The target requires the original value; a generic NULL-to-zero "
+            "conversion would change it. No --accept flag exists."))
+    invalid = count("DigitalSignature", "`demographicId` <> -1 AND NOT "
+                    "EXISTS (SELECT 1 FROM `{0}` p WHERE p.`demographic_no` "
+                    "= `{1}`.`demographicId`)".format(
+                        c.tables["demographic"], c.tables["DigitalSignature"]))
+    if invalid:
+        c.findings.append(finding(
+            "signature-invalid-patient", BLOCKER,
+            "{0} signature(s) have an invalid patient reference".format(invalid),
+            "Only -1 denotes an unassigned signature. Every other value "
+            "must reference a demographic row; no --accept flag exists."))
+    unassigned = count("DigitalSignature", "`demographicId` = -1")
+    if unassigned:
+        c.findings.append(finding(
+            "signature-unassigned", ADVISORY,
+            "{0} unassigned signature(s) use demographicId -1".format(unassigned),
+            "The import preserves -1 and the signature bytes unchanged. "
+            "Clinical references must be reviewed before cutover."))
+    # Early OSCAR 19 builds have no ModuleType. Later builds do, and the
+    # values must fit the target enum exactly. Never mistake an SQL error
+    # or a missing privilege for an absent column.
+    try:
+        columns = c.query(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE "
+            "TABLE_SCHEMA = {0} AND TABLE_NAME = '{1}' AND "
+            "LOWER(COLUMN_NAME) = 'moduletype'".format(
+                c.schema_expr, c.tables["DigitalSignature"].replace("'", "''")))
+    except Exception as exc:
+        c.query_errors["DigitalSignature.ModuleType metadata"] = str(exc)
+        return
+    if columns:
+        bad_types = count("DigitalSignature",
+                          "`ModuleType` IS NOT NULL AND BINARY `ModuleType` "
+                          "NOT IN (BINARY 'CONSULTATION', BINARY 'E_FORM', "
+                          "BINARY 'PRESCRIPTION')")
+        if bad_types:
+            c.findings.append(finding(
+                "signature-module-type", BLOCKER,
+                "{0} signature(s) have an unsupported ModuleType".format(bad_types),
+                "An unknown value would be silently converted to NULL. "
+                "Resolve it in the source; no --accept flag exists."))
+
+
 def check_identifier_class(c):
     """Table AND column names outside the identifier class the ETL
     accepts.
@@ -4005,6 +4078,7 @@ def run_checks(query, properties=None, province="on", accepted=(),
     check_preserved_class_rows(c)
     check_dropped_column_data(c)
     check_required_tables(c)
+    check_digital_signatures(c)
     check_identifier_class(c)
     check_views(c)
     check_facility_and_clinic(c)
