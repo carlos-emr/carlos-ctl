@@ -53,9 +53,20 @@ compatible worker exists. Stopping a foreground wait is distinct from durable ca
 
 Exit 0 means a completed clinical export or a successful observation/control request;
 an observation exit does not establish clinical completeness. Exit 1 is an argument
-error, 2 a configuration/runtime/compatibility failure, 3 denied authority, 4 an incomplete,
-failed or review-required result, and 130 interrupted execution. Python preserves the
-engine's outcome and never constructs a clinical success result itself. CLI and browser
-use the same completion predicate: READY, an available artifact, known positive patient
-total, every selected patient processed and no blocked patients. Waiting preserves an
-unknown total; accepted intent or exit-zero observation alone cannot imply completeness.
+error; 2 a configuration/runtime/compatibility failure, an unconfirmed result
+(`CDS_EXPORT_UNCERTAIN`: inspect the original durable job) or a command that submitted
+or changed no job (`CDS_EXPORT_NOT_STARTED`); 3 denied authority (the engine names a
+missing security object); 4 an incomplete, failed or review-required result; 5 a ready
+package that leaves out held patients, which is not a complete migration; and 130 or
+143 an interrupted or terminated wait, which does not cancel the job. Python preserves
+the engine's outcome, including a signal status, and never constructs a clinical success
+result itself. CLI and browser use the same completion predicate: READY, an available
+artifact, known positive patient total, every selected patient processed and no held
+patients. A held patient is named, with a safe code, in the report and the package
+ReadMe; export it again after correcting the chart. Waiting preserves an unknown total;
+accepted intent or exit-zero observation alone cannot imply completeness.
+
+Run identifiers are canonical lower-case UUIDs, checked before a delegation ticket is
+issued. Each new ticket issuance first removes root-owned ticket files older than the
+ticket lifetime plus five minutes, so tickets left by a killed supervisor do not
+accumulate between tmpfiles cleanups.

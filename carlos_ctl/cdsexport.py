@@ -45,6 +45,14 @@ def _identifier(value):
     return value
 
 
+def _run_id(value):
+    # The engine accepts only a canonical lower-case UUID run identifier; refuse anything else
+    # here, before a delegation ticket is issued for a request that cannot succeed.
+    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", value, flags=re.ASCII):
+        raise argparse.ArgumentTypeError("invalid run identifier")
+    return value
+
+
 def _provider(value):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,16}", value, flags=re.ASCII):
         raise argparse.ArgumentTypeError("invalid provider")
@@ -86,12 +94,17 @@ def parser():
     ap = _Parser(prog="carlos-ctl cds-export", allow_abbrev=False,
                  description="Export OntarioMD CDS through the same durable CARLOS jobs as the browser.",
                  epilog="Exit: 0 completed export or successful observation/control; 1 arguments; "
-                        "2 configuration/runtime; 3 denied; 4 review/failed/incomplete; 130 interrupted. "
+                        "2 configuration/runtime, an unconfirmed result (CDS_EXPORT_UNCERTAIN: inspect the "
+                        "original job) or a command that changed no job (CDS_EXPORT_NOT_STARTED); "
+                        "3 denied; 4 review/failed/incomplete; 5 package ready without held patients, "
+                        "not a complete migration; 130 interrupted or 143 terminated wait. "
                         "Stopping a foreground wait does not cancel a job. Detached acceptance and status "
                         "success do not mean that an export package is complete.")
     ap.add_argument("--provider", action=_Once, type=_provider, required=True, metavar="ID",
                     help="active provider approved for the invoking operator")
-    ap.add_argument("--facility", action=_Once, type=_facility, metavar="ID")
+    ap.add_argument("--facility", action=_Once, type=_facility, metavar="ID",
+                    help="facility the export is made under; with facility filtering on, notes and "
+                         "program access are checked against it, as in the browser's facility choice")
     selection = ap.add_mutually_exclusive_group()
     selection.add_argument("--physicians", action=_Once, type=_physicians, metavar="ID[,ID]",
                            help="discover the primary-provider (MRP) roster, including every patient status")
@@ -106,18 +119,22 @@ def parser():
     ap.add_argument("--audit-plan", action=_Once, type=_registry_key, metavar="KEY",
                     help="registered, verified access arrangement for complete historical audit information")
     ap.add_argument("--submission-key", action=_Once, type=_identifier, metavar="KEY",
-                    help="replay-safe identity for a new request; Java prints one before acceptance if absent")
+                    help="replay-safe identity for a new request; repeating the same request with the same "
+                         "key never starts a second job, and --status-submission KEY recovers its run "
+                         "after a lost acknowledgement. Java prints one before acceptance if absent")
     ap.add_argument("--detach", action=_Once, nargs=0, const=True, default=False,
                     help="durably submit or resume and return; status truthfully reports waiting when no worker is available")
     modes = ap.add_mutually_exclusive_group()
     for operation in ("status", "resume", "cancel", "report", "download"):
-        modes.add_argument("--" + operation, action=_Once, type=_identifier, metavar="RUN_ID")
+        modes.add_argument("--" + operation, action=_Once, type=_run_id, metavar="RUN_ID")
     modes.add_argument("--status-submission", action=_Once, type=_identifier, metavar="KEY",
                        help="recover the accepted handle after a lost acknowledgement")
     ap.add_argument("--artifact", action=_Once, type=_identifier, metavar="ID",
                     help="encrypted artifact identifier (use 'package' with the current engine), for download only")
     ap.add_argument("--output", action=_Once, metavar="PATH",
-                    help="new private destination within the configured delivery root, for download only")
+                    help="for download only: a new file inside the configured delivery root "
+                         "(cds.export.deliveryRoot) that receives the recipient-encrypted package; "
+                         "an existing file is refused unchanged")
     return ap
 
 

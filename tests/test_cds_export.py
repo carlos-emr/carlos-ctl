@@ -15,6 +15,7 @@ from carlos_ctl import cdsexport, cdsruntime
 
 EXPORT = ["--provider", "007", "--physicians", "007,T099", "--profile", "omd-5.2",
           "--recipient", "recipient-fixture", "--audit-plan", "retained-fixture"]
+RUN = "0f1e2d3c-4b5a-4987-8a6b-5c4d3e2f1a0b"
 CAPS = {"engine": "cds-export", "protocol": 1, "java": 25, "cliHeapMiB": 512,
         "operations": sorted(cdsexport.OPERATIONS), "qualifiedProfiles": ["omd-5.2"],
         "submissionLookup": True, "detachedSubmission": True}
@@ -46,27 +47,27 @@ class TestExportArguments(unittest.TestCase):
 
     def test_existing_jobs_cannot_change_their_accepted_intent(self):
         for operation in ("status", "resume", "cancel", "report"):
-            args = cdsexport.parse_args(["--provider", "007", "--" + operation, "run-fixture"])
-            self.assertEqual(cdsexport.engine_arguments(args), ["--operation", operation, "--provider", "007", "--run", "run-fixture"])
+            args = cdsexport.parse_args(["--provider", "007", "--" + operation, RUN])
+            self.assertEqual(cdsexport.engine_arguments(args), ["--operation", operation, "--provider", "007", "--run", RUN])
             for extra in (["--profile", "omd-5.2"], ["--physicians", "007"], ["--facility", "1"], ["--submission-key", "other"]):
                 with self.subTest(operation=operation, extra=extra), self.assertRaises(cdsexport.CdsCommandError):
-                    cdsexport.parse_args(["--provider", "007", "--" + operation, "run-fixture", *extra])
-        resumed = cdsexport.parse_args(["--provider", "007", "--resume", "run-fixture", "--detach"])
+                    cdsexport.parse_args(["--provider", "007", "--" + operation, RUN, *extra])
+        resumed = cdsexport.parse_args(["--provider", "007", "--resume", RUN, "--detach"])
         self.assertEqual(cdsexport.engine_arguments(resumed)[-1], "--detach")
         with self.assertRaises(cdsexport.CdsCommandError):
-            cdsexport.parse_args(["--provider", "007", "--status", "run-fixture", "--detach"])
+            cdsexport.parse_args(["--provider", "007", "--status", RUN, "--detach"])
 
     def test_submission_lookup_does_not_resubmit_or_change_options(self):
         args = cdsexport.parse_args(["--provider", "007", "--status-submission", "request-fixture"])
         self.assertEqual(cdsexport.engine_arguments(args), ["--operation", "status", "--provider", "007", "--submission-key", "request-fixture"])
 
     def test_download_requires_an_explicit_artifact_and_destination(self):
-        args = cdsexport.parse_args(["--provider", "007", "--download", "run-fixture", "--artifact", "artifact-fixture", "--output", "./fixture.cms"])
+        args = cdsexport.parse_args(["--provider", "007", "--download", RUN, "--artifact", "artifact-fixture", "--output", "./fixture.cms"])
         argv = cdsexport.engine_arguments(args)
         self.assertEqual(argv[-4:], ["--artifact", "artifact-fixture", "--output", os.path.abspath("./fixture.cms")])
         for extra in ([], ["--output", "./fixture.cms"], ["--artifact", "fixture"]):
             with self.subTest(extra=extra), self.assertRaises(cdsexport.CdsCommandError):
-                cdsexport.parse_args(["--provider", "007", "--download", "run-fixture", *extra])
+                cdsexport.parse_args(["--provider", "007", "--download", RUN, *extra])
 
     def test_duplicate_ambiguous_and_invalid_selection_options_refuse(self):
         for extra in (["--provider", "4"], ["--profile", "omd-5.2"], ["--detach", "--detach"],
@@ -79,11 +80,62 @@ class TestExportArguments(unittest.TestCase):
             with self.subTest(physicians=physicians), self.assertRaises(cdsexport.CdsCommandError):
                 cdsexport.parse_args([*EXPORT[:3], physicians, *EXPORT[4:]])
 
+    def test_run_identifiers_are_canonical_uuids_before_any_ticket_is_issued(self):
+        for value in ("run-fixture", RUN.upper(), RUN + "x", "{" + RUN + "}", RUN.replace("-", "")):
+            with self.subTest(value=value), self.assertRaises(cdsexport.CdsCommandError):
+                cdsexport.parse_args(["--provider", "007", "--status", value])
+
+    def test_help_states_every_engine_outcome_including_held_patients(self):
+        epilog = cdsexport.parser().epilog
+        for text in ("5 package ready without held patients", "143 terminated", "CDS_EXPORT_UNCERTAIN",
+                     "CDS_EXPORT_NOT_STARTED"):
+            self.assertIn(text, epilog)
+
     def test_help_works_without_root_or_an_installed_war(self):
         cp = subprocess.run([sys.executable, "-m", "carlos_ctl.cli", "cds-export", "--help"], capture_output=True, text=True)
         self.assertEqual(cp.returncode, 0, cp.stderr)
         for flag in ("--physicians", "--patients-file", "--detach", "--status-submission", "--download"):
             self.assertIn(flag, cp.stdout)
+
+
+class TestTicketSweep(unittest.TestCase):
+    def test_sweep_removes_only_expired_ticket_files_owned_by_the_issuer(self):
+        import tempfile, time
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(cdsruntime, "TICKET_OWNER_UID", os.geteuid()):
+            old = os.path.join(directory, "11111111-2222-4333-8444-555555555555.json")
+            fresh = os.path.join(directory, "21111111-2222-4333-8444-555555555555.json")
+            other = os.path.join(directory, "notes.txt")
+            for path in (old, fresh, other):
+                with open(path, "w") as handle:
+                    handle.write("{}")
+            past = time.time() - 3600
+            os.utime(old, (past, past))
+            os.utime(other, (past, past))
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                self.assertEqual(cdsruntime.sweep_expired_tickets(descriptor, 600), 1)
+            finally:
+                os.close(descriptor)
+            self.assertFalse(os.path.exists(old))
+            self.assertTrue(os.path.exists(fresh))
+            self.assertTrue(os.path.exists(other))
+
+    def test_sweep_never_removes_a_ticket_owned_by_another_user(self):
+        import tempfile, time
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(cdsruntime, "TICKET_OWNER_UID", os.geteuid() + 1):
+            old = os.path.join(directory, "11111111-2222-4333-8444-555555555555.json")
+            with open(old, "w") as handle:
+                handle.write("{}")
+            past = time.time() - 3600
+            os.utime(old, (past, past))
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                self.assertEqual(cdsruntime.sweep_expired_tickets(descriptor, 600), 0)
+            finally:
+                os.close(descriptor)
+            self.assertTrue(os.path.exists(old))
 
 
 class TestExportEngineBoundary(unittest.TestCase):
@@ -133,7 +185,7 @@ class TestExportEngineBoundary(unittest.TestCase):
                     executed.assert_not_called()
 
     def test_status_remains_available_without_advertising_new_exports_as_qualified(self):
-        result, ticket, created, executed = self.invoke(["--provider", "007", "--status", "run-fixture"],
+        result, ticket, created, executed = self.invoke(["--provider", "007", "--status", RUN],
                                                        {**CAPS, "qualifiedProfiles": []})
         self.assertEqual(result, 0)
         executed.assert_called_once()

@@ -100,6 +100,42 @@ class Ticket:
             os.close(self.directory_fd)
 
 
+#: Seconds past a ticket's lifetime before the sweep removes it; the Java verifier refuses it
+#: long before.
+TICKET_SWEEP_GRACE_SECONDS = 300
+#: Attestations are issued by root; the sweep never removes a file another user owns.
+TICKET_OWNER_UID = 0
+_TICKET_NAME = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json")
+
+
+def sweep_expired_tickets(directory_fd: int, older_than: int) -> int:
+    """Remove root-owned attestation files older than ``older_than`` seconds.
+
+    Only regular, root-owned files named like a ticket are considered; anything else in the
+    directory is left alone. Failures are ignored: the sweep is housekeeping, and the Java
+    verifier independently refuses expired tickets.
+    """
+    removed = 0
+    cutoff = time.time() - older_than
+    try:
+        names = os.listdir(directory_fd)
+    except OSError:
+        return 0
+    for name in names:
+        if not _TICKET_NAME.fullmatch(name):
+            continue
+        try:
+            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(entry.st_mode) or entry.st_uid != TICKET_OWNER_UID \
+                    or entry.st_mtime >= cutoff:
+                continue
+            os.unlink(name, dir_fd=directory_fd)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def create_ticket(operator: str, uid: int, provider: str, operation: str,
                   arguments: Sequence[str], *, parent: str, directory: str, service_user: str,
                   protocol: int, lifetime: int) -> Ticket:
@@ -135,6 +171,10 @@ def create_ticket(operator: str, uid: int, provider: str, operation: str,
         if directory.st_uid != 0 or directory.st_gid != gid \
                 or stat.S_IMODE(directory.st_mode) != 0o750:
             raise CdsCommandError("CDS_DELEGATION: unsafe delegation directory ownership or permissions", 2)
+        # Retire attestations left by a killed supervisor before issuing a new one, rather than
+        # relying only on the tmpfiles timer: an expired ticket authorizes nothing, but it should
+        # not accumulate.
+        sweep_expired_tickets(directory_fd, max(lifetime, 0) + TICKET_SWEEP_GRACE_SECONDS)
         nonce = str(uuid.uuid4())
         name = nonce + ".json"
         file_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,

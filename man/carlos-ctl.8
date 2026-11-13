@@ -528,10 +528,19 @@ access use server registry keys, never a command-line private key or password.
 .IP
 Existing-run operations are
 .BR "--status RUN_ID" ", " "--resume RUN_ID" ", " "--cancel RUN_ID" ", " "--report RUN_ID" ", " "--download RUN_ID" .
-They cannot replace accepted disclosure intent. Download additionally requires
+.B --facility ID
+names the facility the export is made under; with facility filtering on, note and
+program access are checked against it.
+.B --submission-key KEY
+gives a new request a replay-safe identity: repeating it with the same key never
+starts a second job.
+Existing-run operations take the canonical run UUID and cannot replace accepted
+disclosure intent. Download additionally requires
 .B --artifact package
 and
-.BR "--output PATH" .
+.BR "--output PATH" ,
+a new file inside the configured delivery root that receives the
+recipient-encrypted package; an existing file is refused unchanged.
 .B --status-submission KEY
 recovers the original accepted handle after a lost acknowledgment.
 .B --detach
@@ -1007,8 +1016,12 @@ no\-go, and 3 when the tool itself failed \(em so 1 and 2 are answers, not
 errors.
 .B cds-export
 uses 0 for a completed export or successful observation/control, 1 for arguments,
-2 for configuration/runtime/compatibility failure, 3 for denied authority,
-4 for failed/review-required/incomplete execution, and 130 for interruption.
+2 for configuration/runtime/compatibility failure, an unconfirmed result
+(CDS_EXPORT_UNCERTAIN; inspect the original job) or a command that changed no job
+(CDS_EXPORT_NOT_STARTED), 3 for denied authority,
+4 for failed/review-required/incomplete execution, 5 for a ready package that
+leaves out held patients (not a complete migration), and 130 or 143 for an
+interrupted or terminated wait, which does not cancel the job.
 A successful observation does not establish a completed export.
 .B cds-import
 uses 0 for a clean complete import, verified no-op or valid dry run; 1 for
