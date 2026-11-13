@@ -8,6 +8,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -100,7 +102,6 @@ class TestExportArguments(unittest.TestCase):
 
 class TestTicketSweep(unittest.TestCase):
     def test_sweep_removes_only_expired_ticket_files_owned_by_the_issuer(self):
-        import tempfile, time
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(cdsruntime, "TICKET_OWNER_UID", os.geteuid()):
             old = os.path.join(directory, "11111111-2222-4333-8444-555555555555.json")
@@ -122,7 +123,6 @@ class TestTicketSweep(unittest.TestCase):
             self.assertTrue(os.path.exists(other))
 
     def test_sweep_never_removes_a_ticket_owned_by_another_user(self):
-        import tempfile, time
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(cdsruntime, "TICKET_OWNER_UID", os.geteuid() + 1):
             old = os.path.join(directory, "11111111-2222-4333-8444-555555555555.json")
