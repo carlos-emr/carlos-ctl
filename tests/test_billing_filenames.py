@@ -68,7 +68,7 @@ class TestBillingContract(unittest.TestCase):
                                            {table: {"class": "copy"}}, province="bc"))
 
     def test_schema_envelope_requires_helper_aware_cli_protocol(self):
-        self.assertEqual(o19manifest.manifest_format("o19map-schema"), 2)
+        self.assertEqual(o19manifest.manifest_format("o19map-schema"), 3)
         self.assertEqual(o19manifest.manifest_format("o19map-props"), 1)
         self.assertEqual(o19manifest.manifest_format("o19-preflight"), 1)
 

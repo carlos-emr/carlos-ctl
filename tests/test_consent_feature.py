@@ -230,8 +230,9 @@ class TestConsentFeature(unittest.TestCase):
                     classify(self.root)
 
     def test_manifest_format_and_kind_must_match_the_actual_schema_contract(self):
+        # Formats 1-3 are all real schema-manifest formats (3 since the OSCAR 19 beta8 line).
         for field, value in (("format", True), ("format", "1"), ("format", 1.0),
-                             ("format", 0), ("format", 3), ("format", None), ("kind", "wrong"),
+                             ("format", 0), ("format", 4), ("format", None), ("kind", "wrong"),
                              ("kind", None)):
             with self.subTest(field=field, value=value):
                 self.fixture()
