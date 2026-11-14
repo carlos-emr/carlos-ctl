@@ -443,7 +443,7 @@ class TestBoundedRealProbe(unittest.TestCase):
             {**CAPS, "protocol": 2}, {**CAPS, "protocol": True}, {**CAPS, "java": 21},
             {**CAPS, "java": "25"}, {**CAPS, "operations": ["import"]},
             {**CAPS, "operations": [True]}, [], None,
-            {**CAPS, "cliHeapMiB": 127}, {**CAPS, "cliHeapMiB": 16385},
+            {**CAPS, "cliHeapMiB": 127}, {**CAPS, "cliHeapMiB": 2**31},
             {**CAPS, "cliHeapMiB": "512"}, {**CAPS, "cliHeapMiB": True},
         ]
         for caps in invalid:
@@ -451,6 +451,13 @@ class TestBoundedRealProbe(unittest.TestCase):
                 with self.assertRaises(cdsimport.CdsCommandError) as error:
                     self.probe("print(" + repr(json.dumps(caps)) + ")")
                 self.assertEqual(error.exception.code, 2)
+
+    def test_a_heap_above_the_old_16384_mib_limit_is_accepted(self):
+        # carlos-ctl sets no heap maximum of its own; only the engine's Java int bounds it.
+        for heap in (16385, 32768, 2**31 - 1):
+            with self.subTest(heap=heap):
+                caps = {**CAPS, "cliHeapMiB": heap}
+                self.assertEqual(self.probe("print(" + repr(json.dumps(caps)) + ")"), caps)
 
     def test_duplicate_fields_or_trailing_log_lines_refuse(self):
         for payload in ('{"protocol":2,"protocol":1,"java":25,"operations":[]}',

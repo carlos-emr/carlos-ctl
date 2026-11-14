@@ -91,7 +91,7 @@ The wrapper refuses incompatible engine protocols and unsupported JVMs
 before execution. Java's actual properties loader supplies the launch budget
 through the capability response; Python does not reinterpret property syntax.
 Its heap comes from `cds.import.cliHeapMiB` in production
-`carlos.properties` (default 512 MiB, allowed 128–16384); this is a configurable
+`carlos.properties` (default 512 MiB, at least 128, no maximum of carlos-ctl's own); this is a configurable
 process budget, not proof that every dataset fits that heap. The engine's
 shared admission also accounts for memory/connection/disk use.
 The wrapper attests the exact request in a short-lived root-owned file;

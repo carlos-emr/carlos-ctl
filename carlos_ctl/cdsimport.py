@@ -39,8 +39,8 @@ OPERATIONS = frozenset({"import", "status", "resume", "cancel", "report"})
 # request, so this release keeps working with engines that predate it.
 ABANDON = "abandon"
 MAX_REASON = 1000
-MIN_HEAP_MIB = 128
-MAX_HEAP_MIB = 16 * 1024
+MIN_HEAP_MIB = cdsruntime.MIN_ENGINE_HEAP_MIB
+MAX_HEAP_MIB = cdsruntime.MAX_ENGINE_HEAP_MIB
 TICKET_PARENT = "/run"
 TICKET_DIRECTORY = "carlos-cds-delegations"
 TICKET_LIFETIME = 300

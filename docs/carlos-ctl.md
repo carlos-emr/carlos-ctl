@@ -339,7 +339,8 @@ after abnormal wrapper termination. Inherited JVM-option/classpath overrides
 are removed. A bounded 128 MiB probe obtains the launch budget from Java's
 actual production-properties loader, including its escaping/separator rules;
 Python never independently parses or guesses the effective heap. Configure
-`cds.import.cliHeapMiB` in that production file (default 512, integer 128–16384).
+`cds.import.cliHeapMiB` in that production file (default 512, an integer of at least 128;
+neither carlos-ctl nor the engine sets a maximum, the engine's Java int aside).
 This is a process budget, not a guarantee that arbitrary input fits: validation,
 payload handling, persistence and reporting must remain bounded by the engine.
 Shared admission must reserve this heap plus process overhead across browser

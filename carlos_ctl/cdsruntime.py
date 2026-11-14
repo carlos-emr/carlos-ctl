@@ -105,6 +105,11 @@ class Ticket:
 TICKET_SWEEP_GRACE_SECONDS = 300
 #: Attestations are issued by root; the sweep never removes a file another user owns.
 TICKET_OWNER_UID = 0
+#: The engines need at least 128 MiB of heap to start. Above that carlos-ctl sets no maximum of
+#: its own: a long imported chart may need more heap than any number we could choose. The only
+#: upper bound is the engine's own type, a Java int of MiB, which the engine also refuses beyond.
+MIN_ENGINE_HEAP_MIB = 128
+MAX_ENGINE_HEAP_MIB = 2**31 - 1
 _TICKET_NAME = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json")
 
 

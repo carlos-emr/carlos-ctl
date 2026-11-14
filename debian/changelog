@@ -13,6 +13,10 @@ carlos-ctl (1.3.5) resolute; urgency=medium
     signatures, stock eForm asset reconciliation and re-verified source
     documents on resume. release/2026.08 now ships that format, so the
     1.3.4 note about retaining format 2 no longer applies.
+  * Accept any CDS engine heap of at least 128 MiB. The 16,384 MiB maximum
+    is removed, as CARLOS removed it: a long imported chart may need more
+    heap than any fixed number, and only the engine's own Java int bounds
+    `cds.import.cliHeapMiB` and `cds.export.cliHeapMiB` now.
 
  -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Fri, 13 Nov 2026 20:30:00 +0000
 

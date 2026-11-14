@@ -18,8 +18,8 @@ the Java application. Existing import argument/protocol semantics remain unchang
 
 The export main class is
 `io.github.carlos_emr.carlos.demographic.cdsexport.CdsExport`. Its capability response
-must identify `engine` as `cds-export`, protocol 1, Java 25, a heap budget in
-128–16384 MiB, and operations `export`, `status`, `resume`, `cancel`, `report` and
+must identify `engine` as `cds-export`, protocol 1, Java 25, a heap budget of
+at least 128 MiB (no maximum of carlos-ctl's own), and operations `export`, `status`, `resume`, `cancel`, `report` and
 `download`. A new export additionally needs its exact profile in `qualifiedProfiles`.
 Detached submission and submission lookup require literal `true` capability flags.
 A mismatched or unqualified engine is refused before a delegation ticket is created.

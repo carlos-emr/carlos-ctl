@@ -195,7 +195,8 @@ def engine_arguments(args):
 
 def _probe(command, env):
     return cdsruntime.probe(command, env, operations=OPERATIONS, protocol=PROTOCOL,
-                            minimum_heap=128, maximum_heap=16384, maximum_bytes=65536, timeout=30,
+                            minimum_heap=cdsruntime.MIN_ENGINE_HEAP_MIB,
+                            maximum_heap=cdsruntime.MAX_ENGINE_HEAP_MIB, maximum_bytes=65536, timeout=30,
                             engine="cds-export")
 
 

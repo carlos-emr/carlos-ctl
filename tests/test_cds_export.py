@@ -174,6 +174,15 @@ class TestExportEngineBoundary(unittest.TestCase):
         self.assertEqual(executed.call_args.args[1], created.call_args.args[4])
         ticket.remove.assert_called_once()
 
+    def test_a_heap_above_the_old_16384_mib_limit_reaches_the_engine(self):
+        # carlos-ctl sets no heap maximum of its own; the engine's configured heap is used as is.
+        result, ticket, created, executed = self.invoke(EXPORT, {**CAPS, "cliHeapMiB": 32768})
+        self.assertEqual(result, 0)
+        self.assertEqual(executed.call_args.args[0], ["java", "-Xmx32768m"])
+        caps = {**CAPS, "cliHeapMiB": 32768}
+        command = [sys.executable, "-c", "print(" + repr(json.dumps(caps)) + ")"]
+        self.assertEqual(cdsexport._probe(command, dict(os.environ)), caps)
+
     def test_detached_and_submission_lookup_features_are_checked_independently(self):
         for field, argv in (("detachedSubmission", EXPORT + ["--detach"]),
                             ("submissionLookup", ["--provider", "007", "--status-submission", "fixture"])):
