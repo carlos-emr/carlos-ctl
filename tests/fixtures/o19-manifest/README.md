@@ -1,6 +1,7 @@
 # OSCAR 19 import manifests — test snapshot
 
-These three files are a **snapshot** of the manifests the `carlos-emr`
+These JSON files are a **snapshot** of the manifests and stock eForm asset
+inventory the `carlos-emr`
 package ships under `/usr/share/carlos-emr/o19-manifest/`. They are
 generated in the `carlos-emr/carlos` repository by
 `scripts/migration/o19/generate_manifests.py` (from the OSCAR 19 schema, the

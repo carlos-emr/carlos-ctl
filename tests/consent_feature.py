@@ -92,8 +92,8 @@ def _manifest(root, overlay):
     path = root / "debian/assets/o19-manifest/o19map_schema.json"
     model = json.loads(_read(path), object_pairs_hook=_unique_json_keys)
     if (not isinstance(model, dict) or type(model.get("format")) is not int
-            or model["format"] not in (1, 2) or model.get("kind") != "o19map-schema"):
-        raise ConsentFeatureError("manifest: expected format 1 or 2 o19map-schema envelope")
+            or model["format"] not in (1, 2, 3) or model.get("kind") != "o19map-schema"):
+        raise ConsentFeatureError("manifest: expected format 1, 2 or 3 o19map-schema envelope")
     provinces = [model, model["PROFILES"]["bc"]]
     present = []
     for province, data in zip(("ON", "BC"), provinces):
@@ -117,15 +117,26 @@ def _manifest(root, overlay):
 
 
 def _migration(root):
-    """Recognize the single audited Consent migration by its structural rules."""
+    """Validate one historical migration or the exact reviewed published pair."""
     directory = root / "database/mysql/migration/common"
     found = sorted(p for p in directory.iterdir()
                    if p.name.endswith("one_live_consent_per_type.sql"))
     if not found:
         return False
-    if len(found) != 1:
-        raise ConsentFeatureError("migration: expected exactly one one-live Consent migration")
-    sql = re.sub(r"/\*.*?\*/|--[^\n]*|#[^\n]*", " ", _read(found[0]), flags=re.S)
+    reviewed_pair = {
+        "V1.0.59.30__one_live_consent_per_type.sql",
+        "V1.0.77__one_live_consent_per_type.sql",
+    }
+    if len(found) != 1 and {p.name for p in found} != reviewed_pair:
+        raise ConsentFeatureError("migration: unreviewed duplicate one-live Consent migrations")
+    for path in found:
+        _validate_migration(path)
+    return True
+
+
+def _validate_migration(path):
+    """Require the generated column and non-dropped unique guard in each file."""
+    sql = re.sub(r"/\*.*?\*/|--[^\n]*|#[^\n]*", " ", _read(path), flags=re.S)
     sql = re.sub(r"\s+", " ", sql.replace("`", "")).lower()
     statements = sql.split(";")
     alters = [s for s in statements

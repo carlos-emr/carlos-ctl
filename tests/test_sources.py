@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import gzip
+import hashlib
 import io
 from pathlib import Path
 import tarfile
@@ -31,6 +32,40 @@ class TestCompleteBackupSet(unittest.TestCase):
         else:
             path.write_bytes(content)
         return str(path)
+
+    def test_verified_snapshot_reuse_does_not_allocate_a_second_copy(self):
+        source = Path(self.dump("source.sql"))
+        destination = self.root / "private.sql"
+        expected = hashlib.sha256(source.read_bytes()).hexdigest()
+        self.assertEqual(o19sources.snapshot_file(str(source), str(destination), expected),
+                         expected)
+        inode = destination.stat().st_ino
+        self.assertEqual(o19sources.snapshot_file(str(source), str(destination), expected),
+                         expected)
+        self.assertEqual(destination.stat().st_ino, inode)
+        source.write_bytes(source.read_bytes() + b"changed")
+        with self.assertRaisesRegex(ValueError, "input changed"):
+            o19sources.snapshot_file(str(source), str(destination), expected)
+        self.assertEqual(hashlib.sha256(destination.read_bytes()).hexdigest(), expected)
+
+    def test_unchanged_symlinked_source_can_reuse_a_real_private_snapshot(self):
+        source = Path(self.dump("source.sql"))
+        link = self.root / "selected.sql"
+        link.symlink_to(source)
+        destination = self.root / "private.sql"
+        expected = hashlib.sha256(source.read_bytes()).hexdigest()
+
+        self.assertEqual(o19sources.snapshot_file(str(link), str(destination), expected),
+                         expected)
+        inode = destination.stat().st_ino
+        self.assertEqual(o19sources.snapshot_file(str(link), str(destination), expected),
+                         expected)
+        self.assertEqual(destination.stat().st_ino, inode)
+        self.assertFalse(destination.is_symlink())
+
+        source.write_bytes(source.read_bytes() + b"changed")
+        with self.assertRaisesRegex(ValueError, "input changed"):
+            o19sources.snapshot_file(str(link), str(destination), expected)
 
     def test_complementary_main_and_myisam_parts(self):
         paths = [self.dump("OscarBackup.sql"), self.dump("MyISAMBackup.sql.gz", "b", engine="MyISAM")]

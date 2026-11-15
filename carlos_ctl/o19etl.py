@@ -38,7 +38,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from . import o19billing, o19digest, o19map_schema, o19_preflight
 from .util import sql_escape, warn
 
-ETL_CONTRACT_VERSION = 4
+ETL_CONTRACT_VERSION = 6
 
 # a copy is windowed over the id RANGE, so a sparse id space costs
 # windows rather than rows. Beyond this the range is not a table's id

@@ -2350,6 +2350,18 @@ def run_p4(ctx) -> None:
             "report.txt with the mismatch list.".format(
                 len(bad), ctx["state_dir"],
                 rollback_hint(ctx["state"]).capitalize()))
+    from . import o19signatures
+    try:
+        frozen, unresolved = o19signatures.install_owners(
+            ctx["query_etl"], STAGING_SCHEMA, ctx["target_db"])
+    except (RuntimeError, ValueError, IndexError) as exc:
+        die("could not freeze imported -1 signature ownership from the "
+            "staged source: {0}; the ETL phase is incomplete and --resume "
+            "will retry before go-live".format(o19etl._query_reason(exc)))
+    report_append(ctx["state_dir"], "P4 signature ownership",
+                  "{0} source-proven owner(s) frozen; {1} unassigned "
+                  "signature(s) remain unreadable without a unique source "
+                  "reference".format(frozen, unresolved))
     mark_done(ctx["state_dir"], ctx["state"], "etl")
     log("etl complete — row parity clean for {0} table(s)"
         .format(len(ok)))
@@ -2742,6 +2754,151 @@ def run_p7(ctx) -> None:
         problems.extend(drift)
         problems.extend(schema_contract.foreign_key_violations(query, dst, actual))
         lines.append("physical schema and all declared foreign keys checked against the packaged CARLOS contract")
+
+    if ctx.get("schema_contract") or ctx.get("dev_target"):
+        # The generic value witness compares each row with the ETL's own
+        # sanitizer. For signatures the source demographicId and ModuleType
+        # are a stronger contract: no coercion is authorized. Check the raw
+        # values independently, including after a resume that skipped P4.
+        try:
+            source_signatures = int(query(
+                "SELECT COUNT(*) FROM information_schema.TABLES WHERE "
+                "TABLE_SCHEMA = '{0}' AND TABLE_NAME = 'DigitalSignature'"
+                .format(src))[0][0])
+            if source_signatures:
+                module_column = query(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE "
+                    "TABLE_SCHEMA = '{0}' AND TABLE_NAME = 'DigitalSignature' "
+                    "AND LOWER(COLUMN_NAME) = 'moduletype'".format(src))[0][0]
+                module_mismatch = ("NOT (BINARY s.`ModuleType` <=> BINARY d.`ModuleType`)"
+                                   if int(module_column) else "d.`ModuleType` IS NOT NULL")
+                signature_mismatches = int(query(
+                    "SELECT COUNT(*) FROM `{0}`.`DigitalSignature` s LEFT JOIN "
+                    "`{1}`.`DigitalSignature` d ON s.`id` = d.`id` WHERE "
+                    "d.`id` IS NULL OR NOT (s.`demographicId` <=> d.`demographicId`) "
+                    "OR {2}".format(src, dst, module_mismatch))[0][0])
+                if signature_mismatches:
+                    problems.append("{0} digital signature(s) do not preserve the "
+                                    "source patient and module values exactly"
+                                    .format(signature_mismatches))
+                else:
+                    lines.append("digital signature patient and module values preserved exactly")
+            else:
+                target_signatures = int(query(
+                    "SELECT COUNT(*) FROM `{0}`.`DigitalSignature`"
+                    .format(dst))[0][0])
+                if target_signatures:
+                    problems.append("source DigitalSignature table absent but "
+                                    "{0} target signature(s) exist"
+                                    .format(target_signatures))
+                else:
+                    lines.append("source DigitalSignature table absent; target signature table empty")
+            sentinel_projection = int(query(
+                "SELECT COUNT(*) FROM `{0}`.`DigitalSignature` WHERE "
+                "`demographicId` = -1 AND `demographicFkId` IS NOT NULL"
+                .format(dst))[0][0])
+            if sentinel_projection:
+                problems.append("{0} unassigned digital signature(s) have a "
+                                "non-NULL foreign-key projection"
+                                .format(sentinel_projection))
+            from . import o19signatures
+            owner_problem = o19signatures.verification_problem(query, src, dst)
+            if owner_problem:
+                problems.append(owner_problem)
+            else:
+                lines.append("imported unassigned-signature owners match "
+                             "the staged source")
+        except (RuntimeError, ValueError, IndexError) as exc:
+            problems.append("digital signature integrity could not be checked: {0}"
+                            .format(o19etl._query_reason(exc)))
+
+        # A post-copy fix replaces only this exact legacy marker sequence.
+        # All other eForm HTML outside the packaged Rich Text Letter upgrade
+        # must remain byte-for-byte the source text. The RTL scripts change
+        # their own canonical row and are verified by the roles step.
+        try:
+            marker = "${oscar_image_path}/"
+            bare = "${oscar_image_path}"
+            canonical = ("form_name = 'Rich Text Letter' AND subject LIKE "
+                         "'Rich Text Letter Generator%'")
+            html_mismatches = int(query(
+                "SELECT COUNT(*) FROM `{0}`.eform s LEFT JOIN `{1}`.eform d "
+                "ON s.fid = d.fid WHERE d.fid IS NULL OR "
+                "(NOT (({2}) OR ({3})) AND NOT (BINARY REPLACE(CONVERT(s.form_html "
+                "USING utf8mb4), '{4}', '{5}') <=> "
+                "BINARY CONVERT(d.form_html USING utf8mb4)))".format(
+                    src, dst, canonical.replace("form_name", "s.form_name").replace("subject", "s.subject"),
+                    canonical.replace("form_name", "d.form_name").replace("subject", "d.subject"),
+                    marker, bare))[0][0])
+            if html_mismatches:
+                problems.append("{0} eForm HTML row(s) differ from the source "
+                                "beyond the image-path correction and the "
+                                "packaged Rich Text Letter update"
+                                .format(html_mismatches))
+            else:
+                lines.append("eForm HTML checked against the source and the narrow image-path correction")
+        except (RuntimeError, ValueError, IndexError) as exc:
+            problems.append("eForm HTML integrity could not be checked: {0}"
+                            .format(o19etl._query_reason(exc)))
+
+        # P5 is checkpointed and skipped on a resume. Reconcile live files
+        # here without moving, chowning or rewriting anything so a later
+        # deletion, placeholder or permission regression cannot go live.
+        docs_phase = ctx["state"].get("phases", {}).get("documents", {})
+        if docs_phase.get("skipped") == "no-documents":
+            lines.append("document verification skipped under recorded --accept no-documents")
+        else:
+            ctx_root = os.path.join(ctx.get("documents_root", o19docs.DOCUMENTS_ROOT),
+                                    o19docs.TARGET_CTX)
+            try:
+                tar_path = ctx.get("documents")
+                if not tar_path:
+                    raise ValueError("no source documents tar is recorded")
+                entries = o19bundle.read_tar_entries(
+                    tar_path, tar_path.endswith(".gz"))
+                typed = [(kind, name) for kind, name, _ in entries]
+                o19bundle.validate_tar_members(typed, allow_dirs=True)
+                source_ctx = o19docs.detect_context_dir(typed)
+                doc_problems, doc_lines, doc_private = o19docs.reconcile(
+                    query, dst, ctx_root,
+                    o19docs.source_document_names(entries, source_ctx),
+                    o19docs.source_eform_asset_names(entries, source_ctx),
+                    o19docs.packaged_eform_asset_names()
+                    if not ctx.get("dev_target") else set())
+                write_private(os.path.join(ctx["state_dir"], "verify-documents-details.txt"),
+                              "\n".join(doc_private + doc_problems) + "\n"
+                              if doc_private or doc_problems else "clean\n")
+                if doc_problems:
+                    problems.append("{0} document or eForm asset problem(s) — see "
+                                    "verify-documents-details.txt".format(len(doc_problems)))
+                lines.extend(doc_lines)
+                if not ctx.get("dev_target"):
+                    collision_problems = o19docs.stock_collision_problems(
+                        ctx["state_dir"], docs_phase.get("tar_sha256"), ctx_root,
+                        o19docs.source_eform_asset_names(entries, source_ctx))
+                    if collision_problems:
+                        append_private(os.path.join(ctx["state_dir"], "verify-documents-details.txt"),
+                                       "stock asset receipts:\n" + "\n".join(collision_problems) + "\n")
+                        problems.append("{0} stock eForm collision receipt problem(s) — see "
+                                        "verify-documents-details.txt".format(len(collision_problems)))
+                    owner = HOST.document_ownership()[0]
+                    unreadable = o19docs.service_readability_problems(
+                        query, dst, ctx_root, owner)
+                    if unreadable:
+                        append_private(os.path.join(ctx["state_dir"], "verify-documents-details.txt"),
+                                       "service account cannot read:\n" + "\n".join(unreadable) + "\n")
+                        problems.append("{0} clinical file(s) cannot be read by "
+                                        "the service account — see verify-documents-details.txt"
+                                        .format(len(unreadable)))
+                    else:
+                        lines.append("referenced clinical files readable as the service account")
+            except (RuntimeError,) + o19bundle.ARCHIVE_ERRORS as exc:
+                reason = "final document verification could not run: {0}".format(
+                    o19etl._query_reason(exc))
+                write_private(os.path.join(ctx["state_dir"], "verify-documents-details.txt"),
+                              reason + "\n")
+                problems.append("final document verification could not run — see "
+                                "verify-documents-details.txt")
 
     ok, bad = _row_parity(ctx)
     # three counts, never one: NOT CHECKED lines and acknowledged
@@ -3250,7 +3407,7 @@ FAILED_NEXT_STEPS = (
 #: deliberately not among them: the operator is told where it is)
 RUN_FILES = ("report.txt", "import-report.txt", "import-report.json",
              "roles-details.txt", "privilege-diff.txt",
-             "verify-details.txt", PRISTINE_DETAILS,
+             "verify-details.txt", "verify-documents-details.txt", PRISTINE_DETAILS,
              "documents-details.txt", "billing-files-details.txt",
              CONTENT_DETAILS, VERIFY_PROBLEMS, "preflight.txt",
              "preflight.json", "etl-progress.json",
@@ -3615,13 +3772,42 @@ def _prepare_input_sets(inputs: Dict, state_dir: str, workdir_name: str) -> Dict
         properties_sha = sha256_file(inputs["properties"])
         key = hashlib.sha256(json.dumps([identities, properties_sha], sort_keys=True).encode()).hexdigest()
         workdir = os.path.join(state_dir, workdir_name + "-sources", key)
-        sql = o19sources.prepare_dump_set(dumps, workdir)
-        docs = o19sources.prepare_documents(documents, workdir)
+        os.makedirs(workdir, mode=0o700, exist_ok=True)
+        # A dry run and a real run use separate ledgers, but the selected
+        # content-addressed source bytes are the same. Hardlink only a
+        # verified private snapshot from the other namespace; neither
+        # phase writes through these paths, and cleanup removes both
+        # links. A filesystem without hardlinks falls back to copying.
+        other_name = "bundle-assess" if workdir_name == "bundle" else "bundle"
+        other = os.path.join(state_dir, other_name + "-sources", key)
+        named = []
+        for number, path in enumerate(dumps):
+            named.append(("part-{0:03d}.sql{1}".format(
+                number, ".gz" if path.endswith(".gz") else ""),
+                identities[number][1]))
+        for number, path in enumerate(documents):
+            named.append(("documents-{0:03d}.tar{1}".format(
+                number, ".gz" if path.endswith(".gz") else ""),
+                identities[len(dumps) + number][1]))
+        named.append(("source.properties", properties_sha))
+        for name, digest in named:
+            previous = os.path.join(other, name)
+            current = os.path.join(workdir, name)
+            if not os.path.lexists(current) and o19sources.snapshot_matches(previous, digest):
+                try:
+                    os.link(previous, current)
+                except OSError:
+                    pass  # different filesystem: snapshot_file copies below
+        sql = o19sources.prepare_dump_set(
+            dumps, workdir, [item[1] for item in identities[:len(dumps)]])
+        docs = o19sources.prepare_documents(
+            documents, workdir, [item[1] for item in identities[len(dumps):]])
         observed = [[part["name"], part["sha256"]] for part in sql["parts"] + docs["parts"]]
         if observed != identities:
             raise ValueError("an input changed while its private snapshot was prepared; obtain one stable backup set")
         properties_path = os.path.join(workdir, "source.properties")
-        if o19sources.snapshot_file(inputs["properties"], properties_path) != properties_sha:
+        if o19sources.snapshot_file(inputs["properties"], properties_path,
+                                   properties_sha) != properties_sha:
             raise ValueError("properties changed while their snapshot was prepared")
     except (ValueError, OSError, EOFError) as exc:
         die("cannot prepare the complete backup set: {0}".format(exc))

@@ -91,7 +91,7 @@ The wrapper refuses incompatible engine protocols and unsupported JVMs
 before execution. Java's actual properties loader supplies the launch budget
 through the capability response; Python does not reinterpret property syntax.
 Its heap comes from `cds.import.cliHeapMiB` in production
-`carlos.properties` (default 512 MiB, allowed 128–16384); this is a configurable
+`carlos.properties` (default 512 MiB, at least 128, no maximum of carlos-ctl's own); this is a configurable
 process budget, not proof that every dataset fits that heap. The engine's
 shared admission also accounts for memory/connection/disk use.
 The wrapper attests the exact request in a short-lived root-owned file;
@@ -100,6 +100,12 @@ environment variable. The root supervisor relays signals, streams output
 without capture and retires its own attestation after the engine exits.
 See [the operator reference](docs/carlos-ctl.md#cds-import) and
 `carlos-ctl cds-import --help` for flags and exit semantics.
+
+`carlos-ctl cds-export` runs OntarioMD CDS exports through the same durable CARLOS
+jobs as the browser: foreground or detached, with status, resume, cancel, report and
+recipient-encrypted download. It requires a matching qualified Java engine before
+clinical execution; see the [export command contract](docs/cds-export-command.md),
+`carlos-ctl cds-export --help` and carlos-ctl(8).
 
 ## Development
 
