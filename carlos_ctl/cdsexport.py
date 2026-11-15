@@ -132,8 +132,9 @@ def parser():
     ap.add_argument("--artifact", action=_Once, type=_identifier, metavar="ID",
                     help="encrypted artifact identifier (use 'package' with the current engine), for download only")
     ap.add_argument("--output", action=_Once, metavar="PATH",
-                    help="for download only: a new file inside the configured delivery root "
-                         "(cds.export.deliveryRoot) that receives the recipient-encrypted package; "
+                    help="for download only: a new file in an existing private directory owned by "
+                         "the configured service user, with mode 0700 and protected ancestors; "
+                         "receives the recipient-encrypted package; "
                          "an existing file is refused unchanged")
     return ap
 
