@@ -74,6 +74,7 @@ ACCEPT_CLASSES = (
     "archived-forms", "unknown-as-archive", "dropped-columns",
     "charset-repair", "olis-gone", "no-documents", "no-pre-backup",
     "unverified-bundle", "carry-credentials",
+    o19docs.MISSING_DOCUMENTS_ACCEPT,
     # M22 content integrity: a DISAGREEMENT and a GAP are separate
     # sign-offs. The first says the bytes differ from what the clinic
     # measured; the second says nobody measured. Accepting one must
@@ -1846,12 +1847,6 @@ def run_p2(ctx) -> Dict:
         report["findings"].append(o19_preflight.finding(
             "billing-package-contract", o19_preflight.BLOCKER,
             "the installed application manifest lacks the audited billing filename rule", problem))
-    if billing_problems:
-        verdict, code, acknowledged, outstanding = o19_preflight.preflight_verdict(
-            report["findings"], ctx["accepted"])
-        report.update(verdict=verdict, exit_code=code,
-                      acknowledged=acknowledged,
-                      required_accepts=sorted({f["accept"] for f in outstanding}))
     active_billing = [name for name in o19billing.TABLES
                       if name.lower() in {item.lower() for item in staged_tables}
                       and o19billing.mapped(name, o19map_schema.TABLES.get(name, {}))]
@@ -1878,11 +1873,12 @@ def run_p2(ctx) -> Dict:
             "the installed application manifest lacks the Consent import rule",
             "Install the compatible fixed carlos-emr/carlos-ctl pair. "
             "Unmodified older package files can carry this incompatible mapping."))
-        verdict, code, acknowledged, outstanding = o19_preflight.preflight_verdict(
-            report["findings"], ctx["accepted"])
-        report.update(verdict=verdict, exit_code=code,
-                      acknowledged=acknowledged,
-                      required_accepts=sorted({f["accept"] for f in outstanding}))
+    if ctx.get("documents"):
+        report["findings"].extend(o19docs.source_document_findings(ctx, STAGING_SCHEMA, staged_names))
+    verdict, code, acknowledged, outstanding = o19_preflight.preflight_verdict(
+        report["findings"], ctx["accepted"])
+    report.update(verdict=verdict, exit_code=code, acknowledged=acknowledged,
+                  required_accepts=sorted({f["accept"] for f in outstanding}))
     # 0600 like every other artifact naming the clinic's own objects:
     # these two carry the unknown-table inventory, the identifier-class
     # names, the credential tables found and the per-table counts. The
@@ -2173,7 +2169,7 @@ def make_etl_query(base_argv: List[str],
     return query
 
 
-def _row_parity(ctx):
+def _row_parity(ctx, document_placeholders=()):
     """Parity with the exact break-glass delta (the admin identity the ETL
     recorded in its ledger); merge tables are checked in reverse (every
     staging row has a target twin), which needs the target's columns.
@@ -2228,11 +2224,15 @@ def _row_parity(ctx):
             "digest, which yields no per-row key — re-run the digest "
             "against o19_archive.<table> to narrow it".format(
                 len(content_bad)))
+    post_copy = {}
+    if document_placeholders:
+        post_copy["document"] = (o19docs.placeholder_predicate(document_placeholders, "s"),
+                                 o19docs.placeholder_values("s"))
     copy_ok, copy_bad = o19etl.copy_content_parity(
         ctx["query"], STAGING_SCHEMA, ctx["target_db"],
         src_info, dst_info,
         repairs=progress.get("repairs"), archive_schema=archive,
-        details=details)
+        details=details, post_copy=post_copy)
     # and the merge class, whose live rows come from two places: the
     # pre-merge snapshot is what lets the check say which is which, so
     # "the seed won" and "the clinic's row arrived" become separate
@@ -2493,6 +2493,14 @@ def phase_report_rows(state: Dict, content: Optional[Dict]
         unchecked.append(
             "documents (P5): SKIPPED ({0} acknowledged) — document rows "
             "reference files that are not there".format(docs["skipped"]))
+    elif docs.get("status") == "done" and docs.get("placeholders"):
+        arrived.append("documents (P5): tree restored from tar {0}".format(docs["tar_sha256"][:12]))
+        findings.append(o19report.finding(
+            "advisory", "{0} chart attachment(s) absent from the OSCAR 19 backup".format(
+                docs["placeholders"]),
+            ["Source-unavailable PDF notices were attached under --accept {0}. "
+             "See documents-details.txt for the affected chart documents."
+             .format(o19docs.MISSING_DOCUMENTS_ACCEPT)]))
     elif docs.get("status") == "done":
         arrived.append(
             "documents (P5): tree restored from tar {0} and reconciled "
@@ -2674,6 +2682,8 @@ def import_report(ctx, progress: Dict, parity_ok: Sequence[str],
                    .format(len(acknowledged)))
     else:
         verdict = "PASSED"
+    if not problems and phases.get("documents", {}).get("placeholders"):
+        verdict += " — {0} SOURCE-DOCUMENT PLACEHOLDER(S)".format(phases["documents"]["placeholders"])
     return o19report.build(
         header,
         verdict,
@@ -2748,6 +2758,7 @@ def run_p7(ctx) -> None:
     src, dst = STAGING_SCHEMA, ctx["target_db"]
     problems: List[str] = []
     lines: List[str] = []
+    placeholders: Dict[int, str] = {}
     if ctx.get("schema_contract"):
         actual = schema_contract.capture(query, dst)
         drift = schema_contract.differences(ctx["schema_contract"]["schema"], actual)
@@ -2854,17 +2865,24 @@ def run_p7(ctx) -> None:
                 tar_path = ctx.get("documents")
                 if not tar_path:
                     raise ValueError("no source documents tar is recorded")
-                entries = o19bundle.read_tar_entries(
-                    tar_path, tar_path.endswith(".gz"))
-                typed = [(kind, name) for kind, name, _ in entries]
-                o19bundle.validate_tar_members(typed, allow_dirs=True)
-                source_ctx = o19docs.detect_context_dir(typed)
+                entries, source_ctx = o19docs.read_documents_archive(tar_path)
+                if docs_phase.get("placeholders"):
+                    if o19docs.MISSING_DOCUMENTS_ACCEPT not in ctx["accepted"]:
+                        raise ValueError("document placeholders have no recorded sign-off")
+                    if sha256_file(tar_path) != docs_phase.get("tar_sha256"):
+                        raise ValueError("the source documents archive differs from the P5 checkpoint")
+                    planned, source_problems = o19docs.document_source_gaps(
+                        query, src, "document", o19docs.source_document_entries(entries, source_ctx))
+                    if (source_problems or len(planned) != docs_phase["placeholders"]
+                            or o19docs.placeholders_digest(planned) != docs_phase.get("placeholders_sha256")):
+                        raise ValueError("source document placeholders differ from the P5 checkpoint")
+                    placeholders = planned
                 doc_problems, doc_lines, doc_private = o19docs.reconcile(
                     query, dst, ctx_root,
                     o19docs.source_document_names(entries, source_ctx),
                     o19docs.source_eform_asset_names(entries, source_ctx),
                     o19docs.packaged_eform_asset_names()
-                    if not ctx.get("dev_target") else set())
+                    if not ctx.get("dev_target") else set(), placeholders=placeholders)
                 write_private(os.path.join(ctx["state_dir"], "verify-documents-details.txt"),
                               "\n".join(doc_private + doc_problems) + "\n"
                               if doc_private or doc_problems else "clean\n")
@@ -2900,7 +2918,7 @@ def run_p7(ctx) -> None:
                 problems.append("final document verification could not run — see "
                                 "verify-documents-details.txt")
 
-    ok, bad = _row_parity(ctx)
+    ok, bad = _row_parity(ctx, placeholders)
     # three counts, never one: NOT CHECKED lines and acknowledged
     # mismatches travel in `ok` so that the phase does not fail on
     # them, and `len(ok)` told the operator "345 check(s) pass" when 31
@@ -3408,7 +3426,7 @@ FAILED_NEXT_STEPS = (
 RUN_FILES = ("report.txt", "import-report.txt", "import-report.json",
              "roles-details.txt", "privilege-diff.txt",
              "verify-details.txt", "verify-documents-details.txt", PRISTINE_DETAILS,
-             "documents-details.txt", "billing-files-details.txt",
+             "documents-details.txt", o19docs.DOCUMENT_PREFLIGHT_DETAILS, "billing-files-details.txt",
              CONTENT_DETAILS, VERIFY_PROBLEMS, "preflight.txt",
              "preflight.json", "etl-progress.json",
              "content-transfer.json", "o19-digests.json",
@@ -3452,7 +3470,11 @@ def _parser(prog: str, import_mode: bool) -> argparse.ArgumentParser:
             "Writes nothing to the EMR schema and records neither a "
             "verdict nor a sign-off; the exit status is the verdict "
             "(0 go, 1 acknowledgements required, 2 no-go, 3 tool "
-            "failure)."))
+            "failure)."),
+        epilog=(
+            "Use --accept {0} to attach PDF notices for chart attachments "
+            "absent from the source backup.".format(o19docs.MISSING_DOCUMENTS_ACCEPT)
+            if import_mode else None))
     ap.add_argument("--bundle", metavar="FILE",
                     help="single handoff archive (.tar/.tar.gz/.tar.enc/"
                          ".tar.gz.enc) holding dump + documents tar + "
@@ -3490,12 +3512,11 @@ def _parser(prog: str, import_mode: bool) -> argparse.ArgumentParser:
                          "that differs from it is refused (default: the "
                          "host's own). It selects the manifest profile "
                          "this build carries for that province")
-    # the assessment evaluates only the preflight blockers, and opens
-    # bundles: the phase sign-offs (backup, documents, charset repair)
-    # belong to phases it never runs. choices stay the full set so a
-    # script may pass an import-side flag harmlessly.
+    # The assessment can check attachments when a bundle carries the tar.
+    # Keep the other import-side choices valid for scripts sharing options.
     advertised = (ACCEPT_CLASSES if import_mode else
-                  tuple(o19_preflight.ACCEPT_IDS) + ("unverified-bundle",))
+                  tuple(o19_preflight.ACCEPT_IDS)
+                  + ("unverified-bundle", o19docs.MISSING_DOCUMENTS_ACCEPT))
     ap.add_argument("--accept", action="append", default=[],
                     metavar="CLASS", choices=list(ACCEPT_CLASSES),
                     help="acknowledge a blocker class (repeatable): "
@@ -3557,7 +3578,7 @@ def _parser(prog: str, import_mode: bool) -> argparse.ArgumentParser:
                              "0 = no bound). A sparse or crafted dump "
                              "cannot then hold one statement forever")
         ap.add_argument("--dry-run", action="store_true",
-                        help="run P0-P2 plus the properties report; no "
+                        help="run P0-P2, including source document checks, plus the properties report; no "
                              "writes beyond the throwaway staging schema. "
                              "--accept flags are NOT recorded, and a "
                              "workspace whose import is in progress is "

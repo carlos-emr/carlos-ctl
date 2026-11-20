@@ -4548,7 +4548,8 @@ def copy_value_mismatch_sql(table: str, entry: dict, src_schema: str,
                             archive_schema: Optional[str] = None,
                             select: Optional[str] = None,
                             include_missing: bool = False,
-                            window: Optional[Tuple[int, int]] = None) -> str:
+                            window: Optional[Tuple[int, int]] = None,
+                            post_copy: Optional[Tuple[str, Dict[str, str]]] = None) -> str:
     """Staging rows whose target twin does NOT hold the value the copy's
     own expression produced.
 
@@ -4574,7 +4575,12 @@ def copy_value_mismatch_sql(table: str, entry: dict, src_schema: str,
     row is the target row with the same key.
     """
     def expr(col: str) -> str:
-        return written_expr(entry, col, dst_cols, repaired, archive_schema)
+        original = written_expr(entry, col, dst_cols, repaired, archive_schema)
+        if post_copy and col in post_copy[1]:
+            condition, replacements = post_copy
+            return "CASE WHEN {0} THEN {1} ELSE {2} END".format(
+                condition, replacements[col], original)
+        return original
 
     # the JOIN uses the server's own equality, because that is what
     # decided which target row IS this staging row's twin; the value
@@ -4686,12 +4692,14 @@ def copy_content_parity(plain_query, src_schema: str, dst_schema: str,
                         dst_info: Dict[str, Dict[str, dict]],
                         repairs: Optional[Dict[str, Sequence[str]]] = None,
                         archive_schema: Optional[str] = None,
-                        details: Optional[List[str]] = None
+                        details: Optional[List[str]] = None,
+                        post_copy: Optional[Dict[str, Tuple[str, Dict[str, str]]]] = None,
                         ) -> Tuple[List[str], List[str]]:
     """(ok_lines, mismatch_lines) proving every copied row's target twin
     holds the values the copy wrote. `details`, when given, collects the
     KEYS of the differing rows for the run's private details file -- they
-    are PHI-correlating and never reach the report.
+    are PHI-correlating and never reach the report. The optional post_copy
+    mapping supplies expected values for audited changes after copying.
 
     `row_parity` counts copy-class tables; this reads them. A table it
     cannot pair row-for-row is reported UNCHECKED rather than passed:
@@ -4753,9 +4761,11 @@ def copy_content_parity(plain_query, src_schema: str, dst_schema: str,
             except (RuntimeError, ValueError, IndexError, TypeError) as exc:
                 bad.append("{0}: keyless values could not be verified ({1})".format(table, _query_reason(exc)))
             continue
+        overrides = (post_copy or {}).get(table)
         sql = copy_value_mismatch_sql(
             table, entry, src_schema, dst_schema, dst_info[table],
-            dst_keys[table], set(repairs.get(table) or ()), archive_schema)
+            dst_keys[table], set(repairs.get(table) or ()), archive_schema,
+            post_copy=overrides)
         try:
             n = int(plain_query(sql)[0][0])
         except Exception as exc:                      # noqa: BLE001
@@ -4773,8 +4783,11 @@ def copy_content_parity(plain_query, src_schema: str, dst_schema: str,
                         table, entry, src_schema, dst_schema,
                         dst_info[table], dst_keys[table],
                         set(repairs.get(table) or ()), archive_schema,
-                        select=key_projection(dst_keys[table], "d")),
+                        select=key_projection(dst_keys[table], "d"), post_copy=overrides),
                     dst_keys[table]))
+        elif overrides:
+            ok.append("{0} (copy): copied values and the documented post-copy changes match"
+                      .format(table))
         else:
             ok.append("{0} (copy): every twin holds the copied value"
                       .format(table))

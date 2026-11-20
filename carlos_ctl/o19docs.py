@@ -6,9 +6,9 @@ Restores the clinic's OscarDocument tree into the deb layout
 (/var/lib/carlos-emr/CarlosDocument/carlos/…), renames the O19 context
 directory, relocates HRM reports flat under document/ (refusing when two
 HRMDocument rows would reach the same basename by different paths) and
-rewrites their absolute paths, then runs the BLOCKING
-reconciliation of docs plan §5: every `document.docfilename` and every
-eForm `${oscar_image_path}` asset must resolve to a real file; orphan
+rewrites their absolute paths, then reconciles document and eForm references.
+An explicit sign-off permits a PDF notice for a chart attachment absent
+from the source archive. Other missing referenced files block the import. Orphan
 files are report-only; derived cache directories (`document_cache`, …)
 are skipped with a report line and never migrated. Finally the
 `o19_archive` schema is exported as CSV into the root-only import state
@@ -36,6 +36,9 @@ from .util import STATE, die, log, run, sql_escape, warn
 
 DOCUMENTS_ROOT = os.path.join(STATE, "CarlosDocument")
 TARGET_CTX = "carlos"
+MISSING_DOCUMENTS_ACCEPT = "missing-source-documents"
+DOCUMENT_PREFLIGHT_DETAILS = "preflight-documents-details.txt"
+PLACEHOLDER_PREFIX = "o19-source-unavailable-"
 
 # derived caches are regenerated on demand by the application
 # (NioFileManagerImpl) — never migrated, never a reconciliation failure.
@@ -127,6 +130,14 @@ def detect_context_dir(entries: List[Tuple[str, str]]) -> str:
             "context directory name {0!r} is not a plain directory name "
             "(letters, digits, '_', '.', '-' only)".format(ctx))
     return ctx
+
+
+def read_documents_archive(path: str) -> Tuple[List[Tuple[str, str, int]], str]:
+    """Read and validate the same archive inventory for assessment and restore."""
+    entries = o19bundle.read_tar_entries(path, path.endswith(".gz"))
+    typed = [(kind, name) for kind, name, _ in entries]
+    o19bundle.validate_tar_members(typed, allow_dirs=True)
+    return entries, detect_context_dir(typed)
 
 
 HRM_INCOMING_DIR = "hrm"
@@ -298,6 +309,19 @@ def image_refs(form_html: str) -> List[str]:
     return sorted(refs)
 
 
+def document_name_problem(filename: str) -> Optional[str]:
+    """Why a stored filename cannot name a flat CARLOS document."""
+    if os.path.isabs(filename) or "\0" in filename or ".." in filename.split("/"):
+        return "path escapes the document directory"
+    if "/" in filename or "\\" in filename:
+        return "names a subdirectory — CARLOS serves document/ flat and opens the basename only"
+    if filename.startswith("."):
+        return "a leading dot is refused by CARLOS's filename validation"
+    if not filename.strip():
+        return "blank filename"
+    return None
+
+
 def classify_document_files(rows: List[Tuple[str, str]],
                             doc_dir: str) -> Tuple[List[str], List[str]]:
     """rows = (document_no, docfilename). Returns (missing, empty):
@@ -306,27 +330,11 @@ def classify_document_files(rows: List[Tuple[str, str]],
     for doc_no, filename in rows:
         if not filename:
             continue
+        reason = document_name_problem(filename)
         if not contained(doc_dir, filename):
-            # absolute or traversal filename — never let it be satisfied
-            # by a file outside the restored tree
-            missing.append("document {0}: {1} (path escapes the document "
-                           "directory)".format(doc_no, filename))
-            continue
-        if "/" in filename or "\\" in filename:
-            # PathValidationUtils.sanitizeFileName runs the value through
-            # FilenameUtils.getName before opening it, so CARLOS looks
-            # for the BASENAME in a flat document/ — a file sitting at
-            # the nested path exists but is never served. Same rule the
-            # eForm image references get, for the same reason.
-            missing.append("document {0}: {1} (names a subdirectory — "
-                           "CARLOS serves document/ flat and opens the "
-                           "basename only)".format(doc_no, filename))
-            continue
-        if filename.startswith("."):
-            # sanitizeFileName rejects a dot-leading basename outright
-            missing.append("document {0}: {1} (a leading dot is refused "
-                           "by CARLOS's filename validation)".format(
-                               doc_no, filename))
+            reason = "path escapes the document directory"
+        if reason:
+            missing.append("document {0}: {1} ({2})".format(doc_no, filename, reason))
             continue
         path = os.path.join(doc_dir, filename)
         if os.path.islink(path):
@@ -1179,7 +1187,8 @@ def apply_ownership(root: str, dev_target: bool) -> None:
 def reconcile(query, dst_schema: str, ctx_root: str,
               source_document_names: Optional[Set[str]] = None,
               source_asset_names: Optional[Set[str]] = None,
-              packaged_asset_names: Optional[Set[str]] = None
+              packaged_asset_names: Optional[Set[str]] = None,
+              placeholders: Optional[Dict[int, str]] = None,
               ) -> Tuple[List[str], List[str], List[str]]:
     """(blocking_problems, report_lines, private_lines) for the restored
     tree. File and form names can carry a patient's or a clinician's
@@ -1198,15 +1207,27 @@ def reconcile(query, dst_schema: str, ctx_root: str,
     problems.extend("missing file for " + m for m in missing)
     problems.extend("empty file for " + e for e in empty)
     if source_document_names is not None:
-        # A nonempty placeholder placed in the target can satisfy the
-        # filesystem check above but cannot make a source tar contain a
-        # file it never held. Refuse every such substitution, including
-        # deleted document rows, until a separately audited loss policy
-        # is present; P7 repeats this check after a checkpointed P5.
+        pending = set(placeholders or {})
         for doc_no, filename in rows:
-            if filename and filename not in source_document_names:
+            number = int(doc_no) if placeholders else None
+            if number in pending:
+                pending.remove(number)
+                expected = placeholder_name(number)
+                if filename != expected or not is_placeholder(os.path.join(doc_dir, expected)):
+                    problems.append("document {0}: source-unavailable PDF is missing "
+                                    "or differs from the generated notice".format(doc_no))
+            elif filename and filename not in source_document_names:
                 problems.append("document {0}: {1} has no file in the "
                                 "source documents tar".format(doc_no, filename))
+        problems.extend("document {0}: no target row for the source-unavailable PDF"
+                        .format(number) for number in sorted(pending))
+        if placeholders:
+            wrong_metadata = query(
+                "SELECT d.document_no FROM {0}.document d WHERE {1} AND NOT "
+                "(BINARY d.contenttype <=> 'application/pdf' AND d.number_of_pages <=> 1)"
+                .format(o19etl.ident(dst_schema), placeholder_predicate(placeholders, "d")))
+            problems.extend("document {0}: source-unavailable PDF metadata differs"
+                            .format(row[0]) for row in wrong_metadata)
 
     _, hrm_select = hrm_rewrite_sql(dst_schema, os.path.dirname(ctx_root))
     hrm_rows = [(r[0], r[1]) for r in query(hrm_select)
@@ -1310,22 +1331,196 @@ def reconcile(query, dst_schema: str, ctx_root: str,
     return problems, lines, private
 
 
+def source_document_entries(entries: List[Tuple[str, str, int]],
+                            context: str) -> Dict[str, Optional[int]]:
+    """Top-level document names in the tar, with file sizes or None for directories."""
+    prefix = context + "/document/"
+    names: Dict[str, Optional[int]] = {}
+    for kind, raw, size in entries:
+        clean = os.path.normpath(raw)
+        if clean.startswith(prefix):
+            name, sep, _ = clean[len(prefix):].partition("/")
+            if not sep and kind == o19bundle.TAR_TYPE_FILE:
+                names[name] = size
+            else:
+                names.setdefault(name, None)
+    return names
+
+
 def source_document_names(entries: List[Tuple[str, str, int]],
                           context: str) -> Set[str]:
     """Exact flat document filenames actually carried by the source tar."""
-    prefix = context + "/document/"
-    names = set()
-    for kind, raw, _size in entries:
-        if kind != o19bundle.TAR_TYPE_FILE:
-            continue
-        clean = os.path.normpath(raw)
-        while clean.startswith("./"):
-            clean = clean[2:]
-        if clean.startswith(prefix):
-            name = clean[len(prefix):]
-            if name and "/" not in name:
-                names.add(name)
-    return names
+    return {name for name, size in source_document_entries(entries, context).items()
+            if size is not None}
+
+
+def document_source_gaps(query, schema: str, table: str,
+                         entries: Dict[str, Optional[int]]) -> Tuple[Dict[int, str], List[str]]:
+    """List absent attachments eligible for a notice and other document problems."""
+    rows = query(
+        "SELECT document_no, docfilename FROM {0}.{1} WHERE docfilename IS NOT NULL "
+        "AND BINARY docfilename <> '' ORDER BY document_no"
+        .format(o19etl.ident(schema), o19etl.ident(table)))
+    reserved = set(entries) | {served_name(row[1]) for row in rows}
+    missing = {}
+    blocked = []
+    for doc_no, filename in rows:
+        reason = document_name_problem(filename)
+        if not reason and filename not in entries:
+            number = int(doc_no)
+            if placeholder_name(number) not in reserved:
+                missing[number] = filename
+                continue
+            reason = "the source already uses the placeholder's filename"
+        elif not reason and entries[filename] is None:
+            reason = "the archive path is a directory"
+        elif not reason and entries[filename] == 0:
+            reason = "the source file is empty"
+        if reason:
+            blocked.append("document {0}: {1!r} ({2})".format(doc_no, filename, reason))
+    return missing, blocked
+
+
+def placeholder_name(document_no: int) -> str:
+    """Use the chart document ID so every notice has a stable, distinct path."""
+    return "{0}{1}.pdf".format(PLACEHOLDER_PREFIX, document_no)
+
+
+def placeholder_predicate(document_ids, alias: str) -> str:
+    """Select only the staged IDs confirmed missing from the archive."""
+    return "{0}.document_no IN ({1})".format(
+        alias, ", ".join(str(number) for number in sorted(document_ids)))
+
+
+def placeholder_values(alias: str) -> Dict[str, str]:
+    """Only these file fields change when the original is replaced by a notice."""
+    return {
+        "docfilename": "CONCAT('{0}', {1}.document_no, '.pdf')".format(
+            PLACEHOLDER_PREFIX, alias),
+        "contenttype": "'application/pdf'",
+        "number_of_pages": "1",
+    }
+
+
+def placeholder_pdf() -> bytes:
+    """A one-page PDF with a fixed notice and no patient data or original filename."""
+    page = (b"BT /F1 22 Tf 54 720 Td (Source document unavailable) Tj "
+            b"/F1 12 Tf 0 -32 Td "
+            b"(The original file was absent from the OSCAR 19 backup.) Tj "
+            b"0 -20 Td (This page marks the missing source attachment.) Tj ET\n")
+    objects = (
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(page) + page + b"endstream",
+    )
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, obj in enumerate(objects, 1):
+        offsets.append(len(pdf))
+        pdf.extend(b"%d 0 obj\n" % number + obj + b"\nendobj\n")
+    xref = len(pdf)
+    pdf.extend(b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1))
+    for offset in offsets:
+        pdf.extend(b"%010d 00000 n \n" % offset)
+    pdf.extend(b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+               % (len(objects) + 1, xref))
+    return bytes(pdf)
+
+
+PLACEHOLDER_PDF = placeholder_pdf()
+
+
+def is_placeholder(path: str, dir_fd: Optional[int] = None) -> bool:
+    """Verify the exact notice in a regular file without following the filename as a link."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        try:
+            return (stat.S_ISREG(os.fstat(fd).st_mode)
+                    and os.read(fd, len(PLACEHOLDER_PDF) + 1) == PLACEHOLDER_PDF)
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
+def placeholder_lines(missing: Dict[int, str]) -> List[str]:
+    """Private lookup from the original source filename to each notice."""
+    return ["document {0}: {1!r} absent from the OSCAR 19 backup; notice {2}"
+            .format(number, filename, placeholder_name(number))
+            for number, filename in sorted(missing.items())]
+
+
+def placeholders_digest(missing: Dict[int, str]) -> str:
+    """Bind the document checkpoint to the exact staged IDs and original names."""
+    return hashlib.sha256(json.dumps(sorted(missing.items())).encode("ascii")).hexdigest()
+
+
+def install_placeholders(query, src: str, dst: str, ctx_root: str,
+                         missing: Dict[int, str]) -> List[str]:
+    """Publish complete notices before repointing chart rows. Repeat safely on resume."""
+    target_rows = query("SELECT document_no, docfilename FROM {0}.document"
+                        .format(o19etl.ident(dst)))
+    target_names = {int(row[0]): row[1] for row in target_rows}
+    reserved = {served_name(filename) for number, filename in target_names.items()
+                if filename and (number not in missing or filename != placeholder_name(number))}
+    _, hrm_select = hrm_rewrite_sql(dst, os.path.dirname(ctx_root))
+    reserved.update(served_name(row[1]) for row in query(hrm_select) if row[1])
+
+    root_fd = os.open(ctx_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            os.mkdir("document", mode=0o750, dir_fd=root_fd)
+        except FileExistsError:
+            pass  # existing directory is opened without following links below
+        else:
+            os.fsync(root_fd)
+        doc_fd = os.open("document", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                         dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+    try:
+        open_dir = _fd_dir(doc_fd)
+        problems = []
+        for number, original in missing.items():
+            name = placeholder_name(number)
+            if target_names.get(number) not in (original, name):
+                problems.append("document {0}: target filename differs from the staged source"
+                                .format(number))
+            if os.path.lexists(os.path.join(open_dir, original)):
+                problems.append("document {0}: original path {1!r} already holds a target entry"
+                                .format(number, original))
+            if name in reserved or (os.path.lexists(os.path.join(open_dir, name))
+                                    and not is_placeholder(name, dir_fd=doc_fd)):
+                problems.append("document {0}: notice path {1!r} is already in use"
+                                .format(number, name))
+        if problems:
+            return problems
+        for number in missing:
+            name = placeholder_name(number)
+            if is_placeholder(name, dir_fd=doc_fd):
+                continue
+            with tempfile.NamedTemporaryFile(dir=open_dir, prefix=".o19-notice-") as handle:
+                handle.write(PLACEHOLDER_PDF)
+                handle.flush()
+                os.fsync(handle.fileno())
+                os.link(os.path.basename(handle.name), name, src_dir_fd=doc_fd,
+                        dst_dir_fd=doc_fd, follow_symlinks=False)
+        os.fsync(doc_fd)
+    finally:
+        os.close(doc_fd)
+
+    values = placeholder_values("s")
+    assignments = ", ".join("d.{0} = {1}".format(column, value)
+                            for column, value in values.items())
+    query("UPDATE {0}.document d JOIN {1}.document s USING (document_no) "
+          "SET {2} WHERE {3} AND (BINARY d.docfilename = BINARY CONVERT(s.docfilename USING utf8mb4) "
+          "OR BINARY d.docfilename = BINARY {4})".format(
+              o19etl.ident(dst), o19etl.ident(src), assignments,
+              placeholder_predicate(missing, "s"), values["docfilename"]))
+    return []
 
 
 def source_eform_asset_names(entries: List[Tuple[str, str, int]],
@@ -1344,6 +1539,76 @@ def source_eform_asset_names(entries: List[Tuple[str, str, int]],
             if name and "/" not in name:
                 names.add(name)
     return names
+
+
+def source_document_findings(ctx, schema: str, tables: Dict[str, str]) -> List[Dict]:
+    """Assess archived attachments and assets against the staged rows without extracting files."""
+    from . import o19_preflight, o19import, o19roles
+
+    details = os.path.join(ctx["state_dir"], DOCUMENT_PREFLIGHT_DETAILS)
+    try:
+        entries, context = read_documents_archive(ctx["documents"])
+    except o19bundle.ARCHIVE_ERRORS as exc:
+        o19import.write_private(details, "Cannot read the source documents archive: {0}\n".format(exc))
+        return [o19_preflight.finding(
+            "documents-archive", o19_preflight.BLOCKER, "the source documents archive cannot be used",
+            "See {0} for details. Supply a readable export.".format(DOCUMENT_PREFLIGHT_DETAILS))]
+    ctx["document_archive"] = entries, context
+
+    query = ctx["query"]
+    documents = source_document_entries(entries, context)
+    missing, blocked = ({}, [])
+    if "document" in tables:
+        missing, blocked = document_source_gaps(query, schema, tables["document"], documents)
+    if "hrmdocument" in tables:
+        hrm_prefix = context + "/" + HRM_INCOMING_DIR + "/"
+        hrm_names = {os.path.basename(raw) for kind, raw, size in entries
+                     if kind == o19bundle.TAR_TYPE_FILE and size
+                     and os.path.normpath(raw).startswith(hrm_prefix)}
+        hrm_names.update(name for name, size in documents.items() if size)
+        for number, report in query(
+                "SELECT id, reportFile FROM {0}.{1} WHERE reportFile IS NOT NULL "
+                "AND reportFile <> ''".format(o19etl.ident(schema), o19etl.ident(tables["hrmdocument"]))):
+            if served_name(report) not in hrm_names:
+                blocked.append("HRMDocument {0}: {1!r} has no nonempty source report"
+                               .format(number, report))
+    if "eform" in tables:
+        assets = source_eform_asset_names(entries, context)
+        if not ctx["dev_target"]:
+            assets.update(packaged_eform_asset_names())
+        marker = "${oscar_image_path}"
+        for fid, name, html in query(
+                "SELECT fid, form_name, form_html FROM {0}.{1} "
+                "WHERE form_html LIKE '%oscar_image_path%' AND NOT COALESCE(({2}), 0)"
+                .format(o19etl.ident(schema), o19etl.ident(tables["eform"]),
+                        o19roles.RTL_CANONICAL_PREDICATE)):
+            for ref in image_refs(html.replace(marker + "/", marker)):
+                normalized = os.path.normpath(ref)
+                if "\0" in ref or os.path.isabs(ref) or normalized == ".." or normalized.startswith("../"):
+                    blocked.append("eForm {0} (fid {1}): {2!r} escapes eform/images"
+                                   .format(name, fid, ref))
+                elif not ("/" in ref or "\\" in ref
+                          or ref in assets or ref.split("?", 1)[0] in assets):
+                    blocked.append("eForm {0} (fid {1}): {2!r} is missing from the source and packaged assets"
+                                   .format(name, fid, ref))
+
+    findings = []
+    if missing:
+        findings.append(o19_preflight.finding(
+            MISSING_DOCUMENTS_ACCEPT, o19_preflight.BLOCKER,
+            "{0} chart attachment(s) absent from the OSCAR 19 backup".format(len(missing)),
+            "See {0}. With --accept {1}, the real import attaches a PDF notice at each "
+            "affected chart document.".format(DOCUMENT_PREFLIGHT_DETAILS, MISSING_DOCUMENTS_ACCEPT),
+            accept=MISSING_DOCUMENTS_ACCEPT))
+    if blocked:
+        findings.append(o19_preflight.finding(
+            "source-document-problems", o19_preflight.BLOCKER,
+            "{0} source document or asset problem(s) require correction".format(len(blocked)),
+            "See {0} and correct the source data or archive.".format(DOCUMENT_PREFLIGHT_DETAILS)))
+    o19import.write_private(
+        details, "\n".join(placeholder_lines(missing) + blocked) + "\n"
+        if findings else "The source attachment and asset checks found no missing files.\n")
+    return findings
 
 
 def service_readability_problems(query, dst_schema: str, ctx_root: str,
@@ -1666,27 +1931,13 @@ def run_docs(ctx) -> None:
             .format(ctx_root, str(prev.get("tar_sha256"))[:12],
                     tar_sha[:12]))
 
-    if not already_restored:
-        gz = tar_path.endswith(".gz")
-        try:
-            # from the archive's own headers, not a formatted listing:
-            # tar quotes non-ASCII member names, and a clinic tree full
-            # of accented document names would otherwise be unreadable
-            entries = o19bundle.read_tar_entries(tar_path, gz)
-        except o19bundle.ARCHIVE_ERRORS as exc:
-            die("cannot read documents tar: {0}".format(str(exc)[:300]))
-        try:
-            # plain files + directories only, relative traversal-free
-            # names: the tree is extracted as root
-            typed = [(kind, name) for kind, name, _ in entries]
-            o19bundle.validate_tar_members(typed, allow_dirs=True)
-            # the TYPED entries, not the validated names: a directory
-            # member has no trailing slash once tarfile has read it, so
-            # the type letter is the only thing that says it is one
-            old_ctx = detect_context_dir(typed)
-        except ValueError as exc:
-            die(str(exc))
+    try:
+        entries, old_ctx = ctx.pop("document_archive", None) or read_documents_archive(tar_path)
+    except o19bundle.ARCHIVE_ERRORS as exc:
+        private(["Cannot read the source documents tar: {0}".format(exc)])
+        die("cannot read documents tar — see {0}".format(details_path))
 
+    if not already_restored:
         incoming = os.path.join(documents_root, ".o19-incoming")
         if os.path.isdir(incoming):
             shutil.rmtree(incoming)
@@ -1694,7 +1945,7 @@ def run_docs(ctx) -> None:
         log("extracting documents tar (context '{0}') ...".format(old_ctx))
         # ownership/permissions are applied by apply_ownership from the
         # host policy, never restored from the clinic's archive
-        cp = run(["tar", "-xzf" if gz else "-xf", tar_path,
+        cp = run(["tar", "-xzf" if tar_path.endswith(".gz") else "-xf", tar_path,
                   "-C", incoming, "--no-same-owner",
                   "--no-same-permissions"])
         if cp.returncode != 0:
@@ -1736,13 +1987,6 @@ def run_docs(ctx) -> None:
         o19import.report_append(state_dir, "P5 documents restore",
                                 "\n".join(stock_lines + move_lines))
     else:
-        try:
-            entries = o19bundle.read_tar_entries(tar_path, tar_path.endswith(".gz"))
-            typed = [(kind, name) for kind, name, _ in entries]
-            o19bundle.validate_tar_members(typed, allow_dirs=True)
-            old_ctx = detect_context_dir(typed)
-        except (ValueError,) + o19bundle.ARCHIVE_ERRORS as exc:
-            die("cannot recheck source documents tar: {0}".format(str(exc)[:300]))
         log("documents: tree already restored (sha256 match) — "
             "re-running ownership repair and reconciliation")
 
@@ -1760,6 +2004,28 @@ def run_docs(ctx) -> None:
     if hrm_lines:
         o19import.report_append(state_dir, "P5 HRM relocation",
                                 "\n".join(hrm_lines))
+    placeholders = {}
+    source = o19import.STAGING_SCHEMA
+    if (MISSING_DOCUMENTS_ACCEPT in ctx["accepted"]
+            and "document" in o19etl.schema_tables(query, source)):
+        placeholders, source_problems = document_source_gaps(
+            query, source, "document", source_document_entries(entries, old_ctx))
+        if source_problems:
+            private(["Source document problems:"] + source_problems)
+            die("source document problems need correction before placeholders can be added "
+                "(see {0})".format(details_path))
+        if placeholders:
+            try:
+                conflicts = install_placeholders(query, source, ctx["target_db"],
+                                                 ctx_root, placeholders)
+            except OSError as exc:
+                conflicts = [str(exc)]
+            if conflicts:
+                private(["Source-unavailable PDFs could not be written:"] + conflicts)
+                die("cannot place source-unavailable PDFs — see {0}; "
+                    "resolve the listed problems and re-run with --resume".format(details_path))
+            private(["Chart attachments absent from the OSCAR 19 backup:"] + placeholder_lines(placeholders))
+
     # every pass, not only the first: an operator who fixed the tree by
     # hand (the documented remedy) leaves root-owned files behind, and a
     # root-run reconciliation would never notice
@@ -1771,7 +2037,12 @@ def run_docs(ctx) -> None:
         query, ctx["target_db"], ctx_root,
         source_document_names(entries, old_ctx),
         source_eform_asset_names(entries, old_ctx),
-        packaged_eform_asset_names() if not ctx["dev_target"] else set())
+        packaged_eform_asset_names() if not ctx["dev_target"] else set(),
+        placeholders=placeholders)
+    if placeholders:
+        lines.append("{0} attachment(s) absent from the OSCAR 19 backup, with PDF notices "
+                     "under --accept {1}; see documents-details.txt"
+                     .format(len(placeholders), MISSING_DOCUMENTS_ACCEPT))
     from . import o19billing
     lines.extend(o19billing.inventory(ctx, ctx_root))
     if private_lines:
@@ -1794,8 +2065,8 @@ def run_docs(ctx) -> None:
             "documents. If the file was in the source tar, restore its exact "
             "bytes under {2} and re-run with --resume. If it was absent "
             "from the source tar, recover the original, rebuild the tar "
-            "and start again from stock; a "
-            "target-side placeholder cannot satisfy source provenance. An eForm "
+            "and start again from stock. For chart attachments absent from the source tar, "
+            "--resume --accept {4} can attach source-unavailable PDF notices. An eForm "
             "image reference that ESCAPES eform/images is not a missing "
             "file: correct the source form, re-export the complete source "
             "set and start a fresh import from stock. "
@@ -1804,7 +2075,12 @@ def run_docs(ctx) -> None:
             "it — every eform row that mentions oscar_image_path is checked.) "
             "To start again from stock: {3}."
             .format(len(problems), details_path, ctx_root,
-                    o19import.rollback_hint(state)))
+                    o19import.rollback_hint(state), MISSING_DOCUMENTS_ACCEPT))
     o19import.mark_done(state_dir, state, "documents", tar_sha256=tar_sha,
-                        restored=True)
-    log("documents restored and reconciled clean")
+                        restored=True, placeholders=len(placeholders),
+                        placeholders_sha256=placeholders_digest(placeholders) if placeholders else None)
+    if placeholders:
+        warn("{0} attachment(s) absent from the OSCAR 19 backup. PDF notices attached; "
+             "see documents-details.txt".format(len(placeholders)))
+    else:
+        log("documents restored and reconciled clean")

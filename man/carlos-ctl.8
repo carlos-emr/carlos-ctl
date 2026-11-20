@@ -555,9 +555,8 @@ the report and root\-only billing-files-details.txt identify the work.
 The beta8 package pair requires schema manifest format 3 and ETL contract 6.
 It preserves OSCAR's unassigned digital signatures with patient sentinel \-1,
 and independently checks their original patient and module values.
-Known stock eForm collisions are reconciled with private receipts; missing
-source documents and clinic eForm assets cannot be covered by target-side
-placeholders. A beta7 partial copy must be restored to its pre\-import
+Known stock eForm collisions are reconciled with private receipts.
+A beta7 partial copy must be restored to its pre\-import
 backup before an upgrade and fresh import; see the application runbook.
 .TP
 .B import-o19 (experimental)
@@ -622,6 +621,22 @@ before setup, excluding package configure and provisioning through the
 last phase. A busy lock is refused without changing the workspace or database;
 wait for its owner to finish, then retry. The lock is released on return or
 process termination; never delete its file to bypass a running operation.
+.PP
+A dry run checks staged document references against the source archive
+and lists affected records in
+.IR preflight-documents-details.txt .
+With
+.BR "\-\-accept missing-source-documents" ,
+a real import attaches a PDF titled \(lqSource document unavailable\(rq
+to chart documents whose original file is absent from that archive.
+The final report counts the notices and
+.I documents-details.txt
+lists their original filenames. Unsafe paths, empty files, missing HRM
+reports and missing eForm assets require source correction.
+For an import that stopped at document reconciliation, repeat the command
+with the same inputs and add
+.BR "\-\-resume \-\-accept missing-source-documents" .
+.PP
 .B \-\-dry-run
 stages and reports without writing to the EMR schema (its
 .B \-\-accept
@@ -768,6 +783,8 @@ the exact ISO-8859-1 en-dash and less-than-or-equal sequences),
 (OLIS data is archive-only),
 .B no-documents
 (import without the documents tree),
+.B missing-source-documents
+(attach a PDF notice for a chart attachment absent from the OSCAR 19 backup),
 .B no-pre-backup
 (no pre-import restic snapshot; required when backups are not configured),
 .B unverified-bundle
@@ -928,6 +945,8 @@ continues from),
 .I preflight.txt
 and
 .IR preflight.json ,
+.I preflight-documents-details.txt
+(the root\-only list of missing source files found during preflight),
 .I o19-digests.json
 (the run's own 0600 copy of the clinic's content digests; the ledger
 binds its sha256, so a resumed run cannot substitute another) and
@@ -952,6 +971,7 @@ the derived
 .I o19-derived-carlos.properties
 fragment, the root\-only
 .I documents-details.txt
+(including original names for source\-unavailable PDF notices)
 and the root\-only
 .I verify-documents-details.txt
 (P7's document source-provenance, stock collision, or service-account read

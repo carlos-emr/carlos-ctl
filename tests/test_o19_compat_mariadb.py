@@ -18,7 +18,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from carlos_ctl import o19_preflight as pf, o19etl, o19host, o19import, o19sources
+from carlos_ctl import o19_preflight as pf, o19docs, o19etl, o19host, o19import, o19sources
+from tests.test_docs_driver import make_tar
 
 
 @unittest.skipUnless(os.environ.get("CARLOS_TEST_MARIADB_SOCKET"),
@@ -45,6 +46,73 @@ class TestO19Compatibility(unittest.TestCase):
         cp = subprocess.run(self.base + list(o19import.CLIENT_COMMON_ARGS), input=sql,
                             text=True, capture_output=True, timeout=30, check=True)
         return o19import.batch_rows(cp.stdout)
+
+    def test_document_notice_resumes_and_preserves_exact_document_parity(self):
+        for schema in (self.src, self.dst):
+            self.q("CREATE TABLE {0}.document (document_no INT PRIMARY KEY, docfilename VARCHAR(255), "
+                   "contenttype VARCHAR(255), number_of_pages INT, docdesc VARCHAR(255)); "
+                   "INSERT INTO {0}.document VALUES(1,'present.pdf','application/pdf',2,'Original'), "
+                   "(9,'source-scan.tiff','image/tiff',6,'Historic scan')".format(o19etl.ident(schema)))
+        self.q("CREATE TABLE {0}.HRMDocument (id INT PRIMARY KEY, reportFile VARCHAR(255)); "
+               "CREATE TABLE {0}.eform (fid INT PRIMARY KEY, form_name VARCHAR(255), form_html TEXT)"
+               .format(o19etl.ident(self.dst)))
+        state_dir = Path(self.temp.name, "state")
+        state_dir.mkdir()
+        documents_root = Path(self.temp.name, "documents")
+        ctx_root = documents_root / o19docs.TARGET_CTX
+        ctx_root.mkdir(parents=True)
+        archive = make_tar(str(Path(self.temp.name, "source.tar.gz")),
+                           {"document/present.pdf": "Original synthetic source bytes"})
+        ctx = {"state_dir": str(state_dir), "state": {"phases": {}}, "query": self.q,
+               "documents_root": str(documents_root), "documents": archive,
+               "accepted": [], "dev_target": True, "target_db": self.dst,
+               "archive_schema": self.src + "_archive"}
+        with patch.object(o19import, "STAGING_SCHEMA", self.src):
+            with self.assertRaises(SystemExit):
+                o19docs.run_docs(ctx)
+            ctx["accepted"] = [o19docs.MISSING_DOCUMENTS_ACCEPT]
+            original_path = ctx_root / "document" / "source-scan.tiff"
+            original_path.write_bytes(b"Recovered file")
+            with self.assertRaises(SystemExit):
+                o19docs.run_docs(ctx)
+            self.assertEqual(original_path.read_bytes(), b"Recovered file")
+            original_path.unlink()
+            o19docs.run_docs(ctx)
+            notice = ctx_root / "document" / o19docs.placeholder_name(9)
+            inode = notice.stat().st_ino
+            ctx["state"]["phases"]["documents"]["status"] = "in-progress"
+            o19docs.run_docs(ctx)
+            self.assertEqual(notice.stat().st_ino, inode)
+
+        name = o19docs.placeholder_name(9)
+        values = self.q("SELECT docfilename, contenttype, number_of_pages, docdesc "
+                        "FROM {0}.document ORDER BY document_no".format(o19etl.ident(self.dst)))
+        self.assertEqual(values, [["present.pdf", "application/pdf", "2", "Original"],
+                                  [name, "application/pdf", "1", "Historic scan"]])
+        self.assertEqual((ctx_root / "document" / "present.pdf").read_text(),
+                         "Original synthetic source bytes")
+        self.assertTrue(o19docs.is_placeholder(str(notice)))
+        self.assertIn("Source document unavailable", notice.read_bytes().decode("ascii"))
+        self.assertEqual(ctx["state"]["phases"]["documents"]["placeholders"], 1)
+        self.assertIn("source-scan.tiff", (state_dir / "documents-details.txt").read_text())
+
+        overrides = {"document": (o19docs.placeholder_predicate([9], "s"),
+                                  o19docs.placeholder_values("s"))}
+        source_columns = o19etl.introspect_columns(self.q, self.src)
+        target_columns = o19etl.introspect_columns(self.q, self.dst)
+        args = self.q, self.src, self.dst, source_columns, target_columns
+        ok, bad = o19etl.copy_content_parity(*args, post_copy=overrides)
+        self.assertEqual(bad, [])
+        self.assertIn("document (copy): copied values and the documented post-copy changes match", ok)
+        self.q("UPDATE {0}.document SET docdesc='Changed' WHERE document_no=9"
+               .format(o19etl.ident(self.dst)))
+        _ok, bad = o19etl.copy_content_parity(*args, post_copy=overrides)
+        self.assertTrue(any("document: 1 copied row(s)" in finding for finding in bad))
+
+        notice.write_bytes(b"Something else")
+        problems, _lines, _private = o19docs.reconcile(
+            self.q, self.dst, str(ctx_root), {"present.pdf"}, placeholders={9: "source-scan.tiff"})
+        self.assertTrue(any("differs from the generated notice" in problem for problem in problems))
 
     def test_plain_and_etl_queries_pin_utc_for_temporal_conversions(self):
         base = self.base + ["--init-command=SET time_zone='+05:30'"]

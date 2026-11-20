@@ -23,8 +23,9 @@ from unittest import mock
 
 from carlos_ctl import o19host  # noqa: F401
 from carlos_ctl import dbops
-from carlos_ctl import (o19etl, o19import, o19map_schema,
+from carlos_ctl import (o19docs, o19etl, o19import, o19map_schema,
                         o19report)
+from tests.test_docs_driver import make_tar
 
 # The importer writes its client defaults-file inside the run's own state
 # directory (o19import.py:1192), never in a world-writable temp dir. Tests
@@ -2879,7 +2880,7 @@ class TestVerifyPhaseFiles(unittest.TestCase):
         from carlos_ctl import o19roles
         self._parity = o19import._row_parity
         self._checks = o19roles.verify_role_checks
-        o19import._row_parity = lambda ctx: (["t: 1 -> 1"], [])
+        o19import._row_parity = lambda ctx, placeholders=(): (["t: 1 -> 1"], [])
         self.private = ["expired logins: fixture.expired"]
         #: staging-side row count for patient 7; equal to the target's 1
         #: for a clean run, raised by a test that wants a real mismatch
@@ -3003,6 +3004,44 @@ class TestVerifyPhaseFiles(unittest.TestCase):
                   encoding="utf-8") as fh:
             self.assertIn("final document verification could not run", fh.read())
 
+    def test_final_verification_checks_and_reports_source_unavailable_notices(self):
+        ctx = self._ctx()
+        original = "missing-scan.tiff"
+        planned = {9: original}
+        document_dir = Path(self.state_dir, "target", o19docs.TARGET_CTX, "document")
+        document_dir.mkdir(parents=True)
+        notice = document_dir / o19docs.placeholder_name(9)
+        notice.write_bytes(o19docs.PLACEHOLDER_PDF)
+        tar_path = make_tar(str(Path(self.state_dir, "source.tar.gz")),
+                            {"document/unreferenced.pdf": "synthetic file"})
+        ctx.update(dev_target=True, documents=tar_path, documents_root=str(document_dir.parent.parent),
+                   accepted=[o19docs.MISSING_DOCUMENTS_ACCEPT])
+        ctx["state"]["phases"]["documents"] = {
+            "status": "done", "tar_sha256": o19import.sha256_file(tar_path),
+            "placeholders": 1, "placeholders_sha256": o19docs.placeholders_digest(planned),
+        }
+        fallback = ctx["query"]
+
+        def query(sql, db=None):
+            if sql.startswith("SELECT document_no, docfilename FROM "):
+                return [["9", original if "o19_import" in sql else notice.name]]
+            return fallback(sql, db)
+
+        ctx["query"] = query
+        with mock.patch.object(o19import, "_row_parity", return_value=([], [])) as parity:
+            o19import.run_p7(ctx)
+        parity.assert_called_once_with(ctx, planned)
+        report = Path(self.state_dir, "import-report.txt").read_text()
+        self.assertIn("PASSED — 1 SOURCE-DOCUMENT PLACEHOLDER(S)", report)
+        self.assertNotIn(original, report)
+
+        ctx["state"]["phases"].pop("verify")
+        notice.write_bytes(b"Not the source-unavailable PDF")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            o19import.run_p7(ctx)
+        details = Path(self.state_dir, "verify-documents-details.txt").read_text()
+        self.assertIn("differs from the generated notice", details)
+
     def test_private_files_carry_the_identifiers_and_report_the_counts(
             self):
         ctx = self._ctx()
@@ -3088,7 +3127,7 @@ class TestVerifyPhaseFiles(unittest.TestCase):
         off on. Summing them as passes told report.txt -- the only
         place the count appears without the sections that split it --
         that every one of them was a check that passed."""
-        o19import._row_parity = lambda ctx: ([
+        o19import._row_parity = lambda ctx, placeholders=(): ([
             "demographic: staging 10 -> target 10",
             "drugs: staging 4 -> target 4",
             o19etl.UNCHECKED_PREFIX + "providerExt: no primary key",
@@ -3588,7 +3627,7 @@ class TestTheFullProblemListSurvives(unittest.TestCase):
         ctx = self.ctx()
         err = io.StringIO()
         with mock.patch.object(o19import, "_row_parity",
-                               lambda c: ([], list(problems))), \
+                               lambda c, placeholders=(): ([], list(problems))), \
                 mock.patch.object(o19roles, "verify_role_checks",
                                   lambda *a: ([], [], [], [])), \
                 contextlib.redirect_stdout(io.StringIO()), \

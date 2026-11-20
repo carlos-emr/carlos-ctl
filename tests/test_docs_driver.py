@@ -19,6 +19,7 @@ Run (from the repository root):
     python3 -m unittest discover -v -s tests -t .
 """
 
+import contextlib
 import csv
 import io
 import os
@@ -27,6 +28,8 @@ import shutil
 import tarfile
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from carlos_ctl import o19docs, o19import
 
@@ -333,6 +336,47 @@ class TestTheRefusals(DocsDriverBase):
         with self.assertRaises(SystemExit):
             o19docs.run_docs(self.make_ctx(
                 FakeDb(), documents=other, state=ctx["state"]))
+
+
+class TestDocumentAssessment(DocsDriverBase):
+    def assess(self, db, accepted=()):
+        ctx = self.make_ctx(db, dry_run=True, province="on", accepted=accepted)
+        with patch.object(o19import.o19_preflight, "run_checks",
+                          return_value={"schema_map_version": "test", "findings": []}), \
+                patch.object(o19import.o19etl, "schema_tables",
+                             return_value={"Document", "HRMDocument", "eform"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return o19import.run_p2(ctx)
+
+    def test_dry_run_requires_signoff_for_each_missing_attachment_group(self):
+        db = FakeDb(documents=[["1", "a.pdf"], ["9", "private-scan.tiff"]])
+        flag = o19docs.MISSING_DOCUMENTS_ACCEPT
+        report = self.assess(db)
+        self.assertEqual((report["exit_code"], report["required_accepts"]), (1, [flag]))
+        report = self.assess(db, accepted=[flag])
+        self.assertEqual((report["exit_code"], report["acknowledged"]), (0, [flag]))
+
+        details = Path(self.state_dir, o19docs.DOCUMENT_PREFLIGHT_DETAILS)
+        self.assertEqual(details.stat().st_mode & 0o777, 0o600)
+        self.assertIn("private-scan.tiff", details.read_text())
+        self.assertNotIn("private-scan.tiff", Path(self.state_dir, "preflight.txt").read_text())
+        self.assertEqual(list(Path(self.ctx_root()).iterdir()), [])
+        self.assertEqual(db.writes, [])
+
+    def test_missing_reports_assets_and_unusable_paths_still_block(self):
+        self.tar = make_tar(
+            os.path.join(self.tmp, "incomplete.tar.gz"),
+            {"document/empty.pdf": "", "eform/images/logo.png": "image"})
+        db = FakeDb(documents=[["1", "empty.pdf"], ["2", "../outside.pdf"]],
+                    hrm=[["3", "/legacy/hrm/report.hl7"]],
+                    eforms=[["4", "Source Form", '<img src="${oscar_image_path}/logo.png">'
+                                                '<img src="${oscar_image_path}missing.png">']])
+        report = self.assess(db, [o19docs.MISSING_DOCUMENTS_ACCEPT])
+        self.assertEqual(report["exit_code"], 2)
+        details = Path(self.state_dir, o19docs.DOCUMENT_PREFLIGHT_DETAILS).read_text()
+        for name in ("empty.pdf", "outside.pdf", "report.hl7", "missing.png"):
+            self.assertIn(name, details)
+        self.assertNotIn("logo.png", details)
 
 
 class TestTheResume(DocsDriverBase):

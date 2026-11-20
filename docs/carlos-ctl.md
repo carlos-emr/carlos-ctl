@@ -212,17 +212,33 @@ fields, and rejects conflicting patients or modules. The document phase
 handles the three known stock Rich Text
 Letter assets according to package ownership, normalizes the exact legacy
 `${oscar_image_path}/` marker, and ignores comments and script bodies when
-enumerating static eForm assets. It checks that every referenced clinic
-document and eForm asset came from the source tar, so a nonempty target
-placeholder does not hide missing source material. Final verification repeats
-the source and service-account readability checks. Verified private snapshots
-are reused between assessment and the real import to reduce disk use.
+enumerating static eForm assets. It checks clinic documents and eForm assets
+against the source archive. Final verification repeats the source and
+service-account readability checks. Verified private snapshots are reused
+between assessment and the real import to reduce disk use.
 
 A beta7 import that has already copied rows cannot resume under beta8.
 Restore its pre-import database, document tree and import state, then run a
 fresh assessment and import with the matched packages. The
 [application runbook](https://github.com/carlos-emr/carlos/blob/main/docs/o19-import-deb.md#beta8-package-pair-and-a-beta7-import-already-in-progress)
 has the complete recovery sequence.
+
+### Attachments absent from an OSCAR 19 backup
+
+Run `import-o19 --dry-run` with the complete backup set to check the staged
+document references against the archive. `preflight-documents-details.txt`
+lists the affected records in the root-only import workspace.
+
+After reviewing the list, add `--accept missing-source-documents` to the
+real import to attach one PDF notice to each chart document whose original
+file is absent from the OSCAR 19 backup. The notice reads **Source document
+unavailable** and identifies the source backup as the gap. The private
+`documents-details.txt` maps each notice to its original filename, and the
+final verification report gives the count. Empty files, unsafe paths,
+missing HRM reports and missing eForm assets require source correction.
+
+For a run that stopped at document reconciliation, repeat the original
+command with the same inputs and add `--resume --accept missing-source-documents`.
 
 ## CDS import
 
