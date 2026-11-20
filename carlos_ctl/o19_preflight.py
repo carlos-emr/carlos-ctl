@@ -1781,7 +1781,12 @@ REPAIR_TEMPLATE = "CONVERT(BINARY CONVERT({0} USING latin1) USING utf8mb4)"
 #: regex engine that understands \x{} escapes: the Spencer engine of
 #: MySQL < 8 / MariaDB < 10.0.5 reads it as a literal bracket
 #: expression, so it is only used behind _hex_escape_regexp_supported().
-MOJIBAKE_MARKER_RE = "'[\\\\x{C3}\\\\x{C2}][\\\\x{80}-\\\\x{BF}]'"
+_MOJIBAKE_LATIN = r"[\\x{C3}\\x{C2}][\\x{80}-\\x{BF}]"
+# Windows-1252 forms of UTF-8 punctuation such as â€ and â„¢.
+_MOJIBAKE_PUNCTUATION = r"\\x{E2}(?:\\x{20AC}|\\x{201E}\\x{A2})"
+MOJIBAKE_MARKER_RE = "'{0}'".format(_MOJIBAKE_LATIN)
+TEXT_ENCODING_MARKER_RE = "'(?:{0}|{1})'".format(
+    _MOJIBAKE_LATIN, _MOJIBAKE_PUNCTUATION)
 #: proves the engine really understands the escape: a latin1 'Ã©' must
 #: match and plain ASCII must not. Spencer answers 0 to both (or errors
 #: on the reversed range), which is what makes the two-sided test
@@ -2033,22 +2038,36 @@ def needs_another_charset_pass(expr):
         guarded_legacy_repair_expr(expr), expr)
 
 
-def exact_charset_bad_candidate(expr):
+def charset_marker(expr, pattern=TEXT_ENCODING_MARKER_RE):
+    return ("CONVERT({0} USING utf8mb4) COLLATE utf8mb4_general_ci "
+            "REGEXP {1}").format(expr, pattern)
+
+
+def partial_charset_repair(expr):
+    """Find values whose first pass leaves a mixed, still-encoded value."""
+    candidate = REPAIR_TEMPLATE.format(expr)
+    return "({0}) AND ({1}) AND NOT ({2})".format(
+        double_encoded_expr(expr), charset_marker(candidate),
+        double_encoded_expr(candidate))
+
+
+def exact_charset_bad_candidate(expr, protect_charset_residuals=True):
+    pattern = TEXT_ENCODING_MARKER_RE if protect_charset_residuals else MOJIBAKE_MARKER_RE
     repeated = needs_another_charset_pass(expr)
-    marker = ("CONVERT({0} USING utf8mb4) COLLATE utf8mb4_general_ci "
-              "REGEXP {1}").format(expr, MOJIBAKE_MARKER_RE)
     residual = ("CONVERT({0} USING utf8mb4) COLLATE utf8mb4_bin "
                 "REGEXP '[\\\\x{{E2}}][\\\\x{{80}}-\\\\x{{9F}}]'").format(expr)
     return "{0} IS NOT NULL AND ({1} OR {2} OR {3})".format(
-        expr, residual, marker, repeated)
+        expr, residual, charset_marker(expr, pattern), repeated)
 
 
-def validated_charset_repair(expr, exact=False):
+def validated_charset_repair(expr, exact=False, protect_charset_residuals=True):
     """Carry the original value when one approved repair leaves doubt."""
     candidate = (exact_charset_candidate(expr) if exact else
                  guarded_legacy_repair_expr(expr))
-    bad = (exact_charset_bad_candidate(candidate) if exact else
+    bad = (exact_charset_bad_candidate(candidate, protect_charset_residuals) if exact else
            needs_another_charset_pass(candidate))
+    if not exact and protect_charset_residuals:
+        bad = "({0}) OR ({1})".format(bad, charset_marker(candidate))
     return "CASE WHEN {0} THEN CONVERT({1} USING utf8mb4) ELSE {2} END".format(
         bad, expr, candidate)
 
@@ -2066,7 +2085,7 @@ def checked_charset_count(query, qualified_table, where):
     return n
 
 
-def exact_charset_counts(query, qualified_table, expr):
+def exact_charset_counts(query, qualified_table, expr, protect_charset_residuals=True):
     """Authoritative modern-server scan. Counts are read-only and checked.
 
     The candidate is named once in a derived table to keep the residual
@@ -2078,7 +2097,7 @@ def exact_charset_counts(query, qualified_table, expr):
     known = exact_charset_match("original")
     changed = "NOT (BINARY candidate <=> BINARY " \
         "CONVERT(original USING utf8mb4))"
-    bad = exact_charset_bad_candidate("candidate")
+    bad = exact_charset_bad_candidate("candidate", protect_charset_residuals)
     repairable = "({0} OR {1}) AND NOT ({2})".format(known, changed, bad)
     result = {
         "rows": checked_charset_count(query, relation, repairable),
@@ -3733,8 +3752,14 @@ def check_text_encoding(c):
                 unrepairable.setdefault(label, []).append(
                     "{0} row(s) still double-encoded after one repair — "
                     "encoded more than twice".format(multi))
-            if n > multi:
-                mojibake[label] = n - multi
+            partial = (count_live(t, partial_charset_repair(quoted))
+                       if marker_scan and not exact and n > multi else 0)
+            if partial:
+                unrepairable.setdefault(label, []).append(
+                    "{0} row(s) retain mixed encoding after one repair"
+                    .format(partial))
+            if n > multi + partial:
+                mojibake[label] = n - multi - partial
             if not marker_scan:
                 continue
             if exact:
@@ -3743,10 +3768,9 @@ def check_text_encoding(c):
                 try:
                     known_bad = checked_charset_count(
                         query, qualified,
-                        "{0} AND CONVERT({1} USING utf8mb4) COLLATE "
-                        "utf8mb4_general_ci REGEXP {2}".format(
+                        "{0} AND {1}".format(
                             exact_charset_match(quoted),
-                            exact_charset_expr(quoted), MOJIBAKE_MARKER_RE))
+                            charset_marker(exact_charset_expr(quoted))))
                 except Exception as exc:
                     c.query_errors[label] = str(exc)
                     continue
@@ -3757,7 +3781,7 @@ def check_text_encoding(c):
             source = quoted
             bad = count_live(t, "{0} IS NOT NULL AND {0} REGEXP {1} AND "
                                 "NOT ({2}){3}".format(
-                                    source, MOJIBAKE_MARKER_RE,
+                                    source, TEXT_ENCODING_MARKER_RE,
                                     double_encoded_expr(source),
                                     " AND NOT {0}".format(
                                         exact_charset_match(quoted))

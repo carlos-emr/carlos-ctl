@@ -38,12 +38,9 @@ class FakeDb(object):
         # was written to measure
         self.grants = ([["GRANT ALL PRIVILEGES ON *.* TO `root`@`localhost`"]]
                        if grants is None else grants)
-        # charset: {(table, column): {"n": .., "multi": .., "bad": ..}}
-        # The scan issues THREE different counts per column and the
-        # repairable predicate is a literal SUBSTRING of the other two,
-        # so fragment matching cannot tell them apart -- they are keyed
-        # by lane instead. regexp_hex=False is a Spencer-engine server,
-        # where the `bad` lane cannot be measured at all.
+        # charset: {(table, column): {"n": .., "multi": .., "partial": .., "bad": ..}}
+        # Several counts share the same round-trip predicate. Distinguish
+        # them by the whole query shape. Old regex engines skip markers.
         self.charset = dict(charset or {})
         self.regexp_hex = regexp_hex
         self.tables = dict(tables or {})
@@ -111,7 +108,9 @@ class FakeDb(object):
                 # the charset scan's "bad" lane is `col IS NOT NULL AND
                 # col REGEXP ...`; the login-name check's `NOT REGEXP`
                 # is an ordinary where_counts predicate
-                if " IS NOT NULL AND " in where and " REGEXP " in where:
+                if where.startswith("(") and " REGEXP " in where:
+                    lane = "partial"
+                elif " IS NOT NULL AND " in where and " REGEXP " in where:
                     lane = "bad"
                 elif ") AND (" in where:
                     lane = "multi"
@@ -874,6 +873,14 @@ class TestTheB8CharsetStop(unittest.TestCase):
         self.assertIn("do not round-trip", f["data"]["casemgmt_note.note"])
         self.assertEqual([x["id"] for x in report["findings"]
                           if x["id"] == "charset-mojibake"], [])
+
+    def test_a_partial_repair_requires_only_the_keep_text_signoff(self):
+        db = FakeDb(base_tables(),
+                    charset={("casemgmt_note", "note"): {"n": 1, "partial": 1}})
+        report = pf.run_checks(db, properties=clean_props())
+        self.assertEqual(report["required_accepts"], [pf.KEEP_UNREPAIRABLE_TEXT])
+        finding = next(f for f in report["findings"] if f["id"] == "B8-charset-unrepairable")
+        self.assertIn("retain mixed encoding", finding["data"]["casemgmt_note.note"])
 
     def test_a_spencer_engine_server_says_the_stop_was_not_measured(self):
         """The byte-signature half needs \\x{NN} escapes, which MySQL < 8

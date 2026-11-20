@@ -546,14 +546,18 @@ report, spot checks, UI smoke \(em before clinical use.
 Ontario billing generation rows enter the live tables when the backup
 contains the corresponding nonempty file in
 .BR HOME_DIR .
-For a repeated exact filename, the highest generation ID keeps the
-original name. All source generation rows are preserved in
+OSCAR can regenerate an older billing file under a shared name.
+Repeated filenames are archive-only by default. When the clinic can
+confirm that the surviving files belong to the highest generation IDs,
+.B \-\-accept latest-billing-generation
+selects those rows for repeated exact names within one table.
+All source generation rows are preserved in
 .IR o19_archive .
 Files claimed by both billing tables and names that conflict in a target
 unique index are listed for review in the root\-only
 .IR billing-files-details.txt .
-The dry run reports the planned counts. An import that already wrote
-filename mappings finishes with that policy.
+The dry run reports the planned counts. An import that already started
+copying billing generations finishes with its recorded policy.
 The beta8 package pair requires schema manifest format 3 and ETL contract 6.
 It preserves OSCAR's unassigned digital signatures with patient sentinel \-1,
 and independently checks their original patient and module values.
@@ -782,7 +786,11 @@ and shadow-captured to
 (double-encoded text is repaired per row; drugs.special also supports
 the exact ISO-8859-1 en-dash and less-than-or-equal sequences),
 .B keep-unrepairable-text
-(carry the original source value when the lossless repair cannot verify it),
+(carry the full original source value when a verified repair leaves
+unresolved encoding),
+.B latest-billing-generation
+(use the highest ID for a repeated exact billing filename within one
+table after the clinic confirms which generation owns the surviving file),
 .B olis-gone
 (OLIS data is archive-only),
 .B no-documents

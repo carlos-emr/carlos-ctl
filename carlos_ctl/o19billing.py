@@ -18,6 +18,8 @@ RULE = "o19-billing-v1"
 AUDIT = "billing_filename_import"
 IMPORT_ACTOR = "carlos-ctl/import-o19"
 GENERATION_FILES = "billing_generation_files"
+LATEST_GENERATION_ACCEPT = "latest-billing-generation"
+LATEST_GENERATION_POLICY = "billing_assume_latest"
 DETAILS = "billing-files-details.txt"
 TABLES = {
     "billing_on_diskname": ("ohipfilename", "createdatetime", "claim"),
@@ -156,6 +158,8 @@ class GenerationPlan:
     directory: Optional[str]
     files: Dict[str, int]
     rows: Dict[str, Dict[int, Tuple[str, str]]]
+    assume_latest: bool = False
+    repeated_names: int = 0
 
     def retained(self, table):
         return {row_id: name for row_id, (name, status) in self.rows[table].items()
@@ -193,15 +197,19 @@ def archived_billing_files(ctx):
     return directory, files
 
 
-def plan_generations(ctx, src, sources, dst_info):
-    """Select the last generation ID for each exact backed-up filename.
+def plan_generations(ctx, src, sources, dst_info, assume_latest=None):
+    """Select backed-up filenames that can be assigned to a generation.
 
-    If both generation tables claim one physical file, their IDs cannot tell
-    which writer was last. Distinct files that compare equal in a target
-    unique index also need review. Both cases stay available in the archive.
+    OSCAR can regenerate an older disk under its existing name. Repeated
+    names therefore require operator confirmation before assigning the
+    file to the highest ID. Cross-table and target index conflicts remain
+    available for review in the archive.
     """
-    if "billing_generation_plan" in ctx:
-        return ctx["billing_generation_plan"]
+    if assume_latest is None:
+        assume_latest = LATEST_GENERATION_ACCEPT in ctx.get("accepted", ())
+    cached = ctx.get("billing_generation_plan")
+    if cached and cached.assume_latest == assume_latest:
+        return cached
     directory, files = archived_billing_files(ctx)
     rows = {table: {} for table in sources}
     references = defaultdict(list)
@@ -219,20 +227,27 @@ def plan_generations(ctx, src, sources, dst_info):
                 references[name].append((table, row_id, rank))
 
     candidates = defaultdict(list)
+    repeated_names = 0
     for name, refs in references.items():
         if len({table for table, _, _ in refs}) > 1:
             for table, row_id, _ in refs:
                 rows[table][row_id] = name, "shared between generation tables"
             continue
-        for table, row_id, _ in refs:
-            rows[table][row_id] = name, "overwritten by a later generation"
+        if len(refs) > 1:
+            repeated_names += 1
+            reason = ("older generation archived by selection policy"
+                      if assume_latest else "shared by several generations")
+            for table, row_id, _ in refs:
+                rows[table][row_id] = name, reason
+            if not assume_latest:
+                continue
         table, row_id, rank = max(refs, key=lambda row: row[1])
         candidates[table, rank].append((row_id, name))
     for (table, _), group in candidates.items():
         status = "retained" if len(group) == 1 else "conflicts with another surviving filename"
         for row_id, name in group:
             rows[table][row_id] = name, status
-    plan = GenerationPlan(directory, files, rows)
+    plan = GenerationPlan(directory, files, rows, assume_latest, repeated_names)
     ctx["billing_generation_plan"] = plan
     return plan
 
@@ -256,14 +271,29 @@ def generation_summary(table, plan):
         table, retained, archived)
 
 
-def recorded_plan(ctx, tables, dst_info=None):
+def recorded_latest_policy(progress):
+    """Bind the choice to the billing copy when continuing a run."""
+    tables = progress.get("tables", {})
+    policies = {tables[table].get(LATEST_GENERATION_POLICY, True)
+                for table in generation_tables(progress)}
+    if len(policies) > 1:
+        raise ValueError("billing generation tables have conflicting selection policies")
+    # Earlier file-backed checkpoints used the highest ID for every repeat.
+    return next(iter(policies), None)
+
+
+def recorded_plan(ctx, progress, dst_info=None):
     """Recover the file-backed selection on a checkpointed import."""
     from . import o19etl, o19import
+    tables = generation_tables(progress)
     if not tables:
         return None
-    if dst_info is None and "billing_generation_plan" not in ctx:
+    assume_latest = recorded_latest_policy(progress)
+    cached = ctx.get("billing_generation_plan")
+    if dst_info is None and (not cached or cached.assume_latest != assume_latest):
         dst_info = o19etl.introspect_columns(ctx["query"], ctx["target_db"])
-    return plan_generations(ctx, o19import.STAGING_SCHEMA, {table: table for table in tables}, dst_info)
+    return plan_generations(ctx, o19import.STAGING_SCHEMA, {table: table for table in tables},
+                            dst_info, assume_latest)
 
 
 def report_generations(ctx, plan):
@@ -275,13 +305,23 @@ def report_generations(ctx, plan):
         details.extend("{0} id {1}: {2!r} — {3}".format(table, row_id, name, status)
                        for row_id, (name, status) in sorted(rows.items()))
     o19import.write_private(os.path.join(ctx["state_dir"], DETAILS), "\n".join(details) + "\n")
-    return [generation_summary(table, plan) for table in sorted(plan.rows)]
+    lines = [generation_summary(table, plan) for table in sorted(plan.rows)]
+    if plan.repeated_names:
+        if plan.assume_latest:
+            lines.append("For {0} repeated filename(s), the highest generation ID was selected "
+                         "where eligible under the recorded billing policy.".format(plan.repeated_names))
+        else:
+            lines.append("{0} repeated filename(s) need review. Their generation rows are archived. "
+                         "Use --accept {1} only if the clinic confirms the highest IDs own all "
+                         "eligible files with repeated names.".format(
+                             plan.repeated_names, LATEST_GENERATION_ACCEPT))
+    return lines
 
 
 def generation_file_problems(ctx, root):
     """Check the restored file for every retained live generation."""
     from . import o19docs, o19etl
-    plan = recorded_plan(ctx, generation_tables(o19etl.load_progress(ctx["state_dir"])))
+    plan = recorded_plan(ctx, o19etl.load_progress(ctx["state_dir"]))
     if not plan or plan.directory is None:
         return []
     problems = []
@@ -498,6 +538,7 @@ def prepare(run, table, entry, state, dst_cols, plan=None):
         state["billing_started"] = True
         if plan is not None:
             state[GENERATION_FILES] = True
+            state[LATEST_GENERATION_POLICY] = plan.assume_latest
         save_progress(run.state_dir, run.progress)
         if plan is None:
             build(run.query, table, run.src, run.arch, run.src_info[table], dst_cols)
@@ -543,6 +584,8 @@ def prepare(run, table, entry, state, dst_cols, plan=None):
     else:
         line = generation_summary(table, plan) + ". Source rows are preserved at {0}.{1}.".format(
             run.arch, table)
+        if plan.assume_latest and plan.repeated_names:
+            line += " Highest IDs were used for repeated filenames under the recorded billing policy."
     lines[:] = [item for item in lines if not item.startswith(table + ": ")] + [line]
     save_progress(run.state_dir, run.progress)
 
@@ -589,7 +632,7 @@ def inventory(ctx, root):
     """Private inventory of file-backed generations or legacy ambiguous mappings."""
     from . import o19etl, o19import
     progress = o19etl.load_progress(ctx["state_dir"])
-    plan = recorded_plan(ctx, generation_tables(progress))
+    plan = recorded_plan(ctx, progress)
     if plan is not None:
         return report_generations(ctx, plan)
     if not any(value.get("billing_started") for table, value in progress.get("tables", {}).items()

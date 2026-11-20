@@ -39,6 +39,7 @@ from . import o19billing, o19digest, o19map_schema, o19_preflight
 from .util import sql_escape, warn
 
 ETL_CONTRACT_VERSION = 6
+PROTECT_CHARSET_RESIDUALS = "protect_charset_residuals"
 
 # a copy is windowed over the id RANGE, so a sparse id space costs
 # windows rather than rows. Beyond this the range is not a table's id
@@ -168,9 +169,9 @@ UTF8_BYTE_PATTERN = o19_preflight.UTF8_BYTE_PATTERN
 LATIN1_UTF8_BYTE_PATTERN = o19_preflight.LATIN1_UTF8_BYTE_PATTERN
 
 
-def repair_expr(expr: str, exact: bool = False) -> str:
+def repair_expr(expr: str, exact: bool = False, protect_charset_residuals: bool = True) -> str:
     """One verified repair path, shared with the assessment."""
-    return o19_preflight.validated_charset_repair(expr, exact)
+    return o19_preflight.validated_charset_repair(expr, exact, protect_charset_residuals)
 
 
 # --------------------------------------------------------------------------
@@ -448,7 +449,8 @@ def source_expr(table_entry: dict, target_col: str,
     # doubled here, and a second line of defence costs nothing.
     expr = "s.{0}".format(ident(src))
     if repaired and target_col in repaired:
-        expr = repair_expr(expr, target_col in table_entry.get("_exact_charset_columns", ()))
+        expr = repair_expr(expr, target_col in table_entry.get("_exact_charset_columns", ()),
+                           table_entry.get(PROTECT_CHARSET_RESIDUALS, True))
     parent = table_entry.get("fk_remap", {}).get(target_col)
     if parent and archive_schema:
         lookup = "(SELECT m.new_id FROM `{0}`.`{1}` m WHERE m.old_id = {2})" \
@@ -2648,7 +2650,8 @@ def absent_object_error(exc: Exception) -> bool:
 def detect_repairs(query, src_schema: str, accepted,
                    notes: Optional[List[str]] = None,
                    audit: Optional[dict] = None,
-                   retained: Optional[Dict[str, int]] = None) -> Dict[str, set]:
+                   retained: Optional[Dict[str, int]] = None,
+                   protect_charset_residuals: bool = True) -> Dict[str, set]:
     """Scan for repairable and unrepairable values and check each sign-off.
     The result maps tables to columns with repairable values. The repair
     itself is applied per ROW (repair_expr), never to a whole column. A
@@ -2663,7 +2666,8 @@ def detect_repairs(query, src_schema: str, accepted,
             if (table, col) == o19_preflight.EXACT_CHARSET_SCOPE:
                 try:
                     measured = o19_preflight.exact_charset_counts(
-                        query, "`{0}`.`{1}`".format(src_schema, table), expr)
+                        query, "`{0}`.`{1}`".format(src_schema, table), expr,
+                        protect_charset_residuals)
                 except Exception as exc:
                     if absent_object_error(exc):
                         if notes is not None:
@@ -2703,10 +2707,12 @@ def detect_repairs(query, src_schema: str, accepted,
                 raise RuntimeError(
                     "charset scan of {0}.{1} failed: {2}"
                     .format(table, col, exc)) from exc
+            pattern = (o19_preflight.TEXT_ENCODING_MARKER_RE if protect_charset_residuals
+                       else MOJIBAKE_MARKER_RE)
             bad = int(query(
                 "SELECT COUNT(*) FROM `{0}`.`{1}` WHERE {2} IS NOT NULL AND "
                 "{2} REGEXP {3} AND NOT ({4})".format(
-                    src_schema, table, expr, MOJIBAKE_MARKER_RE,
+                    src_schema, table, expr, pattern,
                     double_encoded_predicate(expr)))[0][0])
             # Thrice-encoded text SATISFIES the predicate — it round-trips
             # — so it is not in `bad`, and one repair hop leaves it still
@@ -2719,13 +2725,16 @@ def detect_repairs(query, src_schema: str, accepted,
                         double_encoded_predicate(expr),
                         double_encoded_predicate(
                             REPAIR_TEMPLATE.format(expr))))[0][0])
-            if bad or multi:
-                unrepairable["{0}.{1}".format(table, col)] = bad + multi
-            if n > multi:
+            partial = (int(query("SELECT COUNT(*) FROM `{0}`.`{1}` WHERE {2}".format(
+                src_schema, table, o19_preflight.partial_charset_repair(expr)))[0][0])
+                       if protect_charset_residuals and n > multi else 0)
+            if bad or multi or partial:
+                unrepairable["{0}.{1}".format(table, col)] = bad + multi + partial
+            if n > multi + partial:
                 repairs.setdefault(table, set()).add(col)
                 if notes is not None:
                     notes.append("{0}.{1}: {2} repairable row(s) "
-                                 "detected".format(table, col, n - multi))
+                                 "detected".format(table, col, n - multi - partial))
     if unrepairable:
         flag = o19_preflight.KEEP_UNREPAIRABLE_TEXT
         lines = ["{0}: {1} value(s) with unresolved source encoding".format(
@@ -2749,7 +2758,8 @@ def detect_repairs(query, src_schema: str, accepted,
 
 def effective_entry(table: str, entry: dict,
                     src_cols: Dict[str, dict],
-                    src_tables: Optional[set] = None
+                    src_tables: Optional[set] = None,
+                    protect_charset_residuals: bool = True,
                     ) -> Tuple[dict, List[str]]:
     """Intersect the manifest's column map with what the staged dump
     actually has (case-insensitive): a clinic at a lower patch level may
@@ -2777,6 +2787,8 @@ def effective_entry(table: str, entry: dict,
              and c not in entry.get("archived_cols", {})]
     if exact:
         entry = dict(entry, _exact_charset_columns=exact)
+    if not protect_charset_residuals and entry.get("charset_scan"):
+        entry = dict(entry, **{PROTECT_CHARSET_RESIDUALS: False})
     have = {c.lower() for c in src_cols}
     renames = entry.get("renames", {})
     ve = entry.get("value_exprs", {})
@@ -4026,13 +4038,18 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
         src_info = introspect_columns(plain, src)
     dst_info = introspect_columns(plain, dst)
     src_tables = set(src_info)
+    progress = load_progress(state_dir, ctx.get("dump_sha256"),
+                             o19map_schema.SCHEMA_MAP_VERSION, ETL_CONTRACT_VERSION)
+    # Run and verify a partial copy with its original repair policy.
+    protect_residuals = progress.setdefault(
+        PROTECT_CHARSET_RESIDUALS, not (progress["tables"] or progress.get("admin_provider_no")))
 
     patch_notes: List[str] = []
     effective: Dict[str, dict] = {}
     for table, entry in o19map_schema.TABLES.items():
         if entry["class"] in ("copy", "merge") and table in src_info:
             adjusted, notes = effective_entry(table, entry,
-                                              src_info[table], src_tables)
+                                              src_info[table], src_tables, protect_residuals)
             effective[table] = adjusted
             patch_notes.extend(notes)
     if patch_notes:
@@ -4045,7 +4062,7 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
     charset_audit: dict = {}
     unrepairable_text: Dict[str, int] = {}
     repairs = detect_repairs(plain, src, ctx["accepted"], scan_notes, charset_audit,
-                             unrepairable_text)
+                             unrepairable_text, protect_residuals)
     if scan_notes:
         report("charset scan:\n  " + "\n  ".join(scan_notes))
     if repairs:
@@ -4091,8 +4108,6 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
     for statement in archive_schema_statements(
             arch, schema_collation(plain, dst)):
         plain(statement)
-    progress = load_progress(state_dir, ctx.get("dump_sha256"),
-                             o19map_schema.SCHEMA_MAP_VERSION, ETL_CONTRACT_VERSION)
     # The repair set goes in the ledger because P7's value-level check
     # rebuilds the copy's own expressions and must use the set THAT RAN.
     # Re-deriving it there would be a second scan that could disagree,
@@ -4109,7 +4124,8 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
     legacy_billing = any(prior_billing.get(table, {}).get("billing_started")
                          and not prior_billing[table].get(o19billing.GENERATION_FILES)
                          for table in billing_sources)
-    billing_plan = (o19billing.plan_generations(ctx, src, billing_sources, dst_info)
+    billing_plan = (o19billing.plan_generations(ctx, src, billing_sources, dst_info,
+                                               o19billing.recorded_latest_policy(progress))
                     if billing_sources and not legacy_billing else None)
 
     # Has the target been rewound under this ledger? The pre-import
@@ -4714,6 +4730,7 @@ def copy_content_parity(plain_query, src_schema: str, dst_schema: str,
                         archive_schema: Optional[str] = None,
                         details: Optional[List[str]] = None,
                         post_copy: Optional[Dict[str, Tuple[str, Dict[str, str]]]] = None,
+                        protect_charset_residuals: bool = True,
                         ) -> Tuple[List[str], List[str]]:
     """(ok_lines, mismatch_lines) proving every copied row's target twin
     holds the values the copy wrote. `details`, when given, collects the
@@ -4745,7 +4762,7 @@ def copy_content_parity(plain_query, src_schema: str, dst_schema: str,
         if table not in dst_info or table not in src_info:
             continue        # absent at this patch level: row_parity's
         entry, _notes = effective_entry(table, entry, src_info[table],
-                                        src_tables)
+                                        src_tables, protect_charset_residuals)
         # the same fold P4 applies before it writes (etl_archived_columns).
         # Without it the `import_archived_` columns are invisible here:
         # the copy check would silently not verify requirement B's column
@@ -5017,7 +5034,8 @@ def merge_content_parity(plain_query, src_schema: str, dst_schema: str,
                          repairs: Optional[Dict[str, Sequence[str]]] = None,
                          details: Optional[List[str]] = None,
                          pruned_property_prefixes: Sequence[str] = (),
-                         pruned_property_keys: Sequence[str] = ()
+                         pruned_property_keys: Sequence[str] = (),
+                         protect_charset_residuals: bool = True,
                          ) -> Tuple[List[str], List[str]]:
     """(ok_lines, mismatch_lines) for the merge class, which `row_parity`
     can only count.
@@ -5061,7 +5079,7 @@ def merge_content_parity(plain_query, src_schema: str, dst_schema: str,
         if table not in dst_info or table not in src_info:
             continue        # absent at this patch level: row_parity's
         entry, _notes = effective_entry(table, entry, src_info[table],
-                                        src_tables)
+                                        src_tables, protect_charset_residuals)
         # the same fold P4 applies before it writes (etl_archived_columns).
         # Without it the `import_archived_` columns are invisible here:
         # the copy check would silently not verify requirement B's column

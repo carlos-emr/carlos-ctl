@@ -67,8 +67,9 @@ class TestExactCharsetMariaDB(unittest.TestCase):
                         for n, value in enumerate(values))
         self.query("INSERT INTO `{0}`.drugs VALUES {1}".format(self.src, rows))
 
-    def assessment(self, guarded=True):
-        c = SimpleNamespace(tables={"drugs": "drugs"}, findings=[], query_errors={}, absent_objects={},
+    def assessment(self, guarded=True, tables=("drugs",)):
+        c = SimpleNamespace(tables={table: table for table in tables},
+                            findings=[], query_errors={}, absent_objects={},
                             query=self.source_query,
                             count_live=lambda t, w: int(self.source_query(
                                 "SELECT COUNT(*) FROM `{0}` WHERE {1}".format(t, w))[0][0]))
@@ -158,33 +159,60 @@ class TestExactCharsetMariaDB(unittest.TestCase):
     def test_acknowledged_unrepairable_text_survives_both_copy_paths(self):
         triple = CP.encode().decode("cp1252")
         mixed = CP + " and café"
+        partial = mixed.encode().decode("cp1252")
+        broken_quote = "’".encode().decode("cp1252") + " and café"
+        wrapped_quote = broken_quote.encode().decode("cp1252")
         # The known drug instruction span must not be partially substituted
         # when another part of the same value still needs review.
         special = DASH + UNKNOWN
-        self.seed([special, CP])
+        self.seed([special, wrapped_quote, CP])
         for schema in (self.src, self.dst):
             self.query("CREATE TABLE `{0}`.casemgmt_note (note_id INT PRIMARY KEY, note TEXT) "
                        "CHARACTER SET utf8mb4".format(schema))
-        self.query("INSERT INTO `{0}`.casemgmt_note VALUES (1,{1}),(2,{2}),(3,{3})"
-                   .format(self.src, literal(triple), literal(mixed), literal(CP)))
+        notes = [triple, mixed, partial, wrapped_quote, broken_quote, CP]
+        self.query("INSERT INTO `{0}`.casemgmt_note VALUES {1}".format(self.src, ",".join(
+            "({0},{1})".format(row_id, literal(value)) for row_id, value in enumerate(notes, 1))))
         note_entry = {"class": "copy", "cols": ["note_id", "note"], "charset_scan": ["note"]}
         entries = {"drugs": self.entry, "casemgmt_note": note_entry}
+        findings = self.assessment(tables=entries)
+        blocked = next(f for f in findings if f["id"] == "B8-charset-unrepairable")
+        self.assertEqual(blocked["accept"], pf.KEEP_UNREPAIRABLE_TEXT)
+        self.assertIn("2 row(s) retain mixed encoding", blocked["data"]["casemgmt_note.note"])
+        self.assertIn("2 row(s) retain unresolved encoding", blocked["data"]["drugs.special"])
+        repairable = next(f for f in findings if f["id"] == "charset-mojibake")
+        self.assertEqual(repairable["data"], {"drugs.special": 1, "casemgmt_note.note": 1})
+
         with patch.object(o19etl.o19map_schema, "TABLES", entries):
+            accepted = ["charset-repair", pf.KEEP_UNREPAIRABLE_TEXT]
             retained = {}
-            repairs = o19etl.detect_repairs(
-                self.query, self.src, ["charset-repair", pf.KEEP_UNREPAIRABLE_TEXT], retained=retained)
-            self.assertEqual(retained, {"drugs.special": 1, "casemgmt_note.note": 2})
+            repairs = o19etl.detect_repairs(self.query, self.src, accepted, retained=retained)
+            self.assertEqual(retained, {"drugs.special": 2, "casemgmt_note.note": 5})
             self.copy(repairs)
             note_state = self.run.progress["tables"].setdefault("casemgmt_note", {})
             o19etl.etl_copy_table(self.run, "casemgmt_note", note_entry, note_state,
                                  self.dst_info["casemgmt_note"], repairs["casemgmt_note"])
             for table, col, key, wanted in (
-                    ("drugs", "special", "drugid", [special, "Café"]),
-                    ("casemgmt_note", "note", "note_id", [triple, mixed, "Café"])):
+                    ("drugs", "special", "drugid", [special, wrapped_quote, "Café"]),
+                    ("casemgmt_note", "note", "note_id", notes[:-1] + ["Café"])):
                 self.assertEqual(self.query(
                     "SELECT HEX({0}) FROM `{1}`.{2} ORDER BY {3}".format(col, self.dst, table, key)),
                     [[value.encode().hex().upper()] for value in wanted])
             self.assertEqual(self.parity(repairs)[1], [])
+
+            old_counts = {}
+            o19etl.detect_repairs(self.query, self.src, accepted, retained=old_counts,
+                                  protect_charset_residuals=False)
+            self.assertEqual(old_counts, {"drugs.special": 1, "casemgmt_note.note": 2})
+            self.query("UPDATE `{0}`.casemgmt_note SET note={1} WHERE note_id=3"
+                       .format(self.dst, literal(mixed)))
+            self.query("UPDATE `{0}`.casemgmt_note SET note={1} WHERE note_id=4"
+                       .format(self.dst, literal(broken_quote)))
+            self.query("UPDATE `{0}`.drugs SET special={1} WHERE drugid=38"
+                       .format(self.dst, literal(broken_quote)))
+            self.assertEqual(o19etl.copy_content_parity(
+                self.query, self.src, self.dst, self.src_info, self.dst_info,
+                repairs=repairs, protect_charset_residuals=False)[1], [])
+            self.assertTrue(self.parity(repairs)[1])
 
     def test_should_assess_known_tokens_without_modern_byte_regex(self):
         self.seed([DASH + LE])

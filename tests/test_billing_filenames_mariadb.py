@@ -96,9 +96,16 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
             column, schema or self.dst, table))
 
     def test_retains_only_surviving_generations_and_verifies_full_history(self):
+        self.check_file_backed_generations(assume_latest=False)
+
+    def test_latest_generation_requires_signoff_and_survives_resume(self):
+        self.check_file_backed_generations(assume_latest=True)
+
+    def check_file_backed_generations(self, assume_latest):
         claims, html = o19billing.TABLES
         self.seed(claims, [(1, "claim.001", "2020-01-01"), (2, "claim.001", "2021-01-01"),
-                           (3, "absent.002", "2021-01-02"), (4, "shared.003", "2021-01-03")])
+                           (3, "absent.002", "2021-01-02"), (4, "shared.003", "2021-01-03"),
+                           (5, "unique.004", "2021-01-05")])
         self.seed(html, [(11, "review.html", "2020-01-01"), (12, "review.html", "2021-01-01"),
                          (13, "shared.003", "2021-01-03"), (14, "empty.html", "2021-01-04")])
         self.plain("ALTER TABLE {0}.{1} AUTO_INCREMENT = 100".format(
@@ -109,15 +116,20 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
                 "billing/download/review.html": "new HTML",
                 "billing/download/shared.003": "ambiguous file",
                 "billing/download/empty.html": "",
+                "billing/download/unique.004": "unique claim",
                 "document/absent.002": "same name outside the billing directory",
             })
             ctx = {"query": self.plain, "documents": archive, "target_db": self.dst,
-                   "archive_schema": self.arch, "state_dir": self.ledger.name, "state": {}}
+                   "archive_schema": self.arch, "state_dir": self.ledger.name, "state": {},
+                   "accepted": [o19billing.LATEST_GENERATION_ACCEPT] if assume_latest else []}
             destination = o19etl.introspect_columns(self.plain, self.dst)
             plan = o19billing.plan_generations(
                 ctx, self.src, {claims: claims, html: html}, destination)
-            self.assertEqual(plan.retained(claims), {2: "claim.001"})
-            self.assertEqual(plan.retained(html), {12: "review.html"})
+            expected_claims = {2: "claim.001", 5: "unique.004"} if assume_latest else {5: "unique.004"}
+            expected_html = {12: "review.html"} if assume_latest else {}
+            self.assertEqual(plan.retained(claims), expected_claims)
+            self.assertEqual(plan.retained(html), expected_html)
+            self.assertEqual(plan.repeated_names, 2)
             entries = {}
             for table in (claims, html):
                 run, entry, state, columns = self.run_for(table, chunk=(table == claims))
@@ -127,8 +139,9 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
                                      state, columns, set())
                 self.assertEqual(self.values(table, self.arch), self.values(table, self.src))
 
-            self.assertEqual([row[:2] for row in self.values(claims)], [["2", "claim.001"]])
-            self.assertEqual([row[:2] for row in self.values(html)], [["12", "review.html"]])
+            for table, expected in ((claims, expected_claims), (html, expected_html)):
+                self.assertEqual([row[:2] for row in self.values(table)],
+                                 [[str(row_id), expected[row_id]] for row_id in sorted(expected)])
             self.assertEqual(o19billing.next_generation_id(self.plain, self.dst, claims), 100)
             self.assertEqual(o19billing.next_generation_id(self.plain, self.dst, html), 15)
             root = Path(directory, "restored")
@@ -136,11 +149,18 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
             billing_dir.mkdir(parents=True)
             (billing_dir / "claim.001").write_text("new claim")
             (billing_dir / "review.html").write_text("new HTML")
+            (billing_dir / "unique.004").write_text("unique claim")
+            # A new invocation must verify the stored policy independently
+            # of the current sign-off and any cached preflight plan.
+            ctx.pop("billing_generation_plan")
+            ctx["accepted"] = [] if assume_latest else [o19billing.LATEST_GENERATION_ACCEPT]
             with patch.object(o19import, "STAGING_SCHEMA", self.src), \
                     patch.object(o19etl.o19map_schema, "TABLES", entries):
+                recorded = o19billing.recorded_plan(ctx, o19etl.load_progress(ctx["state_dir"]))
+                self.assertEqual(recorded.assume_latest, assume_latest)
                 self.assertEqual(o19import._row_parity(ctx)[1], [])
                 self.assertEqual(o19billing.generation_file_problems(ctx, str(root)), [])
-                (billing_dir / "claim.001").unlink()
+                (billing_dir / "unique.004").unlink()
                 self.assertTrue(o19billing.generation_file_problems(ctx, str(root)))
                 self.assertEqual(o19import._cleanup_home_parity(ctx)[1], [])
                 self.plain("UPDATE `{0}`.`{1}` SET payload='changed' WHERE id=1"

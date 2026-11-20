@@ -179,10 +179,16 @@ sudo carlos-ctl destroy-data --confirm <server-name>
 ## OSCAR 19 historical billing files
 
 The dry run and live import look for nonempty files in the backed-up billing
-directory. For an exact filename repeated in one generation table, the
-highest ID is retained in the live table with its original filename. The
-full source generation tables, including overwritten and missing-file rows,
-are preserved in `o19_archive` and its CSV export.
+directory. OSCAR can regenerate an older billing file under a shared name,
+so the default live import keeps only unambiguous generations backed by a
+file. The full source generation tables are preserved in `o19_archive`
+and its CSV export. The backup's billing files are restored with the
+documents tree for review.
+
+If the clinic confirms that all eligible files with repeated exact names
+belong to the highest generation IDs, pass
+`--accept latest-billing-generation` before the billing copy starts.
+The dry run shows how that choice affects the live rows.
 
 The root-only `billing-files-details.txt` lists each generation's disposition.
 An external `HOME_DIR` outside the archive and `--skip-documents` leave
@@ -190,14 +196,14 @@ the generation rows in the archive. A file claimed by both billing tables
 or filenames that conflict under the target's unique index are also listed
 there for review.
 
-Imports with billing mappings already written finish under their recorded
-policy. See the application runbook for those mappings. [Legacy billing filename reconciliation](https://github.com/carlos-emr/carlos/blob/main/docs/o19-import-deb.md#historical-ontario-billing-filenames-beta7)
+Imports that already started copying billing generations finish under their
+recorded policy. See the application runbook for those mappings. [Legacy billing filename reconciliation](https://github.com/carlos-emr/carlos/blob/main/docs/o19-import-deb.md#historical-ontario-billing-filenames-beta7)
 
 ## OSCAR 19 text encoding
 
-`--accept keep-unrepairable-text` carries source text as-is when one
-lossless repair cannot resolve the encoding. Dry runs show the affected
-columns and the validation report gives the retained counts.
+`--accept keep-unrepairable-text` carries the full source value when the
+import cannot verify a complete repair. Dry runs show the affected columns
+and the validation report gives the retained counts.
 `--accept charset-repair` authorizes the verified per-value repairs.
 
 ## OSCAR 19 beta8 import compatibility

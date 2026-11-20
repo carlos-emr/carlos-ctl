@@ -49,7 +49,7 @@ import time
 from typing import (Callable, Dict, Iterator, List, Optional,
                     Sequence, Set, Tuple)
 
-from . import (o19_preflight, o19bundle, o19digest, o19docs,
+from . import (o19_preflight, o19billing, o19bundle, o19digest, o19docs,
                o19etl, o19host, o19manifest, o19map_props, o19map_schema,
                o19report, o19sql, o19sources, schema_contract)
 from .util import (die, genpw, genrandom, log, run, warn)
@@ -68,7 +68,7 @@ STATE_DIR = o19host.STATE_DIR
 STAGING_SCHEMA = "o19_import"
 ARCHIVE_SCHEMA = "o19_archive"
 
-# every blocker class an operator may acknowledge (see o19_preflight and
+# every sign-off an operator may give (see o19_preflight and
 # the phase drivers below); anything else passed to --accept is a typo.
 ACCEPT_CLASSES = (
     "archived-forms", "unknown-as-archive", "dropped-columns",
@@ -76,6 +76,7 @@ ACCEPT_CLASSES = (
     "unverified-bundle", "carry-credentials",
     o19docs.MISSING_DOCUMENTS_ACCEPT,
     o19_preflight.KEEP_UNREPAIRABLE_TEXT,
+    o19billing.LATEST_GENERATION_ACCEPT,
     # M22 content integrity: a DISAGREEMENT and a GAP are separate
     # sign-offs. The first says the bytes differ from what the clinic
     # measured; the second says nobody measured. Accepting one must
@@ -611,7 +612,6 @@ def gather_copy_counts(query, db: str) -> Dict[str, int]:
             continue
         counts[table] = int(query(
             "SELECT COUNT(*) FROM `{0}`.`{1}`".format(db, table))[0][0])
-    from . import o19billing
     if o19billing.AUDIT in tables:
         counts[o19billing.AUDIT] = int(query(
             "SELECT COUNT(*) FROM `{0}`.`{1}`".format(db, o19billing.AUDIT))[0][0])
@@ -1839,7 +1839,6 @@ def run_p2(ctx) -> Dict:
     staged_names = {}
     for name in sorted(staged_tables, key=lambda value: (value != value.lower(), value)):
         staged_names.setdefault(name.lower(), name)
-    from . import o19billing
     billing_problems = o19billing.manifest_problems(
         o19map_schema.TABLES,
         [name for name in o19billing.TABLES
@@ -2177,7 +2176,6 @@ def _row_parity(ctx, document_placeholders=()):
     concatenated, so one mismatch anywhere fails the phase."""
     archive = ctx.get("archive_schema", ARCHIVE_SCHEMA)
     progress = o19etl.load_progress(ctx["state_dir"])
-    from . import o19billing
     generations = o19billing.generation_tables(progress)
     ok, bad = o19etl.row_parity(
         ctx["query"], STAGING_SCHEMA, ctx["target_db"],
@@ -2204,7 +2202,7 @@ def _row_parity(ctx, document_placeholders=()):
     billing_ok, billing_bad = o19billing.verify(
         ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive,
         src_info, dst_info, o19map_schema.TABLES, generation_tables=generations,
-        plan=o19billing.recorded_plan(ctx, generations, dst_info))
+        plan=o19billing.recorded_plan(ctx, progress, dst_info))
     # Mapping/audit failures are structural failures, never waivable as
     # accepted content differences: cleanup would otherwise lose originals.
     ok.extend(billing_ok)
@@ -2227,11 +2225,13 @@ def _row_parity(ctx, document_placeholders=()):
     if document_placeholders:
         post_copy["document"] = (o19docs.placeholder_predicate(document_placeholders, "s"),
                                  o19docs.placeholder_values("s"))
+    protect_residuals = progress.get(o19etl.PROTECT_CHARSET_RESIDUALS, False)
     copy_ok, copy_bad = o19etl.copy_content_parity(
         ctx["query"], STAGING_SCHEMA, ctx["target_db"],
         src_info, dst_info,
         repairs=progress.get("repairs"), archive_schema=archive,
-        details=details, post_copy=post_copy)
+        details=details, post_copy=post_copy,
+        protect_charset_residuals=protect_residuals)
     # and the merge class, whose live rows come from two places: the
     # pre-merge snapshot is what lets the check say which is which, so
     # "the seed won" and "the clinic's row arrived" become separate
@@ -2241,7 +2241,8 @@ def _row_parity(ctx, document_placeholders=()):
         src_info, dst_info, repairs=progress.get("repairs"),
         details=details,
         pruned_property_prefixes=o19_preflight.DROPPED_PROP_PREFIXES,
-        pruned_property_keys=o19_preflight.DROPPED_PROP_KEYS)
+        pruned_property_keys=o19_preflight.DROPPED_PROP_KEYS,
+        protect_charset_residuals=protect_residuals)
     preserved_bad = content_bad
     content_ok = content_ok + copy_ok + merge_ok
     content_bad = content_bad + copy_bad + merge_bad
@@ -2891,7 +2892,6 @@ def run_p7(ctx) -> None:
                     o19docs.source_eform_asset_names(entries, source_ctx),
                     o19docs.packaged_eform_asset_names()
                     if not ctx.get("dev_target") else set(), placeholders=placeholders)
-                from . import o19billing
                 doc_problems.extend(o19billing.generation_file_problems(ctx, ctx_root))
                 write_private(os.path.join(ctx["state_dir"], "verify-documents-details.txt"),
                               "\n".join(doc_private + doc_problems) + "\n"
@@ -3202,7 +3202,6 @@ def _cleanup_home_parity(ctx) -> Tuple[List[str], List[str]]:
     writes, so they are re-counted -- and re-digested -- here, exactly,
     at the moment of the drop."""
     archive = ctx.get("archive_schema", ARCHIVE_SCHEMA)
-    from . import o19billing
     progress = o19etl.load_progress(ctx["state_dir"])
     generations = o19billing.generation_tables(progress)
     kept_ok, kept_bad = o19etl.preserved_parity(
@@ -3524,14 +3523,15 @@ def _parser(prog: str, import_mode: bool) -> argparse.ArgumentParser:
                          "that differs from it is refused (default: the "
                          "host's own). It selects the manifest profile "
                          "this build carries for that province")
-    # The assessment can check attachments when a bundle carries the tar.
+    # The host assessment can check attachments and billing files in the tar.
     # Keep the other import-side choices valid for scripts sharing options.
     advertised = (ACCEPT_CLASSES if import_mode else
                   tuple(o19_preflight.ACCEPT_IDS)
-                  + ("unverified-bundle", o19docs.MISSING_DOCUMENTS_ACCEPT))
+                  + ("unverified-bundle", o19docs.MISSING_DOCUMENTS_ACCEPT,
+                     o19billing.LATEST_GENERATION_ACCEPT))
     ap.add_argument("--accept", action="append", default=[],
                     metavar="CLASS", choices=list(ACCEPT_CLASSES),
-                    help="acknowledge a blocker class (repeatable): "
+                    help="record a review decision (repeatable): "
                          + ", ".join(advertised)
                          + ("" if import_mode else
                             " (not recorded: this verb persists no "
