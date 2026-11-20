@@ -1467,10 +1467,10 @@ class TestCleanupEndToEnd(unittest.TestCase):
         from carlos_ctl import o19etl
         calls = []
         with mock.patch.object(o19etl, "preserved_parity",
-                               lambda *a: (calls.append("kept") or
+                               lambda *a, **k: (calls.append("kept") or
                                            (["kept ok"], []))), \
                 mock.patch.object(o19etl, "preserved_content_parity",
-                                  lambda *a: (calls.append("content") or
+                                  lambda *a, **k: (calls.append("content") or
                                               (["content ok"], []))), \
                 mock.patch.object(o19etl, "row_parity",
                                   lambda *a, **k: (calls.append("LIVE")
@@ -1490,12 +1490,12 @@ class TestCleanupEndToEnd(unittest.TestCase):
     def test_a_missing_archive_copy_still_stops_the_drop(self):
         from carlos_ctl import o19etl
         with mock.patch.object(o19etl, "preserved_parity",
-                               lambda *a: ([], ["cr_user: 12 staging "
+                               lambda *a, **k: ([], ["cr_user: 12 staging "
                                                 "row(s) and no copy at "
                                                 "carlos.import_archived_"
                                                 "cr_user"])), \
                 mock.patch.object(o19etl, "preserved_content_parity",
-                                  lambda *a: ([], [])):
+                                  lambda *a, **k: ([], [])):
             ok, bad = o19import._cleanup_home_parity(
                 {"query": self.query, "target_db": "carlos",
                  "state_dir": self.state_dir})

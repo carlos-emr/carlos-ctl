@@ -169,10 +169,8 @@ LATIN1_UTF8_BYTE_PATTERN = o19_preflight.LATIN1_UTF8_BYTE_PATTERN
 
 
 def repair_expr(expr: str, exact: bool = False) -> str:
-    """One acknowledged repair path, shared with standalone assessment."""
-    if exact:
-        return o19_preflight.exact_charset_candidate(expr)
-    return o19_preflight.guarded_legacy_repair_expr(expr)
+    """One verified repair path, shared with the assessment."""
+    return o19_preflight.validated_charset_repair(expr, exact)
 
 
 # --------------------------------------------------------------------------
@@ -830,10 +828,14 @@ def copy_statement(table: str, entry: dict, src_schema: str,
         + [literal for _, literal in supplied])
     sql = ("INSERT INTO `{0}`.`{1}` ({2}) SELECT {3} FROM `{4}`.`{1}` s"
            .format(dst_schema, table, targets, exprs, src_schema))
+    conditions = []
+    if entry.get(o19billing.GENERATION_FILES):
+        conditions.append(o19billing.retained_predicate(table, archive_schema))
     if window:
         chunk = entry["chunk_by"]
-        sql += (" WHERE s.`{0}` > {1} AND s.`{0}` <= {2}"
-                .format(chunk, window[0], window[1]))
+        conditions.append("s.`{0}` > {1} AND s.`{0}` <= {2}".format(chunk, *window))
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
     return sql
 
 
@@ -2579,7 +2581,7 @@ def load_progress(state_dir: str, dump_sha256: Optional[str] = None,
         if (not isinstance(measured, dict)
                 or set(measured) != {"rows", "bad", "rules"}
                 or type(measured.get("rows")) is not int or measured["rows"] <= 0
-                or type(measured.get("bad")) is not int or measured["bad"] != 0
+                or type(measured.get("bad")) is not int or measured["bad"] < 0
                 or not isinstance(measured.get("rules"), dict)
                 or set(measured["rules"]) != names
                 or any(type(n) is not int or not 0 <= n <= measured["rows"]
@@ -2645,16 +2647,16 @@ def absent_object_error(exc: Exception) -> bool:
 
 def detect_repairs(query, src_schema: str, accepted,
                    notes: Optional[List[str]] = None,
-                   audit: Optional[dict] = None) -> Dict[str, set]:
-    """Charset scan: {table: {columns holding double-encoded rows}} — and
-    hard-stop (B8) if rows look double-encoded but cannot be repaired
-    losslessly, or if repair is needed but unacknowledged. The repair
+                   audit: Optional[dict] = None,
+                   retained: Optional[Dict[str, int]] = None) -> Dict[str, set]:
+    """Scan for repairable and unrepairable values and check each sign-off.
+    The result maps tables to columns with repairable values. The repair
     itself is applied per ROW (repair_expr), never to a whole column. A
     scan query that fails for any reason other than the column being
     absent from this dump raises (never "clean")."""
     from .util import die
     repairs: Dict[str, set] = {}
-    unrepairable = []
+    unrepairable: Dict[str, int] = {}
     for table, entry in o19map_schema.TABLES.items():
         for col in entry.get("charset_scan", ()):
             expr = "`{0}`".format(col)
@@ -2669,7 +2671,7 @@ def detect_repairs(query, src_schema: str, accepted,
                         continue
                     raise RuntimeError("charset scan of {0}.{1} failed: {2}".format(table, col, exc)) from exc
                 if measured["bad"]:
-                    unrepairable.append("{0}.{1} ({2} row(s) retain unresolved encoding markers after one approved repair path)".format(table, col, measured["bad"]))
+                    unrepairable["{0}.{1}".format(table, col)] = measured["bad"]
                 if measured["rows"]:
                     targets = {c for c in entry.get("cols", (col,))
                                if entry.get("renames", {}).get(c, c) == col
@@ -2706,9 +2708,6 @@ def detect_repairs(query, src_schema: str, accepted,
                 "{2} REGEXP {3} AND NOT ({4})".format(
                     src_schema, table, expr, MOJIBAKE_MARKER_RE,
                     double_encoded_predicate(expr)))[0][0])
-            if bad:
-                unrepairable.append("{0}.{1} ({2} row(s))".format(
-                    table, col, bad))
             # Thrice-encoded text SATISFIES the predicate — it round-trips
             # — so it is not in `bad`, and one repair hop leaves it still
             # mojibake while the report says the repair handled it. The
@@ -2720,21 +2719,25 @@ def detect_repairs(query, src_schema: str, accepted,
                         double_encoded_predicate(expr),
                         double_encoded_predicate(
                             REPAIR_TEMPLATE.format(expr))))[0][0])
-            if multi:
-                unrepairable.append(
-                    "{0}.{1} ({2} row(s) still double-encoded after one "
-                    "repair — encoded more than twice)".format(
-                        table, col, multi))
-            if n:
+            if bad or multi:
+                unrepairable["{0}.{1}".format(table, col)] = bad + multi
+            if n > multi:
                 repairs.setdefault(table, set()).add(col)
                 if notes is not None:
-                    notes.append("{0}.{1}: {2} double-encoded row(s) "
-                                 "detected".format(table, col, n))
+                    notes.append("{0}.{1}: {2} repairable row(s) "
+                                 "detected".format(table, col, n - multi))
     if unrepairable:
-        die("B8: text that looks double-encoded but does not round-trip "
-            "through the standard latin1->utf8mb4 repair:\n  "
-            + "\n  ".join(unrepairable)
-            + "\nThis needs manual investigation — no flag overrides it.")
+        flag = o19_preflight.KEEP_UNREPAIRABLE_TEXT
+        lines = ["{0}: {1} value(s) with unresolved source encoding".format(
+            column, count) for column, count in sorted(unrepairable.items())]
+        if flag not in accepted:
+            die("B8: the lossless charset repair could not verify these values:\n  "
+                + "\n  ".join(lines)
+                + "\nRe-run with --resume --accept {0} to carry the original text.".format(flag))
+        if retained is not None:
+            retained.update(unrepairable)
+        if notes is not None:
+            notes.extend(line + " kept as stored in OSCAR 19" for line in lines)
     if repairs and "charset-repair" not in accepted:
         cols = sorted("{0}.{1}".format(t, c)
                       for t, cs in repairs.items() for c in cs)
@@ -3533,6 +3536,8 @@ def etl_copy_table(run: 'EtlRun', table: str, entry: dict, tstate: dict,
         run.copy_primary_keys = primary_key_columns(plain, dst)
     key = run.copy_primary_keys.get(table) or []
     pairable = bool(key) and all(column in entry["cols"] and column in dcols for column in key)
+    if entry.get(o19billing.GENERATION_FILES) and (not pairable or key != ["id"]):
+        raise QueryError(table + ": file-backed billing generations require the primary key id")
     if (not pairable and not entry.get("replace_seed")
             and table not in seed_group and not tstate.get("started")):
         before = int(plain("SELECT COUNT(*) FROM `{0}`.`{1}`".format(dst, table))[0][0])
@@ -4038,7 +4043,9 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
     # below must measure the text as it will be stored, i.e. repaired
     scan_notes: List[str] = []
     charset_audit: dict = {}
-    repairs = detect_repairs(plain, src, ctx["accepted"], scan_notes, charset_audit)
+    unrepairable_text: Dict[str, int] = {}
+    repairs = detect_repairs(plain, src, ctx["accepted"], scan_notes, charset_audit,
+                             unrepairable_text)
     if scan_notes:
         report("charset scan:\n  " + "\n  ".join(scan_notes))
     if repairs:
@@ -4094,7 +4101,16 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
     # mojibake (a restage) does not verify against the old set.
     progress["repairs"] = dict((t, sorted(cs)) for t, cs in repairs.items())
     progress["charset_rules"] = charset_audit
+    progress["unrepairable_text"] = unrepairable_text
     save_progress(state_dir, progress)
+    billing_sources = {table: table for table in o19billing.TABLES
+                       if o19billing.mapped(table, effective.get(table, {}))}
+    prior_billing = progress.get("tables", {})
+    legacy_billing = any(prior_billing.get(table, {}).get("billing_started")
+                         and not prior_billing[table].get(o19billing.GENERATION_FILES)
+                         for table in billing_sources)
+    billing_plan = (o19billing.plan_generations(ctx, src, billing_sources, dst_info)
+                    if billing_sources and not legacy_billing else None)
 
     # Has the target been rewound under this ledger? The pre-import
     # restic snapshot covers the workspace as well as the CARLOS schema
@@ -4205,7 +4221,9 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
             etl_merge_table(run, table, entry, tstate, dcols, repaired)
         else:
             if table in o19billing.TABLES:
-                o19billing.prepare(run, table, entry, tstate, dcols)
+                o19billing.prepare(run, table, entry, tstate, dcols, billing_plan)
+                if billing_plan is not None:
+                    entry = dict(entry, **{o19billing.GENERATION_FILES: True})
             ranked = table == CONSENT_TABLE and consent_live_ranked(entry)
             if ranked:
                 etl_consent_live(run, entry, tstate, dcols)
@@ -4592,6 +4610,8 @@ def copy_value_mismatch_sql(table: str, entry: dict, src_schema: str,
     predicate = "NOT ({0})".format(same)
     if include_missing:
         predicate = "(d.{0} IS NULL OR {1})".format(ident(key[0]), predicate)
+    if entry.get(o19billing.GENERATION_FILES):
+        predicate += " AND " + o19billing.retained_predicate(table, archive_schema)
     if window:
         predicate += " AND s.{0} > {1} AND s.{0} <= {2}".format(ident(entry["chunk_by"]), *window)
     return ("SELECT {0} FROM `{1}`.`{2}` s {6}JOIN `{3}`.`{2}` d ON {4} "
@@ -5174,7 +5194,7 @@ def _merge_table_parity(plain_query, table: str, entry: dict,
 
 
 def preserved_content_parity(plain_query, src_schema: str, dst_schema: str,
-                             archive_schema: str
+                             archive_schema: str, archived_copy_tables=(),
                              ) -> Tuple[List[str], List[str]]:
     """(ok_lines, mismatch_lines) proving each preserved table arrived
     with the same VALUES, not merely the same number of rows.
@@ -5211,13 +5231,14 @@ def preserved_content_parity(plain_query, src_schema: str, dst_schema: str,
     for table in sorted(src_tables):
         entry = o19map_schema.TABLES.get(table)
         cls = entry["class"] if entry else "unknown"
-        if entry and cls not in PRESERVED_CLASSES + ("merge",):
+        archived_copy = table in archived_copy_tables
+        if entry and cls not in PRESERVED_CLASSES + ("merge",) and not archived_copy:
             continue        # copy: row_parity's business
         spec = columns[src_schema].get(table)
         if not spec:
             continue        # a table with no columns cannot be hashed
         homes = [(archive_schema, table, arch_tables)]
-        if cls not in ARCHIVE_ONLY_CLASSES:
+        if cls not in ARCHIVE_ONLY_CLASSES and not archived_copy:
             homes.append((dst_schema, archived_table(table), dst_tables))
         homes = [(schema, name, present) for schema, name, present in homes
                  if name in present]
@@ -5283,7 +5304,7 @@ def _shape_difference(expected: Sequence[Tuple[str, str]],
 
 
 def preserved_parity(plain_query, src_schema: str, dst_schema: str,
-                     archive_schema: str) -> Tuple[List[str], List[str]]:
+                     archive_schema: str, archived_copy_tables=()) -> Tuple[List[str], List[str]]:
     """(ok_lines, mismatch_lines) proving no staging row was orphaned.
 
     `row_parity` checks the tables CARLOS has a home for. This checks the
@@ -5312,13 +5333,14 @@ def preserved_parity(plain_query, src_schema: str, dst_schema: str,
     for table in sorted(src_tables):
         entry = o19map_schema.TABLES.get(table)
         cls = entry["class"] if entry else "unknown"
-        if entry and cls not in PRESERVED_CLASSES + ("merge",):
+        archived_copy = table in archived_copy_tables
+        if entry and cls not in PRESERVED_CLASSES + ("merge",) and not archived_copy:
             continue        # copy: row_parity's business
         src_n = count(src_schema, table)
         if src_n == 0:
             continue
         homes = [(archive_schema, table, arch_tables)]
-        if cls not in ARCHIVE_ONLY_CLASSES:
+        if cls not in ARCHIVE_ONLY_CLASSES and not archived_copy:
             homes.append((dst_schema, archived_table(table), dst_tables))
         counts = []
         for schema, name, present in homes:
@@ -5373,7 +5395,8 @@ def archived_column_exclusions(table: str,
 def archived_column_parity(plain_query, src_schema: str, dst_schema: str,
                            pruned_property_prefixes: Sequence[str] = (),
                            pruned_property_keys: Sequence[str] = (),
-                           archive_schema: Optional[str] = None
+                           archive_schema: Optional[str] = None,
+                           billing_generations=(),
                            ) -> Tuple[List[str], List[str]]:
     """(ok_lines, mismatch_lines) for the `import_archived_` COLUMNS.
 
@@ -5428,6 +5451,8 @@ def archived_column_parity(plain_query, src_schema: str, dst_schema: str,
             for predicate in archived_column_exclusions(
                     table, pruned_property_prefixes, pruned_property_keys):
                 src_sql += " AND NOT ({0})".format(predicate)
+            if table in billing_generations:
+                src_sql += " AND " + o19billing.retained_predicate(table, archive_schema)
             src_n = int(plain_query(src_sql)[0][0])
             surplus = twin_surplus(plain_query, table, source, src_sql,
                                    src_schema, archive_schema,
@@ -5503,7 +5528,8 @@ def row_parity(plain_query, src_schema: str, dst_schema: str,
                dst_info: Optional[Dict[str, Dict[str, dict]]] = None,
                archive_schema: Optional[str] = None,
                pruned_property_prefixes: Optional[Sequence[str]] = None,
-               pruned_property_keys: Optional[Sequence[str]] = None
+               pruned_property_keys: Optional[Sequence[str]] = None,
+               billing_generations=(),
                ) -> Tuple[List[str], List[str]]:
     """(ok_lines, mismatch_lines) comparing staging vs target counts for
     every copy-class table, and merge tables in reverse.
@@ -5590,6 +5616,10 @@ def row_parity(plain_query, src_schema: str, dst_schema: str,
             dst_schema, table))[0][0])
         expected = src_n
         note = ""
+        if table in billing_generations:
+            expected = int(plain_query("SELECT COUNT(*) FROM {0}.{1}".format(
+                ident(archive_schema), ident(o19billing.helper(table))))[0][0])
+            note = " ({0} source generation row(s) archive-only)".format(src_n - expected)
         if admin_user and admin_provider_no:
             sql = admin_row_count_sql(table, dst_schema, admin_user,
                                       admin_provider_no)

@@ -39,10 +39,10 @@ arguments, unreadable file, database error) — never confused with a
 verdict. Blocker classes this mode can acknowledge (--accept, repeatable):
 archived-forms, unknown-as-archive, olis-gone, dropped-columns,
 carry-credentials (B9 — live OAuth consumer secrets or signing keys the
-copy would carry verbatim; rotate or verify them before go-live) and
-charset-repair (double-encoded text repaired per row on the copy; B8 is
-the neighbouring HARD stop for text that does not round-trip, which no
-flag clears). The
+copy would carry verbatim; rotate or verify them before go-live),
+charset-repair (apply a lossless repair per value), and
+keep-unrepairable-text (carry the source text when a repair cannot be
+verified). The
 remaining import-side sign-offs belong to phases this mode never runs.
 The JSON report (--json) is the machine contract.
 
@@ -1730,10 +1730,12 @@ def load_manifest(data):
 BLOCKER = "blocker"
 ADVISORY = "advisory"
 INFO = "info"
+KEEP_UNREPAIRABLE_TEXT = "keep-unrepairable-text"
 #: the blocker classes an assessment can acknowledge (a subset of the
 #: import verb's --accept classes; a typo must not read as "accepted")
 ACCEPT_IDS = ("archived-forms", "unknown-as-archive", "olis-gone",
-              "dropped-columns", "carry-credentials", "charset-repair")
+              "dropped-columns", "carry-credentials", "charset-repair",
+              KEEP_UNREPAIRABLE_TEXT)
 #: copy-class tables whose rows are live credentials (OAuth consumer
 #: secrets, signing keys); mirrors o19map_schema.CREDENTIAL_TABLES
 CREDENTIAL_TABLES = ("ServiceClient", "ServiceAccessToken", "oscarKeys", "publicKeys")
@@ -1741,9 +1743,7 @@ CREDENTIAL_TABLES = ("ServiceClient", "ServiceAccessToken", "oscarKeys", "public
 # exit code for "the check itself failed" — distinct from every verdict
 EXIT_TOOL_ERROR = 3
 
-#: findings that mean "a P4 refusal was NOT measured here". They are not
-#: blockers -- nothing was found -- but nothing was LOOKED for either,
-#: and every class behind them refuses at P4 with no --accept, so
+#: Findings for checks that must be completed on the target server.
 #: render_text repeats them beside the bundling recipe: a `go` above
 #: that recipe otherwise reads as a green light for the whole import.
 UNMEASURED_FINDING_IDS = ("column-checks-deferred", "charset-b8-unmeasured",
@@ -2028,6 +2028,31 @@ def exact_charset_candidate(expr):
         guarded_legacy_repair_expr(expr))
 
 
+def needs_another_charset_pass(expr):
+    return "NOT (BINARY {0} <=> BINARY CONVERT({1} USING utf8mb4))".format(
+        guarded_legacy_repair_expr(expr), expr)
+
+
+def exact_charset_bad_candidate(expr):
+    repeated = needs_another_charset_pass(expr)
+    marker = ("CONVERT({0} USING utf8mb4) COLLATE utf8mb4_general_ci "
+              "REGEXP {1}").format(expr, MOJIBAKE_MARKER_RE)
+    residual = ("CONVERT({0} USING utf8mb4) COLLATE utf8mb4_bin "
+                "REGEXP '[\\\\x{{E2}}][\\\\x{{80}}-\\\\x{{9F}}]'").format(expr)
+    return "{0} IS NOT NULL AND ({1} OR {2} OR {3})".format(
+        expr, residual, marker, repeated)
+
+
+def validated_charset_repair(expr, exact=False):
+    """Carry the original value when one approved repair leaves doubt."""
+    candidate = (exact_charset_candidate(expr) if exact else
+                 guarded_legacy_repair_expr(expr))
+    bad = (exact_charset_bad_candidate(candidate) if exact else
+           needs_another_charset_pass(candidate))
+    return "CASE WHEN {0} THEN CONVERT({1} USING utf8mb4) ELSE {2} END".format(
+        bad, expr, candidate)
+
+
 def checked_charset_count(query, qualified_table, where):
     rows = query("SELECT COUNT(*) FROM {0} WHERE {1}; "
                  "SHOW COUNT(*) WARNINGS".format(qualified_table, where))
@@ -2053,26 +2078,17 @@ def exact_charset_counts(query, qualified_table, expr):
     known = exact_charset_match("original")
     changed = "NOT (BINARY candidate <=> BINARY " \
         "CONVERT(original USING utf8mb4))"
-    # A second guarded hop changing the candidate means one hop did not
-    # finish. Neither a flag nor a known token elsewhere can clear it.
-    repeated = "NOT (BINARY {0} <=> BINARY candidate)".format(
-        guarded_legacy_repair_expr("candidate"))
-    marker = "CONVERT(candidate USING utf8mb4) COLLATE " \
-        "utf8mb4_general_ci REGEXP {0}".format(MOJIBAKE_MARKER_RE)
-    # Modern engines can scan this Unicode span in one pass; keep the
-    # 32 portable LOCATE checks for old source engines only.
-    residual = ("CONVERT(candidate USING utf8mb4) COLLATE utf8mb4_bin "
-                "REGEXP '[\\\\x{E2}][\\\\x{80}-\\\\x{9F}]'")
-    bad = "candidate IS NOT NULL AND ({0} OR {1} OR {2})".format(
-        residual, marker, repeated)
+    bad = exact_charset_bad_candidate("candidate")
+    repairable = "({0} OR {1}) AND NOT ({2})".format(known, changed, bad)
     result = {
-        "rows": checked_charset_count(query, relation, known + " OR " + changed),
+        "rows": checked_charset_count(query, relation, repairable),
         "bad": checked_charset_count(query, relation, bad),
         "rules": {},
     }
     for rule in EXACT_CHARSET_RULES:
         result["rules"][rule[0]] = checked_charset_count(
-            query, relation, exact_charset_match("original", (rule,)))
+            query, relation, "{0} AND NOT ({1})".format(
+                exact_charset_match("original", (rule,)), bad))
     return result
 
 
@@ -3634,8 +3650,8 @@ def check_text_encoding(c):
                  raw latin1 bytes, the ordinary state of a database that
                  has been through a charset move).
 
-    The last two are B8: `die("...no flag overrides it")` at P4, after
-    the pre-import snapshot and the full staging restore. `multi` is pure
+    The last two are B8 and require --accept keep-unrepairable-text.
+    `multi` is pure
     CONVERT/LENGTH and runs anywhere; `bad` needs a regex engine the
     2014-era assessment host may not have, so when the probe says it
     cannot be trusted the report SAYS the stop was not measured rather
@@ -3708,8 +3724,6 @@ def check_text_encoding(c):
             # These lanes are disjoint: the exact C1 sequences cannot
             # round-trip through the Windows-1252 predicate.
             n += known
-            if n > 0:
-                mojibake[label] = n
             multi = count_live(t, "({0}) AND ({1})".format(
                 double_encoded_predicate(col),
                 double_encoded_expr(REPAIR_TEMPLATE.format(quoted))))
@@ -3719,6 +3733,8 @@ def check_text_encoding(c):
                 unrepairable.setdefault(label, []).append(
                     "{0} row(s) still double-encoded after one repair — "
                     "encoded more than twice".format(multi))
+            if n > multi:
+                mojibake[label] = n - multi
             if not marker_scan:
                 continue
             if exact:
@@ -3755,20 +3771,16 @@ def check_text_encoding(c):
             "charset-exact-unmeasured", ADVISORY,
             "full drugs.special candidate validation runs on the target",
             "Exact-pattern and ISO-style C1 counts were measured here. "
-            "This source cannot run the guarded target decoder; remaining "
-            "candidate checks run before copying and can still stop as B8."))
+            "The target verifies repair candidates before copying. It "
+            "requires sign-off for values that need to be kept as-is."))
     if unrepairable:
-        # B8: no --accept clears this one on either side. The ETL dies on
-        # it before the charset-repair question is even asked, so the
-        # assessment must not offer a flag here either.
         findings.append(finding(
             "B8-charset-unrepairable", BLOCKER,
             "text in {0} column(s) that the latin1->utf8mb4 repair "
             "cannot fix".format(len(unrepairable)),
-            "The ETL stops outright on this (B8) at P4 — after the "
-            "pre-import snapshot and the full staging restore — and no "
-            "--accept flag overrides it. Repair the text in the source "
-            "and re-export.",
+            "With --accept keep-unrepairable-text, the import keeps "
+            "these values as stored in OSCAR 19 for clinical review.",
+            accept=KEEP_UNREPAIRABLE_TEXT,
             data=dict((k, "; ".join(v)) for k, v in unrepairable.items())))
     if mojibake:
         # a BLOCKER, not an advisory: the ETL refuses outright without
@@ -3779,22 +3791,19 @@ def check_text_encoding(c):
             "charset-mojibake", BLOCKER,
             "double-encoded text detected in {0} column(s)"
             .format(len(mojibake)),
-            "The ETL's per-row charset repair handles this but refuses "
-            "to run unacknowledged; text the repair cannot round-trip "
-            "blocks there outright (B8).", accept="charset-repair",
+            "The import applies the lossless repair per value with "
+            "--accept charset-repair.", accept="charset-repair",
             data=mojibake))
     if not marker_scan:
         findings.append(finding(
             "charset-b8-unmeasured", ADVISORY,
-            "one half of the B8 charset stop could not be measured on "
+            "some unrepairable text could not be measured on "
             "this server",
             "This server's regex engine does not understand the "
             "\\x{NN} escapes the mojibake byte signature needs (MySQL < "
             "8 / MariaDB < 10.0.5), so mixed-encoding text — mojibake "
-            "bytes beside raw latin1 bytes — was NOT counted. The ETL "
-            "does count it, at P4, and stops there with no --accept. "
-            "The thrice-encoded half of B8 WAS measured. Treat a `go` "
-            "as silent about this one class."))
+            "bytes beside raw latin1 bytes — will be counted on the "
+            "target. Values encoded more than twice were checked here."))
 
 
 def unknown_columns(entry, col_names):
@@ -4152,10 +4161,8 @@ def render_text(report):
                      "not a clearance of them:")
         for f in unmeasured:
             lines.append("  - " + f["title"])
-        lines.append("  Each is a refusal the import makes at P4, after "
-                     "the pre-import snapshot and the")
-        lines.append("  full staging restore, and no --accept clears "
-                     "one. See the findings above.")
+        lines.append("  The target completes these checks before copying. "
+                     "See the findings above for how to proceed.")
     lines.append("")
     lines.append("Next step on a 'go': bundle the three inputs on this "
                  "server and ship them to the CARLOS host:")

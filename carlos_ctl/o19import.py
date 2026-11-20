@@ -75,6 +75,7 @@ ACCEPT_CLASSES = (
     "charset-repair", "olis-gone", "no-documents", "no-pre-backup",
     "unverified-bundle", "carry-credentials",
     o19docs.MISSING_DOCUMENTS_ACCEPT,
+    o19_preflight.KEEP_UNREPAIRABLE_TEXT,
     # M22 content integrity: a DISAGREEMENT and a GAP are separate
     # sign-offs. The first says the bytes differ from what the clinic
     # measured; the second says nobody measured. Accepting one must
@@ -1850,20 +1851,17 @@ def run_p2(ctx) -> Dict:
     active_billing = [name for name in o19billing.TABLES
                       if name.lower() in {item.lower() for item in staged_tables}
                       and o19billing.mapped(name, o19map_schema.TABLES.get(name, {}))]
-    if active_billing and not billing_problems:
+    if ctx.get("documents"):
+        report["findings"].extend(o19docs.source_document_findings(ctx, STAGING_SCHEMA, staged_names))
+    if (active_billing and not billing_problems
+            and (not ctx.get("documents") or "document_archive" in ctx)):
         target_columns = o19etl.introspect_columns(query, ctx["target_db"])
         billing_sources = {name: staged_names[name.lower()] for name in active_billing}
-        for table in active_billing:
-            column = o19billing.TABLES[table][0]
-            count = o19billing.collision_count(query, table, STAGING_SCHEMA,
-                                               target_columns[table][column], staged_names[table.lower()],
-                                               billing_sources)
-            if count:
-                report["findings"].append(o19_preflight.finding(
-                    "historical-billing-filenames", o19_preflight.ADVISORY,
-                    "{0}: {1} historical filename row(s) need disambiguation".format(table, count),
-                    "Every member of a colliding group receives a unique name. Original values and files "
-                    "are preserved; shared files require reconciliation before downloading/regenerating."))
+        plan = o19billing.plan_generations(ctx, STAGING_SCHEMA, billing_sources, target_columns)
+        for line in o19billing.report_generations(ctx, plan):
+            report["findings"].append(o19_preflight.finding(
+                "historical-billing-filenames", o19_preflight.ADVISORY, line,
+                "See billing-files-details.txt for the source files and generation IDs."))
     has_consent = any(name.lower() == o19etl.CONSENT_TABLE.lower()
                       for name in staged_tables)
     if (has_consent and (not consent or consent.get("class") != "copy"
@@ -1873,8 +1871,6 @@ def run_p2(ctx) -> Dict:
             "the installed application manifest lacks the Consent import rule",
             "Install the compatible fixed carlos-emr/carlos-ctl pair. "
             "Unmodified older package files can carry this incompatible mapping."))
-    if ctx.get("documents"):
-        report["findings"].extend(o19docs.source_document_findings(ctx, STAGING_SCHEMA, staged_names))
     verdict, code, acknowledged, outstanding = o19_preflight.preflight_verdict(
         report["findings"], ctx["accepted"])
     report.update(verdict=verdict, exit_code=code, acknowledged=acknowledged,
@@ -2181,6 +2177,8 @@ def _row_parity(ctx, document_placeholders=()):
     concatenated, so one mismatch anywhere fails the phase."""
     archive = ctx.get("archive_schema", ARCHIVE_SCHEMA)
     progress = o19etl.load_progress(ctx["state_dir"])
+    from . import o19billing
+    generations = o19billing.generation_tables(progress)
     ok, bad = o19etl.row_parity(
         ctx["query"], STAGING_SCHEMA, ctx["target_db"],
         admin_user=(progress.get("admin_user") or ctx.get("admin_user")),
@@ -2189,23 +2187,24 @@ def _row_parity(ctx, document_placeholders=()):
         dst_info=o19etl.introspect_columns(ctx["query"], ctx["target_db"]),
         archive_schema=archive,
         pruned_property_prefixes=o19_preflight.DROPPED_PROP_PREFIXES,
-        pruned_property_keys=o19_preflight.DROPPED_PROP_KEYS)
+        pruned_property_keys=o19_preflight.DROPPED_PROP_KEYS,
+        billing_generations=generations)
     kept_ok, kept_bad = o19etl.preserved_parity(
-        ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive)
+        ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive, archived_copy_tables=generations)
     # the same tables again, by VALUE this time: the three parity checks
     # above all COUNT, and a copy that moved the right number of rows
     # with the wrong values passes every one of them
     content_ok, content_bad = o19etl.preserved_content_parity(
-        ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive)
+        ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive, archived_copy_tables=generations)
     # and the copy class, where a declared transform sits between the two
     # sides: rebuilt from the copy's OWN expressions, so the check cannot
     # model the copy differently from the copy
     src_info = o19etl.introspect_columns(ctx["query"], STAGING_SCHEMA)
     dst_info = o19etl.introspect_columns(ctx["query"], ctx["target_db"])
-    from . import o19billing
     billing_ok, billing_bad = o19billing.verify(
         ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive,
-        src_info, dst_info, o19map_schema.TABLES)
+        src_info, dst_info, o19map_schema.TABLES, generation_tables=generations,
+        plan=o19billing.recorded_plan(ctx, generations, dst_info))
     # Mapping/audit failures are structural failures, never waivable as
     # accepted content differences: cleanup would otherwise lose originals.
     ok.extend(billing_ok)
@@ -2302,7 +2301,7 @@ def _row_parity(ctx, document_placeholders=()):
         ctx["query"], STAGING_SCHEMA, ctx["target_db"],
         pruned_property_prefixes=o19_preflight.DROPPED_PROP_PREFIXES,
         pruned_property_keys=o19_preflight.DROPPED_PROP_KEYS,
-        archive_schema=ctx["archive_schema"])
+        archive_schema=ctx["archive_schema"], billing_generations=generations)
     return (ok + kept_ok + col_ok + content_ok,
             bad + kept_bad + col_bad + content_bad)
 
@@ -2653,6 +2652,12 @@ def import_report(ctx, progress: Dict, parity_ok: Sequence[str],
         findings.append(o19report.finding(
             "advisory", "content mismatch(es) accepted with --accept "
                         "content-migration", body))
+    retained_text = progress.get("unrepairable_text") or {}
+    if retained_text:
+        findings.append(o19report.finding(
+            "advisory", "source text kept under --accept " + o19_preflight.KEEP_UNREPAIRABLE_TEXT,
+            ["{0}: {1} value(s) copied as stored in OSCAR 19".format(column, count)
+             for column, count in sorted(retained_text.items())]))
     for title, key in (("surrogate ids reassigned on merge", "idmap"),
                        ("historical billing filenames and file reconciliation", "billing"),
                        ("dangling foreign keys in the source", "fk"),
@@ -2684,6 +2689,9 @@ def import_report(ctx, progress: Dict, parity_ok: Sequence[str],
         verdict = "PASSED"
     if not problems and phases.get("documents", {}).get("placeholders"):
         verdict += " — {0} SOURCE-DOCUMENT PLACEHOLDER(S)".format(phases["documents"]["placeholders"])
+    if not problems and retained_text:
+        verdict += " — {0} TEXT VALUE(S) KEPT WITH SOURCE ENCODING ISSUES".format(
+            sum(retained_text.values()))
     return o19report.build(
         header,
         verdict,
@@ -2883,11 +2891,13 @@ def run_p7(ctx) -> None:
                     o19docs.source_eform_asset_names(entries, source_ctx),
                     o19docs.packaged_eform_asset_names()
                     if not ctx.get("dev_target") else set(), placeholders=placeholders)
+                from . import o19billing
+                doc_problems.extend(o19billing.generation_file_problems(ctx, ctx_root))
                 write_private(os.path.join(ctx["state_dir"], "verify-documents-details.txt"),
                               "\n".join(doc_private + doc_problems) + "\n"
                               if doc_private or doc_problems else "clean\n")
                 if doc_problems:
-                    problems.append("{0} document or eForm asset problem(s) — see "
+                    problems.append("{0} document, billing file or eForm asset problem(s) — see "
                                     "verify-documents-details.txt".format(len(doc_problems)))
                 lines.extend(doc_lines)
                 if not ctx.get("dev_target"):
@@ -3192,16 +3202,18 @@ def _cleanup_home_parity(ctx) -> Tuple[List[str], List[str]]:
     writes, so they are re-counted -- and re-digested -- here, exactly,
     at the moment of the drop."""
     archive = ctx.get("archive_schema", ARCHIVE_SCHEMA)
-    kept_ok, kept_bad = o19etl.preserved_parity(
-        ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive)
-    content_ok, content_bad = o19etl.preserved_content_parity(
-        ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive)
     from . import o19billing
+    progress = o19etl.load_progress(ctx["state_dir"])
+    generations = o19billing.generation_tables(progress)
+    kept_ok, kept_bad = o19etl.preserved_parity(
+        ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive, archived_copy_tables=generations)
+    content_ok, content_bad = o19etl.preserved_content_parity(
+        ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive, archived_copy_tables=generations)
     billing_ok, billing_bad = o19billing.verify(
         ctx["query"], STAGING_SCHEMA, ctx["target_db"], archive,
         o19etl.introspect_columns(ctx["query"], STAGING_SCHEMA),
         o19etl.introspect_columns(ctx["query"], ctx["target_db"]),
-        o19map_schema.TABLES, live=False)
+        o19map_schema.TABLES, live=False, generation_tables=generations)
     return kept_ok + content_ok + billing_ok, kept_bad + content_bad + billing_bad
 
 

@@ -543,15 +543,17 @@ command refuses unless the host's own configured name is typed back to it.
 Migration output should receive a technical review \(em verification
 report, spot checks, UI smoke \(em before clinical use.
 .PP
-Historical Ontario billing filename collisions use an audited, resumable
-mapping across the shared OHIP and HTML file namespace, including a name
-used just once in each table. Every member receives a unique name; originals,
-IDs and timestamps are preserved. Files included in the restored document
-tree are preserved; check for missing source files and custom HOME_DIR
-locations separately, especially with \-\-skip-documents.
-Original names remain reserved.
-Ambiguous historical downloads and regeneration require file reconciliation;
-the report and root\-only billing-files-details.txt identify the work.
+Ontario billing generation rows enter the live tables when the backup
+contains the corresponding nonempty file in
+.BR HOME_DIR .
+For a repeated exact filename, the highest generation ID keeps the
+original name. All source generation rows are preserved in
+.IR o19_archive .
+Files claimed by both billing tables and names that conflict in a target
+unique index are listed for review in the root\-only
+.IR billing-files-details.txt .
+The dry run reports the planned counts. An import that already wrote
+filename mappings finishes with that policy.
 The beta8 package pair requires schema manifest format 3 and ETL contract 6.
 It preserves OSCAR's unassigned digital signatures with patient sentinel \-1,
 and independently checks their original patient and module values.
@@ -779,6 +781,8 @@ and shadow-captured to
 .B charset-repair
 (double-encoded text is repaired per row; drugs.special also supports
 the exact ISO-8859-1 en-dash and less-than-or-equal sequences),
+.B keep-unrepairable-text
+(carry the original source value when the lossless repair cannot verify it),
 .B olis-gone
 (OLIS data is archive-only),
 .B no-documents
@@ -862,9 +866,9 @@ takes its own flags \(em
 .BR \-\-accept ", " \-\-json " and " \-\-digests
 \(em not this verb's, and its
 .B \-\-accept
-knows only the six classes an assessment can acknowledge: archived\-forms,
-unknown\-as\-archive, olis\-gone, dropped\-columns, carry\-credentials
-and charset\-repair.
+knows only the seven classes an assessment can acknowledge: archived\-forms,
+unknown\-as\-archive, olis\-gone, dropped\-columns, carry\-credentials,
+charset\-repair and keep\-unrepairable\-text.
 .B \-\-digests
 .I PATH
 writes a content digest of every table (0600) for the clinic to ship in

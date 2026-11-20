@@ -155,6 +155,37 @@ class TestExactCharsetMariaDB(unittest.TestCase):
                     self.detect()
                 self.assertEqual(self.query("SELECT COUNT(*) FROM `{0}`.drugs".format(self.dst)), [["0"]])
 
+    def test_acknowledged_unrepairable_text_survives_both_copy_paths(self):
+        triple = CP.encode().decode("cp1252")
+        mixed = CP + " and café"
+        # The known drug instruction span must not be partially substituted
+        # when another part of the same value still needs review.
+        special = DASH + UNKNOWN
+        self.seed([special, CP])
+        for schema in (self.src, self.dst):
+            self.query("CREATE TABLE `{0}`.casemgmt_note (note_id INT PRIMARY KEY, note TEXT) "
+                       "CHARACTER SET utf8mb4".format(schema))
+        self.query("INSERT INTO `{0}`.casemgmt_note VALUES (1,{1}),(2,{2}),(3,{3})"
+                   .format(self.src, literal(triple), literal(mixed), literal(CP)))
+        note_entry = {"class": "copy", "cols": ["note_id", "note"], "charset_scan": ["note"]}
+        entries = {"drugs": self.entry, "casemgmt_note": note_entry}
+        with patch.object(o19etl.o19map_schema, "TABLES", entries):
+            retained = {}
+            repairs = o19etl.detect_repairs(
+                self.query, self.src, ["charset-repair", pf.KEEP_UNREPAIRABLE_TEXT], retained=retained)
+            self.assertEqual(retained, {"drugs.special": 1, "casemgmt_note.note": 2})
+            self.copy(repairs)
+            note_state = self.run.progress["tables"].setdefault("casemgmt_note", {})
+            o19etl.etl_copy_table(self.run, "casemgmt_note", note_entry, note_state,
+                                 self.dst_info["casemgmt_note"], repairs["casemgmt_note"])
+            for table, col, key, wanted in (
+                    ("drugs", "special", "drugid", [special, "Café"]),
+                    ("casemgmt_note", "note", "note_id", [triple, mixed, "Café"])):
+                self.assertEqual(self.query(
+                    "SELECT HEX({0}) FROM `{1}`.{2} ORDER BY {3}".format(col, self.dst, table, key)),
+                    [[value.encode().hex().upper()] for value in wanted])
+            self.assertEqual(self.parity(repairs)[1], [])
+
     def test_should_assess_known_tokens_without_modern_byte_regex(self):
         self.seed([DASH + LE])
         findings = self.assessment(guarded=False)

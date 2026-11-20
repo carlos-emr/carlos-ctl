@@ -2045,6 +2045,7 @@ def run_docs(ctx) -> None:
                      .format(len(placeholders), MISSING_DOCUMENTS_ACCEPT))
     from . import o19billing
     lines.extend(o19billing.inventory(ctx, ctx_root))
+    problems.extend(o19billing.generation_file_problems(ctx, ctx_root))
     if private_lines:
         private(["P5 reconciliation notes:"] + private_lines)
     csv_lines = _export_archives(ctx)

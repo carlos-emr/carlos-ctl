@@ -1,20 +1,24 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 CARLOS Contributors
-"""Lossless Ontario billing filename allocation and its independent witnesses.
+"""Select backed-up Ontario billing generations and preserve their history.
 
-Every member of a colliding group is renamed: a surviving file with the old
-name is not evidence that it belongs to the earliest (or latest) submission.
-The live audit also reserves the old names and lets CARLOS refuse ambiguous
-downloads/regeneration until an administrator has reconciled the actual file.
+The earlier filename allocator remains available for interrupted imports
+that already wrote its mappings.
 """
+from collections import defaultdict
+from dataclasses import dataclass
 import os
 import re
+import stat
+from typing import Dict, Optional, Tuple
 
 from .util import sql_escape
 
 RULE = "o19-billing-v1"
 AUDIT = "billing_filename_import"
 IMPORT_ACTOR = "carlos-ctl/import-o19"
+GENERATION_FILES = "billing_generation_files"
+DETAILS = "billing-files-details.txt"
 TABLES = {
     "billing_on_diskname": ("ohipfilename", "createdatetime", "claim"),
     "billing_on_filename": ("htmlfilename", "timestamp", "html"),
@@ -143,6 +147,157 @@ def source_billing_tables(query, src):
     rows = query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = {0} "
                  "AND TABLE_NAME IN ({1})".format(literal(src), ",".join(literal(t) for t in TABLES)))
     return [row[0] for row in rows]
+
+
+@dataclass
+class GenerationPlan:
+    """Source rows and the files available in the backed-up billing directory."""
+
+    directory: Optional[str]
+    files: Dict[str, int]
+    rows: Dict[str, Dict[int, Tuple[str, str]]]
+
+    def retained(self, table):
+        return {row_id: name for row_id, (name, status) in self.rows[table].items()
+                if status == "retained"}
+
+
+def archived_billing_files(ctx):
+    """Inventory the source HOME_DIR when it is inside the exported context."""
+    from . import o19_preflight, o19bundle, o19docs, o19props
+    archive = ctx.get("documents")
+    if not archive:
+        return None, {}
+    entries, context = ctx.get("document_archive") or o19docs.read_documents_archive(archive)
+    directory = "billing/download"
+    properties = ctx.get("properties")
+    home = o19_preflight.parse_properties(properties).get("HOME_DIR") if properties else None
+    if home:
+        # Use the same path translation shipped in the properties fragment.
+        # A directory under a different OSCAR context is outside this backup.
+        pattern = r"/(?:.*/)?OscarDocument/" + re.escape(context) + r"(?:/.*)?"
+        if not re.fullmatch(pattern, home):
+            return None, {}
+        translated = o19props.translate_docpath(home, documents_root="")
+        if translated is None:
+            return None, {}
+        directory = os.path.relpath(translated, o19docs.TARGET_CTX)
+    prefix = os.path.normpath(os.path.join(context, directory)) + "/"
+    files = {}
+    for kind, raw, size in entries:
+        clean = os.path.normpath(raw)
+        if kind == o19bundle.TAR_TYPE_FILE and size and clean.startswith(prefix):
+            name = clean[len(prefix):]
+            if "/" not in name and "\\" not in name:
+                files[name] = size
+    return directory, files
+
+
+def plan_generations(ctx, src, sources, dst_info):
+    """Select the last generation ID for each exact backed-up filename.
+
+    If both generation tables claim one physical file, their IDs cannot tell
+    which writer was last. Distinct files that compare equal in a target
+    unique index also need review. Both cases stay available in the archive.
+    """
+    if "billing_generation_plan" in ctx:
+        return ctx["billing_generation_plan"]
+    directory, files = archived_billing_files(ctx)
+    rows = {table: {} for table in sources}
+    references = defaultdict(list)
+    for table, actual in sources.items():
+        column = "s." + ident(TABLES[table][0])
+        comparison = key(column, dst_info[table][TABLES[table][0]])
+        sql = ("SELECT s.id, IFNULL(HEX(CONVERT({0} USING utf8mb4)), ''), "
+               "DENSE_RANK() OVER (ORDER BY {1}) FROM {2}.{3} s ORDER BY s.id"
+               .format(column, comparison, ident(src), ident(actual)))
+        for raw_id, encoded, rank in ctx["query"](sql):
+            row_id = int(raw_id)
+            name = bytes.fromhex(encoded).decode("utf-8")
+            rows[table][row_id] = name, "file unavailable in backup"
+            if name in files:
+                references[name].append((table, row_id, rank))
+
+    candidates = defaultdict(list)
+    for name, refs in references.items():
+        if len({table for table, _, _ in refs}) > 1:
+            for table, row_id, _ in refs:
+                rows[table][row_id] = name, "shared between generation tables"
+            continue
+        for table, row_id, _ in refs:
+            rows[table][row_id] = name, "overwritten by a later generation"
+        table, row_id, rank = max(refs, key=lambda row: row[1])
+        candidates[table, rank].append((row_id, name))
+    for (table, _), group in candidates.items():
+        status = "retained" if len(group) == 1 else "conflicts with another surviving filename"
+        for row_id, name in group:
+            rows[table][row_id] = name, status
+    plan = GenerationPlan(directory, files, rows)
+    ctx["billing_generation_plan"] = plan
+    return plan
+
+
+def generation_tables(progress):
+    """Billing tables whose copy used the file-backed selection."""
+    return {table for table, state in progress.get("tables", {}).items()
+            if table in TABLES and state.get(GENERATION_FILES)}
+
+
+def retained_predicate(table, archive):
+    """Limit a copy or its row checks to the selected source IDs."""
+    return "EXISTS (SELECT 1 FROM {0}.{1} f WHERE f.row_id = s.id)".format(
+        ident(archive), ident(helper(table)))
+
+
+def generation_summary(table, plan):
+    retained = len(plan.retained(table))
+    archived = len(plan.rows[table]) - retained
+    return "{0}: {1} generation row(s) backed by surviving files, {2} archive-only".format(
+        table, retained, archived)
+
+
+def recorded_plan(ctx, tables, dst_info=None):
+    """Recover the file-backed selection on a checkpointed import."""
+    from . import o19etl, o19import
+    if not tables:
+        return None
+    if dst_info is None and "billing_generation_plan" not in ctx:
+        dst_info = o19etl.introspect_columns(ctx["query"], ctx["target_db"])
+    return plan_generations(ctx, o19import.STAGING_SCHEMA, {table: table for table in tables}, dst_info)
+
+
+def report_generations(ctx, plan):
+    """Write each source generation's disposition to the private report."""
+    from . import o19import
+    details = ["Billing directory in the source backup: {0}".format(
+        repr(plan.directory) if plan.directory is not None else "outside the supplied archive")]
+    for table, rows in sorted(plan.rows.items()):
+        details.extend("{0} id {1}: {2!r} — {3}".format(table, row_id, name, status)
+                       for row_id, (name, status) in sorted(rows.items()))
+    o19import.write_private(os.path.join(ctx["state_dir"], DETAILS), "\n".join(details) + "\n")
+    return [generation_summary(table, plan) for table in sorted(plan.rows)]
+
+
+def generation_file_problems(ctx, root):
+    """Check the restored file for every retained live generation."""
+    from . import o19docs, o19etl
+    plan = recorded_plan(ctx, generation_tables(o19etl.load_progress(ctx["state_dir"])))
+    if not plan or plan.directory is None:
+        return []
+    problems = []
+    for table in sorted(plan.rows):
+        for row_id, name in plan.retained(table).items():
+            relative = os.path.join(plan.directory, name)
+            try:
+                file = os.lstat(os.path.join(root, relative))
+                if (stat.S_ISREG(file.st_mode) and file.st_size == plan.files[name]
+                        and o19docs.contained(root, relative)):
+                    continue
+            except OSError:
+                pass  # name the affected row in the private reconciliation finding below
+            problems.append("{0} id {1}: the restored billing file {2!r} is missing or differs in size"
+                            .format(table, row_id, name))
+    return problems
 
 
 def collision_predicate(table, src, info, alias="m", sources=None):
@@ -274,17 +429,92 @@ def check_audit(query, table, dst, arch):
             for _ in [0] if int(query(sql)[0][0]) or int(query(extra)[0][0])]
 
 
-def prepare(run, table, entry, state, dst_cols):
+def build_generation_mapping(query, table, src, arch, dst_cols, retained):
+    """Publish a mapping for selected rows with their original on-disk names."""
+    from . import o19etl
+    info = dst_cols[TABLES[table][0]]
+    column = "s." + ident(TABLES[table][0])
+    source = ident(src) + "." + ident(table)
+    ids = sorted(retained)
+
+    def build(scratch):
+        path = ident(arch) + "." + ident(scratch)
+        statements = [
+            "CREATE TABLE {0} (row_id BIGINT NOT NULL PRIMARY KEY, "
+            "original_filename VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, "
+            "imported_filename VARCHAR(50) CHARACTER SET {1} COLLATE {2} NOT NULL UNIQUE, "
+            "group_size BIGINT NOT NULL, reason VARCHAR(32) NOT NULL) ENGINE=InnoDB"
+            .format(path, info["charset"], info["collation"])]
+        for start in range(0, len(ids), 1000):
+            batch = ", ".join(str(row_id) for row_id in ids[start:start + 1000])
+            statements.append(
+                "INSERT INTO {0} SELECT s.id, {1}, {1}, 1, 'unchanged' FROM {2} s "
+                "WHERE s.id IN ({3})".format(path, column, source, batch))
+        return statements
+
+    for statement in o19etl.rebuild_statements(arch, helper(table), build):
+        query(statement)
+
+
+def check_generation_mapping(query, table, src, arch, retained=None):
+    """Compare every mapping to its staged row and the file inventory when open."""
+    mapping = ident(arch) + "." + ident(helper(table))
+    source = ident(src) + "." + ident(table)
+    sql = ("SELECT COUNT(*) FROM {0} f LEFT JOIN {1} s ON s.id = f.row_id "
+           "WHERE s.id IS NULL OR NOT (BINARY f.original_filename <=> BINARY "
+           "CONVERT(s.{2} USING utf8mb4)) OR NOT (BINARY f.imported_filename <=> "
+           "BINARY f.original_filename) OR f.group_size <> 1 OR f.reason <> 'unchanged'"
+           .format(mapping, source, ident(TABLES[table][0])))
+    if int(query(sql)[0][0]):
+        return [table + ": retained billing filename mapping differs from staging"]
+    if retained is not None:
+        ids = {int(row[0]) for row in query("SELECT row_id FROM " + mapping)}
+        if ids != set(retained):
+            return [table + ": retained billing generations differ from the source file inventory"]
+    return []
+
+
+def next_generation_id(query, schema, table):
+    rows = query("SELECT AUTO_INCREMENT FROM information_schema.TABLES "
+                 "WHERE TABLE_SCHEMA = {0} AND TABLE_NAME = {1}".format(literal(schema), literal(table)))
+    return int(rows[0][0]) if rows and rows[0][0] not in (None, "", "NULL") else None
+
+
+def generation_id_floor(query, src, table):
+    """Keep future generations from reusing IDs that still appear in history."""
+    largest = int(query("SELECT COALESCE(MAX(id), 0) FROM {0}.{1}".format(
+        ident(src), ident(table)))[0][0])
+    return max(largest + 1, next_generation_id(query, src, table) or 1)
+
+
+def prepare(run, table, entry, state, dst_cols, plan=None):
     """Publish verified helper/audit evidence before resumable clinical copying."""
-    from .o19etl import QueryError, save_progress
+    from .o19etl import QueryError, archive_statements, save_progress
     if not mapped(table, entry):
         raise QueryError(table + ": missing audited billing filename mapping")
     if not state.get("done"):
         # Record intent before metadata writes. Package/resume guards must
         # treat even an interrupted metadata publication as a partial import.
         state["billing_started"] = True
+        if plan is not None:
+            state[GENERATION_FILES] = True
         save_progress(run.state_dir, run.progress)
-        build(run.query, table, run.src, run.arch, run.src_info[table], dst_cols)
+        if plan is None:
+            build(run.query, table, run.src, run.arch, run.src_info[table], dst_cols)
+        else:
+            if not state.get("billing_archived"):
+                for sql in archive_statements(table, run.src, run.arch):
+                    run.query(sql)
+                state["billing_archived"] = True
+                save_progress(run.state_dir, run.progress)
+            build_generation_mapping(run.query, table, run.src, run.arch, dst_cols,
+                                     plan.retained(table))
+            current = next_generation_id(run.plain, run.dst, table)
+            if current is not None:
+                minimum = generation_id_floor(run.plain, run.src, table)
+                if current < minimum:
+                    run.query("ALTER TABLE {0}.{1} AUTO_INCREMENT = {2}".format(
+                        ident(run.dst), ident(table), minimum))
         mapping = ident(run.arch) + "." + ident(helper(table))
         audit = ident(run.dst) + "." + ident(AUDIT)
         count = int(run.plain("SELECT COUNT(*) FROM {0} WHERE source_table = {1}".format(audit, literal(table)))[0][0])
@@ -297,21 +527,28 @@ def prepare(run, table, entry, state, dst_cols):
                       "group_size, reason, file_status, lastUpdateUser) SELECT {1}, row_id, original_filename, "
                       "imported_filename, group_size, reason, IF(group_size > 1, 'ambiguous', 'unchanged'), {3} "
                       "FROM {2}".format(audit, literal(table), mapping, literal(IMPORT_ACTOR)))
-    issues = check_helper(run.plain, table, run.src, run.arch, run.src_info[table], dst_cols)
+    issues = (check_helper(run.plain, table, run.src, run.arch, run.src_info[table], dst_cols)
+              if plan is None else check_generation_mapping(
+                  run.plain, table, run.src, run.arch, plan.retained(table)))
     issues += check_audit(run.plain, table, run.dst, run.arch)
     if issues:
         raise QueryError("; ".join(issues))
-    n = int(run.plain("SELECT COUNT(*) FROM {0}.{1} WHERE group_size > 1".format(
-        ident(run.arch), ident(helper(table))))[0][0])
     lines = run.progress.setdefault("report_lines", {}).setdefault("billing", [])
-    line = (table + ": {0} historical row(s) received unique filenames; originals and mappings are in "
-            "{1}.{2} and {3}.{4}. Ambiguous downloads/regeneration require file reconciliation.".format(
-                n, run.arch, helper(table), run.dst, AUDIT))
+    if plan is None:
+        n = int(run.plain("SELECT COUNT(*) FROM {0}.{1} WHERE group_size > 1".format(
+            ident(run.arch), ident(helper(table))))[0][0])
+        line = (table + ": {0} historical row(s) received unique filenames; originals and mappings are in "
+                "{1}.{2} and {3}.{4}. Ambiguous downloads/regeneration require file reconciliation.".format(
+                    n, run.arch, helper(table), run.dst, AUDIT))
+    else:
+        line = generation_summary(table, plan) + ". Source rows are preserved at {0}.{1}.".format(
+            run.arch, table)
     lines[:] = [item for item in lines if not item.startswith(table + ": ")] + [line]
     save_progress(run.state_dir, run.progress)
 
 
-def verify(query, src, dst, arch, src_info, dst_info, tables, live=True):
+def verify(query, src, dst, arch, src_info, dst_info, tables, live=True,
+           generation_tables=(), plan=None):
     """Verify durable evidence; also compare live submissions during P4/P7."""
     ok, bad = [], []
     for table in TABLES:
@@ -321,7 +558,11 @@ def verify(query, src, dst, arch, src_info, dst_info, tables, live=True):
             bad.extend(manifest_problems(tables, [table]))
             continue
         try:
-            failures = check_helper(query, table, src, arch, src_info[table], dst_info[table])
+            if table in generation_tables:
+                failures = check_generation_mapping(query, table, src, arch,
+                                                    plan.retained(table) if plan else None)
+            else:
+                failures = check_helper(query, table, src, arch, src_info[table], dst_info[table])
             failures += check_audit(query, table, dst, arch)
             if live:
                 column = TABLES[table][0]
@@ -332,6 +573,10 @@ def verify(query, src, dst, arch, src_info, dst_info, tables, live=True):
                          "WHERE m.row_id IS NULL".format(ident(dst), ident(table), ident(arch), ident(helper(table))))
                 if int(query(sql)[0][0]) or int(query(extra)[0][0]):
                     failures.append(table + ": live submissions differ from the verified filename mapping")
+                if table in generation_tables:
+                    next_id = next_generation_id(query, dst, table)
+                    if next_id is not None and next_id < generation_id_floor(query, src, table):
+                        failures.append(table + ": future generations could reuse a source ID")
             bad.extend(failures)
             if not failures:
                 ok.append(table + ": original filenames, allocation and live audit verified against staging")
@@ -341,13 +586,12 @@ def verify(query, src, dst, arch, src_info, dst_info, tables, live=True):
 
 
 def inventory(ctx, root):
-    """Private inventory only: a shared surviving file is never assigned to a row.
-
-    All source files stay in the restored tree. The audit's ambiguous state
-    guards both old and allocated names in CARLOS until deliberate reconciliation.
-    """
+    """Private inventory of file-backed generations or legacy ambiguous mappings."""
     from . import o19etl, o19import
     progress = o19etl.load_progress(ctx["state_dir"])
+    plan = recorded_plan(ctx, generation_tables(progress))
+    if plan is not None:
+        return report_generations(ctx, plan)
     if not any(value.get("billing_started") for table, value in progress.get("tables", {}).items()
                if table in TABLES):
         return []
@@ -356,7 +600,7 @@ def inventory(ctx, root):
                  "imported_filename, file_status FROM {0}.{1} WHERE group_size > 1 ORDER BY source_table, source_id".format(
                      ident(ctx["target_db"]), ident(AUDIT)))
     if not rows:
-        o19import.write_private(os.path.join(ctx["state_dir"], "billing-files-details.txt"), "clean\n")
+        o19import.write_private(os.path.join(ctx["state_dir"], DETAILS), "clean\n")
         return []
     details = []
     for table, row_id, encoded, imported, status in rows:
@@ -368,6 +612,6 @@ def inventory(ctx, root):
         present = bool(path and os.path.isfile(path) and not os.path.islink(path))
         details.append("{0} id {1}: original={2!r}; imported={3!r}; status={4}; "
                        "original file in standard HOME_DIR={5}".format(table, row_id, original, imported, status, present))
-    o19import.write_private(os.path.join(ctx["state_dir"], "billing-files-details.txt"), "\n".join(details) + "\n")
+    o19import.write_private(os.path.join(ctx["state_dir"], DETAILS), "\n".join(details) + "\n")
     return ["{0} historical billing filename mapping(s) need file reconciliation; originals remain preserved. "
             "See billing-files-details.txt and the billing_filename_import archive. Check any custom/external HOME_DIR separately.".format(len(rows))]

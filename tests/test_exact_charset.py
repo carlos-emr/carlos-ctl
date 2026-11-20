@@ -61,6 +61,11 @@ class TestExactCharset(unittest.TestCase):
             measured["bad"] = 1
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 o19etl.detect_repairs(None, "src", ["charset-repair"])
+            retained = {}
+            self.assertEqual(o19etl.detect_repairs(
+                None, "src", ["charset-repair", pf.KEEP_UNREPAIRABLE_TEXT], retained=retained),
+                {"drugs": {"special"}})
+            self.assertEqual(retained, {"drugs.special": 1})
 
     def test_detected_source_rules_follow_the_target_rename(self):
         entry = {"cols": ["instructions"], "renames": {"instructions": "special"},
@@ -93,7 +98,7 @@ class TestExactCharset(unittest.TestCase):
                 exec(compile(text, str(path), "exec"), namespace)
                 namespace["bind"](province)
                 self.assertEqual(namespace["EXACT_CHARSET_RULES"], pf.EXACT_CHARSET_RULES)
-                self.assertEqual(namespace["exact_charset_candidate"]("v"),
+                self.assertEqual(namespace["validated_charset_repair"]("v", True),
                                  o19etl.repair_expr("v", exact=True))
                 self.assertEqual(namespace["exact_charset_residual"]("v"),
                                  pf.exact_charset_residual("v"))

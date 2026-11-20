@@ -178,25 +178,27 @@ sudo carlos-ctl destroy-data --confirm <server-name>
 
 ## OSCAR 19 historical billing files
 
-The beta7 package pair (carlos-ctl 1.3.2) imports repeated Ontario billing
-filenames through an audited mapping. Every submission, ID, timestamp and
-original filename is preserved. Every member of a colliding group receives
-a unique name; an old shared file is not assigned to a submission by guesswork.
-The OHIP and HTML columns share one file namespace, including a basename
-used just once in each table.
-Original names remain reserved for future billing. The import report and
-root-only `billing-files-details.txt` identify the reconciliation work.
-Files included in the restored document tree are preserved. Check missing
-source files and custom `HOME_DIR` locations separately, especially when
-using `--skip-documents`.
+The dry run and live import look for nonempty files in the backed-up billing
+directory. For an exact filename repeated in one generation table, the
+highest ID is retained in the live table with its original filename. The
+full source generation tables, including overwritten and missing-file rows,
+are preserved in `o19_archive` and its CSV export.
 
-CARLOS gates ambiguous historical downloads and regeneration until the exact
-file is reconciled. The mapping survives cleanup in `o19_archive`, its CSV
-export, and the live `billing_filename_import` table. See the application's
-[migration and recovery runbook](https://github.com/carlos-emr/carlos/blob/main/docs/o19-import-deb.md#historical-ontario-billing-filenames-beta7).
-Schema manifest format 2 and ETL contract 4 require the matched package pair.
-A beta6 import that already copied data uses the tested restore-and-restart
-procedure; a changed package contract cannot be resumed across a partial copy.
+The root-only `billing-files-details.txt` lists each generation's disposition.
+An external `HOME_DIR` outside the archive and `--skip-documents` leave
+the generation rows in the archive. A file claimed by both billing tables
+or filenames that conflict under the target's unique index are also listed
+there for review.
+
+Imports with billing mappings already written finish under their recorded
+policy. See the application runbook for those mappings. [Legacy billing filename reconciliation](https://github.com/carlos-emr/carlos/blob/main/docs/o19-import-deb.md#historical-ontario-billing-filenames-beta7)
+
+## OSCAR 19 text encoding
+
+`--accept keep-unrepairable-text` carries source text as-is when one
+lossless repair cannot resolve the encoding. Dry runs show the affected
+columns and the validation report gives the retained counts.
+`--accept charset-repair` authorizes the verified per-value repairs.
 
 ## OSCAR 19 beta8 import compatibility
 

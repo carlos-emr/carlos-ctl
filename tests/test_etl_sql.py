@@ -1124,7 +1124,7 @@ class TestCharsetRepairPredicate(unittest.TestCase):
         # on MariaDB 11.8 (measured on Ubuntu 26.04's 11.8.6, whose
         # utf8mb4 default is uca1400_ai_ci); 10.11 resolved it silently
         self.assertTrue(
-            expr.endswith("ELSE CONVERT(s.`note` USING utf8mb4) END"), expr)
+            expr.endswith("ELSE CONVERT(s.`note` USING utf8mb4) END END"), expr)
         self.assertNotIn("ELSE s.`note` END", expr)
 
     def test_marker_regex_targets_utf8_lead_bytes_only(self):

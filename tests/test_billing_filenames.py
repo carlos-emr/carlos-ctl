@@ -11,7 +11,7 @@ from carlos_ctl import o19billing, o19etl, o19import, o19manifest
 
 class TestBillingContract(unittest.TestCase):
     def test_host_preflight_uses_restored_case_for_filename_counts(self):
-        """Host preflight must count the complete namespace before table-case normalization."""
+        """Host preflight plans the backed-up generations before table-case normalization."""
         sources = {"billing_on_diskname": "Billing_on_diskname", "billing_on_filename": "BILLING_ON_FILENAME"}
         entries = {table: {"class": "copy", "billing_filename": o19billing.RULE,
                            "value_exprs": {o19billing.TABLES[table][0]: o19billing.expression(table)}}
@@ -25,14 +25,13 @@ class TestBillingContract(unittest.TestCase):
             stack.enter_context(mock.patch.object(o19etl, "schema_tables", return_value=list(sources.values())))
             stack.enter_context(mock.patch.object(o19etl, "introspect_columns", return_value={
                 table: {o19billing.TABLES[table][0]: {}} for table in sources}))
-            count = stack.enter_context(mock.patch.object(o19billing, "collision_count", return_value=1))
+            plan = o19billing.GenerationPlan("billing/download", {}, {table: {} for table in sources})
+            choose = stack.enter_context(mock.patch.object(o19billing, "plan_generations", return_value=plan))
             stack.enter_context(mock.patch.object(o19import, "report_content_transfer"))
             query = mock.Mock()
             o19import.run_p2({"query": query, "state": {}, "state_dir": directory,
                               "province": "on", "target_db": "target", "accepted": set(), "dry_run": True})
-            self.assertEqual(count.call_args_list, [
-                mock.call(query, table, o19import.STAGING_SCHEMA, {}, actual, sources)
-                for table, actual in sources.items()])
+            self.assertEqual(choose.call_args.args[1:3], (o19import.STAGING_SCHEMA, sources))
             self.assertTrue(any(f["id"] == "historical-billing-filenames" for f in report["findings"]))
 
     def test_a_previous_import_audit_is_not_a_pristine_target(self):
@@ -93,11 +92,13 @@ class TestBillingContract(unittest.TestCase):
         self.assertTrue(o19etl.reserved_helper_names([o19billing.helper("billing_on_filename")]))
 
     def test_cleanup_rechecks_billing_originals_before_staging_can_be_dropped(self):
-        with mock.patch.object(o19etl, "preserved_parity", return_value=([], [])), \
+        with tempfile.TemporaryDirectory() as state_dir, \
+                mock.patch.object(o19etl, "preserved_parity", return_value=([], [])), \
                 mock.patch.object(o19etl, "preserved_content_parity", return_value=([], [])), \
                 mock.patch.object(o19etl, "introspect_columns", return_value={}), \
                 mock.patch.object(o19billing, "verify", return_value=([], ["billing audit differs"])):
-            _ok, bad = o19import._cleanup_home_parity({"query": mock.Mock(), "target_db": "target"})
+            _ok, bad = o19import._cleanup_home_parity({"query": mock.Mock(), "target_db": "target",
+                                                     "state_dir": state_dir})
         self.assertEqual(bad, ["billing audit differs"])
         self.assertIsNotNone(o19import.cleanup_data_refusal(True, bad))
 

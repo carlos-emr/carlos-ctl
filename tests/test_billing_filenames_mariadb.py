@@ -8,10 +8,12 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import uuid
 
 from carlos_ctl import o19billing, o19etl, o19import
 from .carlos_src import carlos_path
+from .test_docs_driver import make_tar
 
 
 @unittest.skipUnless(os.environ.get("CARLOS_TEST_MARIADB_SOCKET") and shutil.which("mariadb"),
@@ -29,7 +31,7 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
         self.writer = o19import.make_etl_query(self.client, statement_timeout=20)
         for table, (column, date, _token) in o19billing.TABLES.items():
             for schema in (self.src, self.dst):
-                ddl = ("CREATE TABLE `{0}`.`{1}` (id INT PRIMARY KEY, `{2}` VARCHAR(50) NULL, "
+                ddl = ("CREATE TABLE `{0}`.`{1}` (id INT AUTO_INCREMENT PRIMARY KEY, `{2}` VARCHAR(50) NULL, "
                        "timestamp TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP, "
                        "payload TEXT NULL{3}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE={4}").format(
                            schema, table, column,
@@ -92,6 +94,58 @@ class TestBillingFilenamesMariaDB(unittest.TestCase):
         column = o19billing.TABLES[table][0]
         return self.plain("SELECT id, `{0}`, payload, timestamp FROM `{1}`.`{2}` ORDER BY id".format(
             column, schema or self.dst, table))
+
+    def test_retains_only_surviving_generations_and_verifies_full_history(self):
+        claims, html = o19billing.TABLES
+        self.seed(claims, [(1, "claim.001", "2020-01-01"), (2, "claim.001", "2021-01-01"),
+                           (3, "absent.002", "2021-01-02"), (4, "shared.003", "2021-01-03")])
+        self.seed(html, [(11, "review.html", "2020-01-01"), (12, "review.html", "2021-01-01"),
+                         (13, "shared.003", "2021-01-03"), (14, "empty.html", "2021-01-04")])
+        self.plain("ALTER TABLE {0}.{1} AUTO_INCREMENT = 100".format(
+            o19billing.ident(self.src), o19billing.ident(claims)))
+        with tempfile.TemporaryDirectory() as directory:
+            archive = make_tar(str(Path(directory, "docs.tar.gz")), {
+                "billing/download/claim.001": "new claim",
+                "billing/download/review.html": "new HTML",
+                "billing/download/shared.003": "ambiguous file",
+                "billing/download/empty.html": "",
+                "document/absent.002": "same name outside the billing directory",
+            })
+            ctx = {"query": self.plain, "documents": archive, "target_db": self.dst,
+                   "archive_schema": self.arch, "state_dir": self.ledger.name, "state": {}}
+            destination = o19etl.introspect_columns(self.plain, self.dst)
+            plan = o19billing.plan_generations(
+                ctx, self.src, {claims: claims, html: html}, destination)
+            self.assertEqual(plan.retained(claims), {2: "claim.001"})
+            self.assertEqual(plan.retained(html), {12: "review.html"})
+            entries = {}
+            for table in (claims, html):
+                run, entry, state, columns = self.run_for(table, chunk=(table == claims))
+                entries[table] = entry
+                o19billing.prepare(run, table, entry, state, columns, plan)
+                o19etl.etl_copy_table(run, table, dict(entry, billing_generation_files=True),
+                                     state, columns, set())
+                self.assertEqual(self.values(table, self.arch), self.values(table, self.src))
+
+            self.assertEqual([row[:2] for row in self.values(claims)], [["2", "claim.001"]])
+            self.assertEqual([row[:2] for row in self.values(html)], [["12", "review.html"]])
+            self.assertEqual(o19billing.next_generation_id(self.plain, self.dst, claims), 100)
+            self.assertEqual(o19billing.next_generation_id(self.plain, self.dst, html), 15)
+            root = Path(directory, "restored")
+            billing_dir = root / "billing" / "download"
+            billing_dir.mkdir(parents=True)
+            (billing_dir / "claim.001").write_text("new claim")
+            (billing_dir / "review.html").write_text("new HTML")
+            with patch.object(o19import, "STAGING_SCHEMA", self.src), \
+                    patch.object(o19etl.o19map_schema, "TABLES", entries):
+                self.assertEqual(o19import._row_parity(ctx)[1], [])
+                self.assertEqual(o19billing.generation_file_problems(ctx, str(root)), [])
+                (billing_dir / "claim.001").unlink()
+                self.assertTrue(o19billing.generation_file_problems(ctx, str(root)))
+                self.assertEqual(o19import._cleanup_home_parity(ctx)[1], [])
+                self.plain("UPDATE `{0}`.`{1}` SET payload='changed' WHERE id=1"
+                           .format(self.arch, claims))
+                self.assertTrue(o19import._cleanup_home_parity(ctx)[1])
 
     def test_both_tables_keep_all_rows_originals_payload_and_timestamps(self):
         """Renaming collisions must preserve source rows and every unrelated destination value."""

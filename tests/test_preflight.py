@@ -70,12 +70,13 @@ class FakeDb(object):
             where = match.group(1)
             spec = self.charset.get(("drugs", "special"), {})
             if " OR NOT (BINARY candidate <=>" in where:
-                n = spec.get("n", 0) + spec.get("exact", 0)
+                n = max(0, spec.get("n", 0) + spec.get("exact", 0)
+                        - spec.get("rejected_candidates", spec.get("bad", 0) + spec.get("multi", 0)))
             elif where.startswith("candidate IS NOT NULL AND "):
                 n = spec.get("bad", 0) + spec.get("multi", 0)
-            elif where == pf.exact_charset_match("original", (pf.EXACT_CHARSET_RULES[0],)):
+            elif where.startswith(pf.exact_charset_match("original", (pf.EXACT_CHARSET_RULES[0],))):
                 n = spec.get("dash", 0)
-            elif where == pf.exact_charset_match("original", (pf.EXACT_CHARSET_RULES[1],)):
+            elif where.startswith(pf.exact_charset_match("original", (pf.EXACT_CHARSET_RULES[1],))):
                 n = spec.get("le", 0)
             else:
                 raise AssertionError("unexpected exact-scan predicate: " + where)
@@ -530,7 +531,8 @@ class TestVerdicts(unittest.TestCase):
         self.assertEqual(set(pf.ACCEPT_IDS),
                          {"archived-forms", "unknown-as-archive",
                           "olis-gone", "dropped-columns",
-                          "carry-credentials", "charset-repair"})
+                          "carry-credentials", "charset-repair",
+                          "keep-unrepairable-text"})
 
     def test_ambiguous_oauth_identifiers_are_not_clearable_by_credential_acceptance(self):
         report = pf.run_checks(FakeDb(base_tables(ServiceAccessToken=2),
@@ -840,7 +842,7 @@ class TestTheB8CharsetStop(unittest.TestCase):
     o19etl.detect_repairs over the same rows exited 1 with B8 both
     times."""
 
-    def test_thrice_encoded_text_is_a_hard_stop_not_a_repairable_one(self):
+    def test_thrice_encoded_text_requires_only_the_keep_text_signoff(self):
         # it SATISFIES the repairable predicate, so it used to be
         # reported as ordinary mojibake -- and the flag the report
         # offered could not clear the stop it was offered for
@@ -849,12 +851,15 @@ class TestTheB8CharsetStop(unittest.TestCase):
                              {"n": 1, "multi": 1}})
         report = pf.run_checks(db, properties=clean_props(),
                                accepted=["charset-repair"])
-        self.assertEqual(report["verdict"], "no-go")
+        self.assertEqual(report["verdict"], "go-with-acknowledgements")
+        self.assertEqual(report["required_accepts"], [pf.KEEP_UNREPAIRABLE_TEXT])
         f = [x for x in report["findings"]
              if x["id"] == "B8-charset-unrepairable"][0]
-        self.assertIsNone(f.get("accept"))
+        self.assertEqual(f.get("accept"), pf.KEEP_UNREPAIRABLE_TEXT)
         self.assertIn("encoded more than twice",
                       f["data"]["demographic.last_name"])
+        self.assertEqual(pf.run_checks(db, properties=clean_props(),
+                                      accepted=[pf.KEEP_UNREPAIRABLE_TEXT])["verdict"], "go")
 
     def test_mixed_encoding_text_blocks_although_it_never_round_trips(self):
         # counts 0 on the repairable predicate: the assessment used to
@@ -862,10 +867,10 @@ class TestTheB8CharsetStop(unittest.TestCase):
         db = FakeDb(base_tables(),
                     charset={("casemgmt_note", "note"): {"bad": 2}})
         report = pf.run_checks(db, properties=clean_props())
-        self.assertEqual(report["verdict"], "no-go")
+        self.assertEqual(report["verdict"], "go-with-acknowledgements")
         f = [x for x in report["findings"]
              if x["id"] == "B8-charset-unrepairable"][0]
-        self.assertIsNone(f.get("accept"))
+        self.assertEqual(f.get("accept"), pf.KEEP_UNREPAIRABLE_TEXT)
         self.assertIn("do not round-trip", f["data"]["casemgmt_note.note"])
         self.assertEqual([x["id"] for x in report["findings"]
                           if x["id"] == "charset-mojibake"], [])
@@ -911,9 +916,9 @@ class TestTheB8CharsetStop(unittest.TestCase):
         db = FakeDb(base_tables(), charset={
             ("drugs", "special"): {"exact": 1, "bad": 1, "dash": 1}})
         report = pf.run_checks(db, properties=clean_props(), accepted=["charset-repair"])
-        self.assertEqual(report["verdict"], "no-go")
+        self.assertEqual(report["required_accepts"], [pf.KEEP_UNREPAIRABLE_TEXT])
         f = next(x for x in report["findings"] if x["id"] == "B8-charset-unrepairable")
-        self.assertIsNone(f.get("accept"))
+        self.assertEqual(f.get("accept"), pf.KEEP_UNREPAIRABLE_TEXT)
 
     def test_an_invalid_derived_scan_is_not_a_clean_database(self):
         class BrokenExactDb(FakeDb):
@@ -1182,7 +1187,7 @@ class TestImportMode(unittest.TestCase):
         recipe = text.index("Next step on a 'go'")
         # the caveat must reach the operator BEFORE the recipe does
         self.assertLess(caveat, recipe)
-        self.assertIn("no --accept clears one", text)
+        self.assertIn("The target completes these checks before copying", text)
 
     def test_import_mode_makes_no_such_excuse(self):
         # carlos-ctl HAS the schema map and the target, so the caveat
