@@ -24,6 +24,7 @@ CAPS = {"protocol": 1, "java": 25, "cliHeapMiB": 512,
         "operations": ["import", "status", "resume", "cancel", "report"]}
 IMPORT = ["--input", "/allowed/patient.xml", "--provider", "999998",
           "--source-namespace", "vendor.instance", "--source-profile", "omd-5.2"]
+RUN_ID = "0f1e2d3c-4b5a-4987-8a6b-5c4d3e2f1a0b"
 
 
 def _account_entry(name):
@@ -85,33 +86,34 @@ class TestArguments(unittest.TestCase):
 
     def test_abandon_reaches_the_engine_with_the_run_twice_and_the_stated_reason(self):
         args = cdsimport.parse_args([
-            "--abandon", "--run", "run-123", "--confirm", "run-123",
+            "--abandon", "--run", RUN_ID.upper(), "--confirm", RUN_ID,
             "--reason", "defect stops every resume; see ticket 42", "--provider", "T099"])
         self.assertEqual(args.operation, "abandon")
-        self.assertEqual(args.run_id, "run-123")
+        self.assertEqual(args.run_id, RUN_ID)
         self.assertEqual(cdsimport.engine_arguments(args), [
-            "--operation", "abandon", "--provider", "T099", "--run", "run-123",
-            "--confirm", "run-123", "--reason", "defect stops every resume; see ticket 42"])
+            "--operation", "abandon", "--provider", "T099", "--run", RUN_ID,
+            "--confirm", RUN_ID, "--reason", "defect stops every resume; see ticket 42"])
 
     def test_abandon_refuses_without_an_exact_confirmation_and_a_one_line_reason(self):
         base = ["--abandon", "--provider", "4"]
+        confirmed = [*base, "--run", RUN_ID, "--confirm", RUN_ID]
         invalid = [
-            base + ["--run", "run-1", "--reason", "stated"],
-            base + ["--run", "run-1", "--confirm", "run-1"],
-            base + ["--confirm", "run-1", "--reason", "stated"],
-            base + ["--run", "run-1", "--confirm", "run-2", "--reason", "stated"],
-            base + ["--run", "run-1", "--confirm", "run-1", "--reason", " "],
-            base + ["--run", "run-1", "--confirm", "run-1", "--reason", "two\nlines"],
-            base + ["--run", "run-1", "--confirm", "run-1", "--reason", "a\u2028b"],
-            base + ["--run", "run-1", "--confirm", "run-1", "--reason", "x" * 1001],
+            base + ["--run", RUN_ID, "--reason", "stated"],
+            confirmed,
+            base + ["--confirm", RUN_ID, "--reason", "stated"],
+            base + ["--run", RUN_ID, "--confirm", RUN_ID[:-1] + "0", "--reason", "stated"],
+            confirmed + ["--reason", " "],
+            confirmed + ["--reason", "two\nlines"],
+            confirmed + ["--reason", "a\u2028b"],
+            confirmed + ["--reason", "a\udc80b"],
+            confirmed + ["--reason", "x" * 1001],
+            base + ["--run", "run-1", "--confirm", "run-1", "--reason", "stated"],
             base + ["--run", "../run", "--confirm", "../run", "--reason", "stated"],
-            base + ["--run", "run-1", "--confirm", "run-1", "--reason", "stated",
-                    "--input", "/allowed/new.xml"],
-            base + ["--run", "run-1", "--confirm", "run-1", "--reason", "stated",
-                    "--status", "run-1"],
-            ["--resume", "run-1", "--provider", "4", "--reason", "stated"],
-            ["--cancel", "run-1", "--provider", "4", "--run", "run-1"],
-            IMPORT + ["--confirm", "run-1"],
+            confirmed + ["--reason", "stated", "--input", "/allowed/new.xml"],
+            confirmed + ["--reason", "stated", "--status", RUN_ID],
+            ["--resume", RUN_ID, "--provider", "4", "--reason", "stated"],
+            ["--cancel", RUN_ID, "--provider", "4", "--run", RUN_ID],
+            IMPORT + ["--confirm", RUN_ID],
         ]
         for argv in invalid:
             with self.subTest(argv=argv):
@@ -120,7 +122,7 @@ class TestArguments(unittest.TestCase):
                 self.assertEqual(error.exception.code, 1)
 
     def test_abandon_runs_only_on_an_engine_that_offers_it(self):
-        request = ["--abandon", "--run", "run-1", "--confirm", "run-1",
+        request = ["--abandon", "--run", RUN_ID, "--confirm", RUN_ID,
                    "--reason", "stated", "--provider", "4"]
         for operations, expected in ((CAPS["operations"], 2),
                                      (CAPS["operations"] + ["abandon"], 4)):
@@ -192,7 +194,7 @@ class TestArguments(unittest.TestCase):
                 cli.main(["cds-import", "--help"])
         self.assertEqual(exit_.exception.code, 0)
         for item in ("--source-profile", "--merge-existing", "--resume", "130", "committed",
-                     "--abandon", "--confirm", "--reason"):
+                     "--abandon", "--confirm", "--reason", "ABANDONED", "maintenanceReleaseState"):
             self.assertIn(item, stdout.getvalue())
 
 
@@ -380,6 +382,20 @@ class TestTrustedTicket(unittest.TestCase):
             self.create()
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_retry_repairs_only_an_empty_interrupted_directory(self):
+        directory = self.parent / cdsimport.TICKET_DIRECTORY
+        directory.mkdir(mode=0o700)
+        marker = directory / "retained"
+        marker.touch()
+        with self.assertRaises(cdsimport.CdsCommandError):
+            self.create()
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        self.assertTrue(marker.exists())
+        marker.unlink()
+        ticket = self.create()
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o750)
+        self.assertTrue(ticket.remove())
+
     def test_exclusive_name_collision_does_not_delete_another_ticket(self):
         directory = self.parent / cdsimport.TICKET_DIRECTORY
         directory.mkdir(mode=0o750)
@@ -399,6 +415,18 @@ class TestTrustedTicket(unittest.TestCase):
         replacement.replace(path)
         self.assertFalse(ticket.remove())
         self.assertEqual(path.read_text(), "other request")
+
+    def test_expiry_sweep_can_retire_a_ticket_between_stat_and_unlink(self):
+        ticket = self.create()
+        unlink = os.unlink
+
+        def sweep_first(name, **kwargs):
+            unlink(name, **kwargs)
+            unlink(name, **kwargs)  # the supervisor now finds an already-retired ticket
+
+        with mock.patch.object(os, "unlink", side_effect=sweep_first):
+            self.assertTrue(ticket.remove())
+        self.assertFalse(os.path.exists(ticket.path))
 
     def test_failed_ticket_creation_never_starts_engine(self):
         with mock.patch.object(cdsimport.os, "geteuid", return_value=0), \
@@ -488,6 +516,23 @@ class TestBoundedRealProbe(unittest.TestCase):
 
 
 class TestRealExecution(unittest.TestCase):
+    def test_pending_signals_during_launch_forward_the_strongest_request(self):
+        for pending, expected in (((signal.SIGINT,), signal.SIGINT),
+                                  ((signal.SIGINT, signal.SIGTERM), signal.SIGKILL)):
+            proc = mock.Mock(pid=1234)
+            proc.wait.return_value = -expected
+            proc.poll.return_value = -expected
+
+            def launch(*args, **kwargs):
+                for signum in pending:
+                    signal.getsignal(signum)(signum, None)
+                return proc
+
+            with self.subTest(pending=pending), mock.patch.object(subprocess, "Popen", side_effect=launch), \
+                    mock.patch.object(os, "killpg") as delivered:
+                self.assertEqual(cdsimport._run_engine(["synthetic-engine"], [], {}), 128 + expected)
+                delivered.assert_called_once_with(proc.pid, expected)
+
     def test_supervision_preserves_engine_outcomes_without_capturing_import_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             engine = Path(tmp) / "engine.py"

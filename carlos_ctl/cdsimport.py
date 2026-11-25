@@ -71,6 +71,13 @@ def _identifier(value: str) -> str:
     return value
 
 
+def _run_id(value: str) -> str:
+    # The import engine compares the two handles as canonical lowercase UUIDs.
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value, flags=re.ASCII | re.IGNORECASE):
+        raise argparse.ArgumentTypeError("invalid run identifier")
+    return value.lower()
+
+
 def _number(value: str) -> str:
     if not re.fullmatch(r"[0-9]{1,20}", value, flags=re.ASCII):
         raise argparse.ArgumentTypeError("invalid number")
@@ -84,10 +91,10 @@ def _provider(value: str) -> str:
 
 
 def _reason(value: str) -> str:
-    # The stated reason travels only to the engine's protected record. It is a single
-    # bounded line; control and line-separator characters are refused.
+    # The reason travels in process arguments and is retained in the protected run record.
     if not value.strip() or len(value) > MAX_REASON or any(
-            ord(char) < 32 or 127 <= ord(char) < 160 or char in "\u2028\u2029" for char in value):
+            ord(char) < 32 or 127 <= ord(char) < 160 or 0xd800 <= ord(char) <= 0xdfff
+            or char in "\u2028\u2029" for char in value):
         raise argparse.ArgumentTypeError("invalid reason")
     return value
 
@@ -112,8 +119,8 @@ def parser() -> argparse.ArgumentParser:
                 "1 arguments; 2 configuration/runtime; 3 denied; 4 refused/busy/failed/"
                 "partial/uncertain; 130 interrupted. Status/report success does not mean "
                 "the recorded import is complete. A nonzero result can coexist with "
-                "committed clinical data; resume/reconcile by run ID. An abandon always "
-                "exits 4: an abandoned import is never complete."),
+                "committed clinical data. A recorded abandon returns 4, as can a refusal. "
+                "Use --status to confirm ABANDONED and inspect maintenanceReleaseState."),
     )
     ap.add_argument("--input", action=_Once, metavar="PATH",
                     help="source XML, ZIP or directory within the configured allowed root")
@@ -143,17 +150,16 @@ def parser() -> argparse.ArgumentParser:
     modes.add_argument("--status-submission", action=_Once, type=_identifier, metavar="KEY",
                        help="recover a run handle from its printed submission key without resubmitting")
     modes.add_argument("--abandon", action=_Once, nargs=0, const=True, default=False,
-                       help=("close a stopped, already cancelled import that cannot complete: its "
-                             "held charts are released incomplete, no clinical data changes, and "
-                             "the EMR reopens once no other import holds a chart; requires --run, "
-                             "--confirm and --reason; always exits 4"))
-    ap.add_argument("--run", action=_Once, type=_identifier, metavar="RUN_ID",
+                       help=("close a stopped, already cancelled import that cannot complete. "
+                             "It releases the run's held charts incomplete and preserves clinical data. "
+                             "Requires --run, --confirm and --reason"))
+    ap.add_argument("--run", action=_Once, type=_run_id, metavar="RUN_ID",
                     help="the run to abandon")
-    ap.add_argument("--confirm", action=_Once, type=_identifier, metavar="RUN_ID",
+    ap.add_argument("--confirm", action=_Once, type=_run_id, metavar="RUN_ID",
                     help="the same run ID again, confirming the abandon")
     ap.add_argument("--reason", action=_Once, type=_reason, metavar="TEXT",
-                    help=("why the import is abandoned, one line of at most 1000 characters, "
-                          "kept in the run's protected record; never name a patient"))
+                    help=("one line of at most 1000 characters for the protected run record. Other local users "
+                          "may see process arguments. Give an operational reason without patient or confidential details"))
     return ap
 
 

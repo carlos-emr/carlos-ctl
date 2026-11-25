@@ -164,9 +164,17 @@ def parse_args(argv: Sequence[str]):
     for field in ("patients_file", "output"):
         value = getattr(args, field)
         if value is not None:
-            if not value or len(value) > 8192 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            # abspath removes ".." lexically. A preceding symlink (or missing directory)
+            # would make that a different file from the selection or destination supplied.
+            if not value or ".." in value.split(os.sep) or any(ord(c) < 32 or 127 <= ord(c) < 160 for c in value):
                 ap.error("invalid path")
-            setattr(args, field, os.path.abspath(value))
+            absolute = os.path.abspath(value)
+            try:
+                if len(absolute.encode("utf-16-le")) > 2 * 8192:  # the Java Path contract counts UTF-16 units
+                    ap.error("invalid path")
+            except UnicodeEncodeError:
+                ap.error("invalid path")
+            setattr(args, field, absolute)
     return args
 
 

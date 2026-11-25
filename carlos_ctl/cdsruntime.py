@@ -84,15 +84,14 @@ class Ticket:
 
     def remove(self) -> bool:
         try:
-            try:
-                entry = os.stat(self.name, dir_fd=self.directory_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                # The root-owned expiry cleanup may already have retired it.
-                return True
+            entry = os.stat(self.name, dir_fd=self.directory_fd, follow_symlinks=False)
             if not stat.S_ISREG(entry.st_mode) or entry.st_uid != 0 \
                     or (entry.st_dev, entry.st_ino) != (self.device, self.inode):
                 return False
             os.unlink(self.name, dir_fd=self.directory_fd)
+            return True
+        except FileNotFoundError:
+            # The root-owned expiry sweep may win either the stat or the unlink.
             return True
         except OSError:
             return False
@@ -169,7 +168,11 @@ def create_ticket(operator: str, uid: int, provider: str, operation: str,
         directory_fd = os.open(directory_name,
                                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                                dir_fd=parent_fd)
-        if created:
+        metadata = os.fstat(directory_fd)
+        # A stopped creator can leave its empty, private directory before it
+        # publishes the service-read permissions. Finish that setup on retry.
+        if created or (metadata.st_uid == 0 and stat.S_IMODE(metadata.st_mode) == 0o700
+                       and not os.listdir(directory_fd)):
             os.fchown(directory_fd, 0, gid)
             os.fchmod(directory_fd, 0o750)
         directory = os.fstat(directory_fd)
@@ -357,18 +360,24 @@ def run_engine(command: Sequence[str], arguments: Sequence[str], env: Mapping[st
     stop = stop_probe if stop is None else stop
     process = None
     requested_signal = None
+    pending_signal = None
     old_handlers = {}
 
+    def send(signum):
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            # The engine finished concurrently; its durable result remains authoritative.
+            pass
+
     def forward(signum, frame):
-        nonlocal requested_signal
-        repeat = requested_signal is not None
+        nonlocal requested_signal, pending_signal
+        delivery = signum if requested_signal is None else signal.SIGKILL
         requested_signal = signum
-        if process is not None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL if repeat else signum)
-            except ProcessLookupError:
-                # The engine finished concurrently; its durable result remains authoritative.
-                pass
+        if process is None:
+            pending_signal = delivery
+        else:
+            send(delivery)
 
     try:
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
@@ -377,12 +386,8 @@ def run_engine(command: Sequence[str], arguments: Sequence[str], env: Mapping[st
             return 128 + requested_signal
         process = subprocess.Popen(list(command) + list(arguments), env=dict(env),
                                    start_new_session=True)
-        if requested_signal is not None:
-            try:
-                os.killpg(process.pid, requested_signal)
-            except ProcessLookupError:
-                # Cancellation raced process completion; preserve its recorded outcome.
-                pass
+        if pending_signal is not None:
+            send(pending_signal)
         rc = process.wait()
         if rc < 0:
             return 128 - rc

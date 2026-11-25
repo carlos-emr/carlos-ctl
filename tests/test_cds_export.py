@@ -47,6 +47,17 @@ class TestExportArguments(unittest.TestCase):
             with self.subTest(categories=categories), self.assertRaises(cdsexport.CdsCommandError):
                 cdsexport.parse_args(EXPORT + ["--categories", categories])
 
+    def test_protected_paths_refuse_parent_components_and_unrepresentable_names(self):
+        selection = [*EXPORT[:2], *EXPORT[4:], "--patients-file"]
+        download = ["--provider", "007", "--download", RUN, "--artifact", "package", "--output"]
+        for request in (selection, download):
+            for path in ("nested/../case.json", "/some-dir/../case.json", "private\u0085name",
+                         "private\udc80name", "/" + "\U0001f600" * 4096):
+                with self.subTest(request=request, path=path), self.assertRaises(cdsexport.CdsCommandError) as caught:
+                    cdsexport.parse_args(request + [path])
+                self.assertEqual(caught.exception.code, 1)
+                self.assertNotIn(path, str(caught.exception))
+
     def test_existing_jobs_cannot_change_their_accepted_intent(self):
         for operation in ("status", "resume", "cancel", "report"):
             args = cdsexport.parse_args(["--provider", "007", "--" + operation, RUN])

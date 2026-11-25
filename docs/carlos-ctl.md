@@ -297,7 +297,7 @@ delegation. `sudo` does not grant clinical attribution by itself.
 | `--synthetic`, `--course ID`, `--timeshift DAYS` | Approved synthetic/anonymized workflow; course/nonzero shift require synthetic mode, which cannot merge real charts |
 | `--status-submission KEY` | Read-only recovery after acceptance output loss; same verified OS operator and selected provider; unknown outcome remains uncertain, never resubmits |
 | `--status RUN_ID`, `--resume RUN_ID`, `--cancel RUN_ID`, `--report RUN_ID` | Mutually exclusive existing-run operations, always with `--provider ID`; source/import options cannot be replaced |
-| `--abandon --run RUN_ID --confirm RUN_ID --reason TEXT` | Close a stopped, already cancelled import that cannot complete; see below. Always with `--provider ID`; always exits `4` |
+| `--abandon --run RUN_ID --confirm RUN_ID --reason TEXT` | Close a stopped, cancelled import with `--provider ID`. Verify `ABANDONED` using `--status` as described below. |
 
 The foreground import command streams the engine's safe progress and waits for
 its outcome. It does not capture batch output in memory. The engine retains
@@ -327,7 +327,10 @@ outcome and must not be treated as proof of rollback.
 A stopped import that has written charts keeps them held, and the EMR closed
 for ordinary clinical work, until it completes. When it cannot complete (the
 same defect stops every resume, or an upgrade changed the ruleset it is bound
-to), its own operator closes it with an audited abandon after cancelling it:
+to), an authorized operator can cancel the run and record an audited abandonment.
+The operator's live root delegation must cover the run's provider, facility and
+program. This also permits recovery of a run started by someone else or in the
+browser.
 
 ```bash
 sudo carlos-ctl cds-import --cancel RUN_ID --provider 999998
@@ -335,19 +338,26 @@ sudo carlos-ctl cds-import --abandon --run RUN_ID --confirm RUN_ID \
   --reason "defect stops every resume; vendor ticket 1234" --provider 999998
 ```
 
-The engine refuses, and changes nothing, unless the run is stopped after
-writing, cancelled and free of a pending resume or review, and the operator
-and provider are the run's own. No clinical data is deleted or changed: each
-held chart's committed rows are checked against their sealed receipts, the
-charts are released incomplete and marked `ABANDONED`, the run becomes
-`ABANDONED` for good, and the maintenance window reopens once no other import
-holds a chart. The reason (one line, at most 1000 characters) goes to the
-run's protected record and is never printed; like any argument it is briefly
-visible to other administrators on the host, so never name a patient in it.
-The command always exits `4`, and every released chart needs clinical
-reconciliation. It needs a CARLOS release whose engine advertises the abandon
-operation (`CDS_HANDSHAKE` otherwise); see the CARLOS CDS import operator
-guide for the full procedure.
+The engine requires a stopped, cancelled run with committed work and no pending
+resume or review. It checks the committed rows against
+their sealed receipts before releasing the held charts as incomplete. Use an
+operational reason of at most 1000 characters on one line. The reason goes into
+the protected run record, and other local users may see it in the command's process
+arguments. Keep patient identifiers and confidential details out of the reason.
+
+A recorded abandonment returns `4`. A refusal or incomplete outcome can also return
+`4`. Invalid arguments return `1`, a handshake or runtime failure returns `2`, and
+denied authority returns `3`. Check the run with the following command and confirm
+`ABANDONED` before treating the chart holds as released.
+
+```bash
+sudo carlos-ctl cds-import --status RUN_ID --provider 999998
+```
+
+Each released chart needs clinical reconciliation. Check `maintenanceReleaseState`
+separately. `RELEASED` confirms the maintenance window reopened. Another import
+holding a chart can defer release, and a failed release can require reconciliation.
+The CARLOS CDS import operator guide covers the recovery procedure.
 
 Only `/etc/carlos-emr/carlos.properties` is selected by this host adapter; no
 credential is placed in argv. The root wrapper records the verified invoking

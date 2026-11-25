@@ -493,18 +493,23 @@ resubmitting the input.
 .B --abandon --run RUN_ID --confirm RUN_ID --reason TEXT --provider ID
 Close a stopped import that has written charts and cannot complete, for
 example because the same defect stops every resume or an upgrade changed the
-ruleset it is bound to. Cancel the run first; the engine refuses an abandon
-of a run that is not stopped and cancelled, has a pending resume or review,
-or belongs to another operator or provider, and then changes nothing. The run
-ID is typed twice. The reason, one line of at most 1000 characters, is kept
-in the run's protected record and never printed; like every argument it is
-briefly visible to other administrators on the host, so never name a patient
-in it. No clinical data is deleted or changed: each held chart's committed
-rows are checked against their sealed receipts, the charts are released
-incomplete and marked ABANDONED, the run becomes ABANDONED for good, and the
-maintenance window reopens once no other import holds a chart. The command
-always exits 4; the released charts need clinical reconciliation. It requires
-a CARLOS engine that advertises the abandon operation.
+ruleset it is bound to. Cancel the run first. The engine requires committed
+work, a stopped and cancelled run, and no pending resume or review. A live
+root delegation covering the run's provider, facility and program also permits
+an operator to close a run started by someone else or in the browser. Type the
+run ID twice. The reason is one line of at most 1000 characters in the
+run's protected record. Other local users may see it in process arguments.
+Give an operational reason without patient identifiers or confidential details.
+The engine checks the committed rows against their sealed receipts and
+releases the held charts incomplete. A recorded abandonment returns 4.
+A refusal or incomplete outcome can also return 4. Invalid arguments return
+1, handshake or runtime failures return 2, and denied authority returns 3.
+Use
+.B --status RUN_ID --provider ID
+and confirm ABANDONED before treating the chart holds as released.
+Each released chart needs clinical reconciliation. Check maintenanceReleaseState
+separately. RELEASED confirms the maintenance window reopened. Another import
+holding a chart can defer release, and a failed release can require reconciliation.
 .IP
 The wrapper verifies a bounded version/capability handshake before execution,
 requires Java 25 and runs the engine as the carlos service account with the
@@ -1122,9 +1127,8 @@ A successful observation does not establish a completed export.
 .B cds-import
 uses 0 for a clean complete import, verified no-op or valid dry run; 1 for
 arguments; 2 for configuration/runtime/protocol failure; 3 for denied authority;
-4 for refused/busy/failed/partial/uncertain or incomplete import, and for every
-.B --abandon
-(an abandoned import is never complete). An interrupted
+4 for refused/busy/failed/partial/uncertain or incomplete import, including
+a recorded abandonment. An interrupted
 process may use 130 or the conventional signal status. For
 .B --status
 or
