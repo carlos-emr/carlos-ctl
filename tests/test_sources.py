@@ -2,6 +2,7 @@
 import gzip
 import hashlib
 import io
+import json
 from pathlib import Path
 import tarfile
 import tempfile
@@ -9,7 +10,7 @@ import unittest
 import contextlib
 from unittest import mock
 
-from carlos_ctl import o19bundle, o19import, o19sources
+from carlos_ctl import o19bundle, o19debug, o19import, o19sources
 
 
 class TestCompleteBackupSet(unittest.TestCase):
@@ -367,17 +368,35 @@ class TestCompleteBackupSet(unittest.TestCase):
         self.assertEqual(args.dump_parts, ["main.sql", "myisam.sql"])
         self.assertEqual(args.documents_parts, ["full.tar", "increment.tar"])
 
-    def context(self, dump, state, restage=False, assessment=False):
+    def context(self, dump, state, restage=False, assessment=False, debug=False):
         properties = self.root / "oscar.properties"
         properties.write_text("billregion=ON\n")
         args = o19import._parser("test", True).parse_args([
             "--dump", dump, "--properties", str(properties), "--skip-documents",
             "--accept", "no-documents", "--dev-target", "--mariadb-arg=--no-defaults"])
         args.restage = restage
+        args.debug = debug
+        versions = {"carlos-ctl": "1.3.6", "carlos-emr": "2026.08.0-beta9"}
         with mock.patch.object(o19import.HOST, "is_packaged_host", return_value=False), \
                 mock.patch.object(o19import, "take_workspace_lock"), \
-                mock.patch.object(o19import, "package_version", return_value="test"):
+                mock.patch.object(o19import, "package_version", side_effect=lambda p="carlos-emr": versions[p]):
             return o19import._make_ctx(args, not assessment, str(state))
+
+    def test_preflight_trace_records_both_packages_and_retires_even_before_staging(self):
+        state = self.root / "state"
+        self.context(self.dump("clinic.sql"), state, assessment=True, debug=True)
+        path = state / o19debug.FILENAME
+        opened = json.loads(path.read_text())
+        self.assertEqual((opened["mode"], opened["carlos_ctl_version"], opened["carlos_emr_version"]),
+                         ("preflight", "1.3.6", "2026.08.0-beta9"))
+        self.assertFalse((state / "state.json").exists())
+        with mock.patch.object(o19import.time, "strftime", return_value="same-second"):
+            self.assertIsNone(o19import.archive_state(str(state)))
+            self.context(str(self.root / "clinic.sql"), state, assessment=True, debug=True)
+            self.assertIsNone(o19import.archive_state(str(state)))
+        self.assertFalse(path.exists())
+        attempts = [json.loads(p.read_text())["attempt"] for p in state.glob(o19debug.FILENAME + ".completed-*")]
+        self.assertEqual(len(set(attempts)), 2)
 
     def test_only_accepted_durable_source_sets_retire_older_siblings(self):
         state = self.root / "state"

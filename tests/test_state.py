@@ -2882,7 +2882,7 @@ class TestVerifyPhaseFiles(unittest.TestCase):
         from carlos_ctl import o19roles
         self._parity = o19import._row_parity
         self._checks = o19roles.verify_role_checks
-        o19import._row_parity = lambda ctx, placeholders=(): (["t: 1 -> 1"], [])
+        o19import._row_parity = lambda ctx, placeholders=(), *, phase="P4": (["t: 1 -> 1"], [])
         self.private = ["expired logins: fixture.expired"]
         #: staging-side row count for patient 7; equal to the target's 1
         #: for a clean run, raised by a test that wants a real mismatch
@@ -3032,7 +3032,7 @@ class TestVerifyPhaseFiles(unittest.TestCase):
         ctx["query"] = query
         with mock.patch.object(o19import, "_row_parity", return_value=([], [])) as parity:
             o19import.run_p7(ctx)
-        parity.assert_called_once_with(ctx, planned)
+        parity.assert_called_once_with(ctx, planned, phase="P7")
         report = Path(self.state_dir, "import-report.txt").read_text()
         self.assertIn("PASSED — 1 SOURCE-DOCUMENT PLACEHOLDER(S)", report)
         self.assertNotIn(original, report)
@@ -3129,7 +3129,7 @@ class TestVerifyPhaseFiles(unittest.TestCase):
         off on. Summing them as passes told report.txt -- the only
         place the count appears without the sections that split it --
         that every one of them was a check that passed."""
-        o19import._row_parity = lambda ctx, placeholders=(): ([
+        o19import._row_parity = lambda ctx, placeholders=(), *, phase="P4": ([
             "demographic: staging 10 -> target 10",
             "drugs: staging 4 -> target 4",
             o19etl.UNCHECKED_PREFIX + "providerExt: no primary key",
@@ -3628,8 +3628,7 @@ class TestTheFullProblemListSurvives(unittest.TestCase):
         from carlos_ctl import o19roles
         ctx = self.ctx()
         err = io.StringIO()
-        with mock.patch.object(o19import, "_row_parity",
-                               lambda c, placeholders=(): ([], list(problems))), \
+        with mock.patch.object(o19import, "_row_parity", return_value=([], list(problems))), \
                 mock.patch.object(o19roles, "verify_role_checks",
                                   lambda *a: ([], [], [], [])), \
                 contextlib.redirect_stdout(io.StringIO()), \

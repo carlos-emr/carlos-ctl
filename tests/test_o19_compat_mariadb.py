@@ -9,6 +9,7 @@ Example in an Ubuntu 26.04 test container after installing carlos-ctl:
   export CARLOS_TEST_MARIADB_SOCKET=/run/mysqld/mysqld.sock
   python3 -m unittest -v test_o19_compat_mariadb.py
 """
+import json
 import os
 import subprocess
 import tempfile
@@ -18,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from carlos_ctl import o19_preflight as pf, o19docs, o19etl, o19host, o19import, o19sources
+from carlos_ctl import o19_preflight as pf, o19debug, o19docs, o19etl, o19host, o19import, o19sources
 from tests.test_docs_driver import make_tar
 
 
@@ -47,6 +48,13 @@ class TestO19Compatibility(unittest.TestCase):
                             text=True, capture_output=True, timeout=30, check=True)
         return o19import.batch_rows(cp.stdout)
 
+    def diagnostics(self, mode="import", verbose=False, resume=False):
+        return o19debug.Diagnostics(self.temp.name, o19import.append_private, verbose=verbose, mode=mode,
+                                    resume=resume, version="test", manifest="test", timeout=0)
+
+    def events(self):
+        return [json.loads(line) for line in Path(self.temp.name, o19debug.FILENAME).read_text().splitlines()]
+
     def test_audit_log_width_on_the_host_dry_run_and_before_copy(self):
         self.q("CREATE TABLE {0}.Log (id BIGINT PRIMARY KEY, data TEXT CHARACTER SET latin1); "
                "INSERT INTO {0}.Log VALUES (0, REPEAT(0x80, 65535)), (50001, 'last'); "
@@ -60,7 +68,8 @@ class TestO19Compatibility(unittest.TestCase):
             return etl_query(sql)
 
         ctx = {"state_dir": self.temp.name, "state": {}, "target_db": self.dst, "query": self.q,
-               "query_etl": counted, "dry_run": True, "accepted": ["content-migration"], "province": "on"}
+               "query_etl": counted, "dry_run": True, "accepted": ["content-migration"], "province": "on",
+               "diagnostics": self.diagnostics("dry-run")}
 
         def assess():
             with patch.object(pf, "run_checks", return_value={"schema_map_version": "test", "findings": []}), \
@@ -93,6 +102,11 @@ class TestO19Compatibility(unittest.TestCase):
         unreadable = assess()
         self.assertEqual(unreadable["exit_code"], 2)
         self.assertRegex(unreadable["findings"][0]["detail"], r"Log\.data \(id 50000\.\.50001\).*1030.*168")
+        failed, = self.events()
+        self.assertEqual((failed["phase"], failed["source_table"], failed["target_table"],
+                          failed["first_id"], failed["last_id"]), ("P2", "Log", "log", 50000, 50001))
+        self.assertEqual((failed["sqlstate"], failed["engine_errno"]), ("HY000", 168))
+        self.assertEqual(self.q(failed["width_count_sql"]), [["1"]])
 
         o19etl.normalize_table_case(self.q, self.src, ["Log"])
         src = o19etl.introspect_columns(self.q, self.src)
@@ -147,18 +161,31 @@ class TestO19Compatibility(unittest.TestCase):
 
         run = SimpleNamespace(query=interrupted, plain=self.q, src=self.src, dst=self.dst, arch=self.src,
                               state_dir=self.temp.name, progress=progress, counts={"copy": 0},
-                              seed_group=set(), admin_user=None, admin_pn=None)
+                              seed_group=set(), admin_user=None, admin_pn=None,
+                              src_info=src, diagnostics=self.diagnostics())
         with self.assertRaisesRegex(o19etl.QueryError, r"log \(id 49999\.\.50000\).*1030.*168"):
             o19etl.etl_copy_table(run, "log", entry, state, dst["log"], set())
         self.assertEqual(o19etl.load_progress(self.temp.name)["tables"]["log"], {"started": True, "done_through": 49998})
+        failed, = self.events()
+        self.assertEqual((failed["phase"], failed["operation"], failed["checkpoint_through"]),
+                         ("P4", "verify copied values before checkpoint", 49998))
+        self.assertEqual(failed["source_column_by_target"], {"id": "id", "data": "data"})
         run.query = query
+        run.diagnostics = self.diagnostics(verbose=True, resume=True)
         o19etl.etl_copy_table(run, "log", entry, state, dst["log"], set())
         self.assertTrue(state["done"])
+        retried = [e for e in self.events() if e["event"] == "started" and "first_id" in e]
+        self.assertEqual([e["operation"] for e in retried], ["clear unconfirmed range on resume", "insert copied rows",
+                                                              "verify copied values before checkpoint"])
+        self.assertTrue(all(e["resume"] and e["first_id"] == 49999 and e["last_id"] == 50000 for e in retried))
         args = self.src, self.dst, src, dst
         self.assertEqual(o19etl.copy_content_parity(query, *args)[1], [])
-        ok, bad = o19etl.copy_content_parity(interrupted, *args)
+        ok, bad = o19etl.copy_content_parity(interrupted, *args, diagnostics=run.diagnostics)
         self.assertFalse(ok)
         self.assertRegex(bad[0], r"id 49999\.\.50000.*1030.*168")
+        final = self.events()[-1]
+        self.assertEqual((final["phase"], final["operation"], final["event"], final["engine_errno"]),
+                         ("P7", "compare copied values", "failed", 168))
         # Same row count, but one changed value and one missing twin.
         self.q("UPDATE {0}.log SET data='changed' WHERE id=49998; "
                "UPDATE {0}.log SET id=50001 WHERE id=50000".format(self.dst))
@@ -168,6 +195,39 @@ class TestO19Compatibility(unittest.TestCase):
         self.assertIn("log: 2 copied row(s)", bad[0])
         self.assertIn("id=49998", details[0])
         self.assertIn("id=50000", details[1])
+
+        def blocked_detail(sql):
+            if " JOIN " in sql and " LIMIT " in sql and not sql.startswith("SELECT COUNT("):
+                raise o19etl.QueryError("ERROR 1030 (HY000): Got error 168 from InnoDB")
+            return query(sql)
+
+        missing_details = []
+        self.assertEqual(o19etl.copy_content_parity(blocked_detail, *args, details=missing_details,
+                                                   diagnostics=run.diagnostics)[1], bad)
+        self.assertTrue(all("keys unavailable" in line for line in missing_details))
+        failed_details = [e for e in self.events() if e.get("operation") == "collect mismatch details"
+                          and e["event"] == "failed"]
+        self.assertEqual([(e["first_id"], e["engine_errno"]) for e in failed_details], [(-1, 168), (49999, 168)])
+
+    def test_hrm_and_chart_file_ownership_use_exact_linux_names(self):
+        for schema, table, charset in ((self.src, "hrmDOCUMENT", "latin1"), (self.dst, "HRMDocument", "utf8mb4")):
+            self.q(f"CREATE TABLE `{schema}`.`{table}` (id INT PRIMARY KEY, reportFile VARCHAR(255)) "
+                   f"DEFAULT CHARSET={charset} COLLATE={charset}_{'swedish_ci' if charset == 'latin1' else 'general_ci'}")
+            self.q(f"INSERT INTO `{schema}`.`{table}` VALUES "
+                   "(1, '/HRM/A/café.hl7'), (2, '/HRM/a/café.hl7'), "
+                   "(3, '/2010/Report.hl7'), (4, '/2020/report.hl7'), "
+                   "(5, '/2012/Cafe.hl7'), (6, '/2013/Café.hl7')")
+        self.assertEqual(self.q(o19docs.hrm_basename_twins_sql(self.dst)), [["café.hl7", "2"]])
+        problems = o19docs.source_hrm_basename_problems(self.q, self.src, "hrmDOCUMENT", self.dst)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("'café.hl7': 2 distinct source paths", problems[0])
+
+        self.q(f"CREATE TABLE `{self.dst}`.document (docfilename VARCHAR(255)) "
+               "DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
+        self.q(f"INSERT INTO `{self.dst}`.document VALUES "
+               "(NULL), (''), (' '), ('Resume.pdf'), ('resume.pdf'), ('résumé.pdf'), ('resume.pdf ')")
+        self.assertEqual(o19docs.claimed_document_names(self.q, self.dst),
+                         {" ", "Resume.pdf", "resume.pdf", "résumé.pdf", "resume.pdf "})
 
     def test_document_notice_resumes_and_preserves_exact_document_parity(self):
         for schema in (self.src, self.dst):

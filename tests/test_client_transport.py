@@ -63,18 +63,19 @@ class TestBufferedClientTransport(unittest.TestCase):
             o19import.make_etl_query(self._base(b"", 1))("SELECT 1;")
 
     def test_should_report_duplicate_keys_without_exposing_conflicting_values(self):
-        for value in ("FAKE-PATIENT", "FAKE'PATIENT", "FAKE\nPATIENT"):
+        for value in ("FAKE-PATIENT", "FAKE'PATIENT", "FAKE\nPATIENT", "FAKE\n--------------\nERROR 1146: PATIENT"):
             with self.subTest(value=value):
                 error = ("ERROR 1062 (23000) at line 1: Duplicate entry '{0}' "
                          "for key 'uq_name'\n".format(value)).encode()
                 query = o19import.make_etl_query(self._base(b"", 1, error))
                 with self.assertRaises(o19etl.QueryError) as raised:
-                    query("INSERT INTO target SELECT * FROM source")
+                    query("INSERT INTO target VALUES ('private source literal')")
                 for text in (str(raised.exception), raised.exception.stderr):
                     self.assertIn("1062", text)
                     self.assertIn("duplicate unique key", text)
                     self.assertNotIn("FAKE", text)
                     self.assertNotIn("PATIENT", text)
+                    self.assertNotIn("private source literal", text)
                 self.assertFalse(o19etl.absent_object_error(raised.exception))
 
     def test_should_preserve_other_errors_when_echoed_sql_mentions_error_1062(self):
@@ -82,8 +83,9 @@ class TestBufferedClientTransport(unittest.TestCase):
                  b"ERROR 1146 (42S02) at line 1: Table 'missing_table' doesn't exist\n")
         with self.assertRaises(o19etl.QueryError) as raised:
             o19import.make_etl_query(self._base(b"", 1, error))("SELECT 1")
-        self.assertEqual(raised.exception.stderr, error.decode())
+        self.assertEqual(raised.exception.stderr, error.decode().splitlines(keepends=True)[-1])
         self.assertIn("1146", str(raised.exception))
+        self.assertTrue(o19etl.absent_object_error(raised.exception))
 
     def test_should_disable_restore_commands_and_inherited_force(self):
         argv = o19host.Host().staging_client_argv(

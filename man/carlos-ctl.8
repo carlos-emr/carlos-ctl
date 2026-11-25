@@ -639,6 +639,9 @@ The final report counts the notices and
 .I documents-details.txt
 lists their original filenames. Unsafe paths, empty files, missing HRM
 reports and missing eForm assets require source correction.
+Preflight also checks for HRM report names already claimed by chart
+attachments. When incoming files could share a destination, it checks
+their sizes and compares the contents of equal-sized candidates.
 For an import that stopped at document reconciliation, repeat the command
 with the same inputs and add
 .BR "\-\-resume \-\-accept missing-source-documents" .
@@ -651,6 +654,30 @@ When a column definition cannot establish the bound, the importer measures
 the values. On large tables with a declared, indexed, non-null integer chunk key,
 it checks successive ID ranges. Oversized values and failed reads block
 the import. Copy verification also reads the audit log in ranges.
+.PP
+If a database operation fails during a width check, table copy or copied-value check, the
+importer writes a private diagnostic record in
+.IR /var/lib/carlos-emr/o19-import/import-debug.jsonl .
+Add
+.B \-\-debug
+to a hosted preflight, dry run, import or resume to also record the start
+and completion of these operations. Follow a long-running check with
+.BR "sudo tail \-f /var/lib/carlos-emr/o19-import/import-debug.jsonl" .
+Each attempt has its own ID and records the installed carlos-ctl and
+carlos-emr versions. Records include UTC time, elapsed seconds,
+schema, table and column names, and the inclusive key range when applicable.
+A resumed copy reports its last recorded checkpoint. The trace identifies
+TEXT and BLOB widths proven from the column definitions. A direct column
+width measurement includes its read-only count query and target limit. For MariaDB
+error 1030, the trace gives the server error codes and a time-bounded
+journal command to run on the database host. If MariaDB logs to a file,
+use the same UTC interval in its configured error log. The record includes
+the query to locate that log on the database host.
+.PP
+The trace is mode 0600. It retains database identifiers and range boundaries
+for diagnosis. Row contents, credentials, server message text and derived SQL
+expressions are excluded. The database server's own
+log can contain clinical values and should be reviewed locally.
 .PP
 .B \-\-dry-run
 stages and reports without writing to the EMR schema (its
@@ -750,6 +777,7 @@ rehearsed profile for is refused);
 .BR \-\-role-template " CUSTOM=STOCK;"
 .BR \-\-accept " CLASS;"
 .BR \-\-dry-run ,
+.BR \-\-debug ,
 .BR \-\-resume ,
 .BR \-\-restage ,
 .BR \-\-cleanup ;
@@ -861,6 +889,7 @@ takes no lock. Options:
 .BR \-\-province ,
 .BR \-\-accept ,
 .BR \-\-restage ,
+.BR \-\-debug ,
 .BR \-\-mariadb-arg ,
 .B \-\-dev-target
 as for
@@ -963,6 +992,8 @@ and
 continues from),
 .I report.txt
 (the running phase log),
+.I import-debug.jsonl
+(database diagnostics from the run and its attempts),
 .I preflight.txt
 and
 .IR preflight.json ,

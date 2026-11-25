@@ -27,6 +27,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
 import urllib.parse
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -143,16 +144,31 @@ def read_documents_archive(path: str) -> Tuple[List[Tuple[str, str, int]], str]:
 HRM_INCOMING_DIR = "hrm"
 
 
-def hrm_basename_twins_sql(dst_schema: str) -> str:
+def hrm_basename_twins_sql(schema: str, table: str = "HRMDocument", report_file: str = "reportFile") -> str:
     """Basenames that two HRMDocument rows reach through DIFFERENT paths
     (re-sent reports land in dated directories under hrm/sftp_downloads
     and may repeat a name): the basename rewrite would point both rows
     at one file, so the import refuses before rewriting anything."""
-    return ("SELECT SUBSTRING_INDEX(REPLACE(reportFile, '\\\\', '/'), '/', "
-            "-1) AS b, COUNT(DISTINCT REPLACE(reportFile, '\\\\', '/')) AS "
-            "paths FROM `{0}`.HRMDocument WHERE reportFile IS NOT NULL AND "
-            "reportFile <> '' GROUP BY b HAVING paths > 1 ORDER BY b"
-            .format(dst_schema))
+    # The Linux document directory compares exact filename bytes. Return UTF-8
+    # bytes as well, including when the source column uses a legacy charset.
+    path = "REPLACE(CONVERT({0} USING utf8mb4), '\\\\', '/')".format(report_file)
+    return ("SELECT BINARY SUBSTRING_INDEX({0}, '/', -1) AS b, COUNT(DISTINCT BINARY {0}) AS paths "
+            "FROM {1}.{2} WHERE {3} IS NOT NULL AND BINARY {3} <> '' "
+            "GROUP BY b HAVING paths > 1 ORDER BY b"
+            .format(path, o19etl.ident(schema), o19etl.ident(table), report_file))
+
+
+def source_hrm_basename_problems(query, src, table, dst):
+    """Account for the target column charset before comparing filesystem paths."""
+    metadata = query("SELECT CHARACTER_SET_NAME FROM information_schema.COLUMNS "
+                     "WHERE TABLE_SCHEMA = '{0}' AND TABLE_NAME = 'HRMDocument' AND COLUMN_NAME = 'reportFile'"
+                     .format(sql_escape(dst)))
+    if (len(metadata) != 1 or len(metadata[0]) != 1
+            or not re.fullmatch(r"[A-Za-z0-9_]+", metadata[0][0] or "")):
+        return ["Cannot check HRM filename collisions without the target HRMDocument.reportFile character set."]
+    expr = "CONVERT(reportFile USING {0})".format(metadata[0][0])
+    return ["HRM report {0!r}: {1} distinct source paths would share this filename in document/".format(name, count)
+            for name, count in query(hrm_basename_twins_sql(src, table, expr))]
 
 
 def hrm_rewrite_sql(dst_schema: str,
@@ -167,7 +183,7 @@ def hrm_rewrite_sql(dst_schema: str,
     run_docs moves the report files there. Idempotent: rewriting an
     already-rewritten path yields the same path."""
     doc_dir = os.path.join(new_root, TARGET_CTX, "document") + "/"
-    where = "reportFile IS NOT NULL AND reportFile <> ''"
+    where = "reportFile IS NOT NULL AND BINARY reportFile <> ''"
     # a Windows-era path (backslashes) yields its basename too
     update = ("UPDATE `{0}`.HRMDocument SET reportFile = CONCAT('{1}', "
               "SUBSTRING_INDEX(REPLACE(reportFile, '\\\\', '/'), '/', -1)) "
@@ -1354,14 +1370,27 @@ def source_document_names(entries: List[Tuple[str, str, int]],
             if size is not None}
 
 
-def document_source_gaps(query, schema: str, table: str,
-                         entries: Dict[str, Optional[int]]) -> Tuple[Dict[int, str], List[str]]:
-    """List absent attachments eligible for a notice and other document problems."""
-    rows = query(
+def source_document_rows(query, schema: str, table: str):
+    return query(
         "SELECT document_no, docfilename FROM {0}.{1} WHERE docfilename IS NOT NULL "
         "AND BINARY docfilename <> '' ORDER BY document_no"
         .format(o19etl.ident(schema), o19etl.ident(table)))
-    reserved = set(entries) | {served_name(row[1]) for row in rows}
+
+
+def claimed_document_names(query, schema):
+    rows = query("SELECT DISTINCT BINARY CONVERT(docfilename USING utf8mb4) FROM {0}.document "
+                 "WHERE docfilename IS NOT NULL AND BINARY docfilename <> ''".format(o19etl.ident(schema)))
+    return {served_name(name) for name, in rows}
+
+
+def document_source_gaps(query, schema: str, table: str,
+                         entries: Dict[str, Optional[int]]) -> Tuple[Dict[int, str], List[str]]:
+    """List absent attachments eligible for a notice and other document problems."""
+    rows = source_document_rows(query, schema, table)
+    return attachment_gaps(rows, entries, set(entries) | {served_name(name) for _, name in rows})
+
+
+def attachment_gaps(rows, entries, reserved):
     missing = {}
     blocked = []
     for doc_no, filename in rows:
@@ -1541,6 +1570,47 @@ def source_eform_asset_names(entries: List[Tuple[str, str, int]],
     return names
 
 
+def _differing_hrm_files(path, context, incoming, documents, claimed):
+    """Compare exactly the basenames P5 would coalesce under document/."""
+    conflicts = set()
+    pending = {}
+    for name, members in incoming.items():
+        if name in claimed or (len(members) == 1 and name not in documents):
+            continue
+        candidates = dict(members)
+        if name in documents:
+            candidates[os.path.join(context, "document", name)] = documents[name]
+        sizes = set(candidates.values())
+        if len(sizes) != 1:
+            # Also catches a destination directory (its size is None).
+            conflicts.add(name)
+        elif sizes != {0}:
+            pending.update(candidates)
+    if pending:
+        first_digest = {}
+        # Read only the colliding payloads from the validated private archive.
+        # Forward iteration through GzipFile supports concatenated gzip members as
+        # in read_documents_archive. A plain tar can seek past unrelated files.
+        with tarfile.open(path, "r:gz" if path.endswith(".gz") else "r:") as archive:
+            for member in iter(archive.next, None):
+                archive.members.clear()  # Python 3.12 otherwise retains all the visited headers
+                key = os.path.normpath(member.name)
+                if key not in pending:
+                    continue
+                if not member.isreg() or member.size != pending.pop(key):
+                    raise ValueError("HRM file membership changed after archive validation")
+                with archive.extractfile(member) as content:
+                    digest = hashlib.file_digest(content, "sha256").digest()
+                name = os.path.basename(key)
+                if digest != first_digest.setdefault(name, digest):
+                    conflicts.add(name)
+                if not pending:
+                    break
+        if pending:
+            raise ValueError("an HRM file for comparison disappeared after archive validation")
+    return conflicts
+
+
 def source_document_findings(ctx, schema: str, tables: Dict[str, str]) -> List[Dict]:
     """Assess archived attachments and assets against the staged rows without extracting files."""
     from . import o19_preflight, o19import, o19roles
@@ -1557,21 +1627,37 @@ def source_document_findings(ctx, schema: str, tables: Dict[str, str]) -> List[D
 
     query = ctx["query"]
     documents = source_document_entries(entries, context)
-    missing, blocked = ({}, [])
-    if "document" in tables:
-        missing, blocked = document_source_gaps(query, schema, tables["document"], documents)
+    chart_rows = source_document_rows(query, schema, tables["document"]) if "document" in tables else []
+    claimed = {served_name(name) for _, name in chart_rows}
+    hrm_rows = []
     if "hrmdocument" in tables:
-        hrm_prefix = context + "/" + HRM_INCOMING_DIR + "/"
-        hrm_names = {os.path.basename(raw) for kind, raw, size in entries
-                     if kind == o19bundle.TAR_TYPE_FILE and size
-                     and os.path.normpath(raw).startswith(hrm_prefix)}
-        hrm_names.update(name for name, size in documents.items() if size)
-        for number, report in query(
-                "SELECT id, reportFile FROM {0}.{1} WHERE reportFile IS NOT NULL "
-                "AND reportFile <> ''".format(o19etl.ident(schema), o19etl.ident(tables["hrmdocument"]))):
-            if served_name(report) not in hrm_names:
-                blocked.append("HRMDocument {0}: {1!r} has no nonempty source report"
-                               .format(number, report))
+        hrm_rows = query("SELECT id, reportFile FROM {0}.{1} WHERE reportFile IS NOT NULL "
+                         "AND BINARY reportFile <> ''".format(o19etl.ident(schema), o19etl.ident(tables["hrmdocument"])))
+    hrm_prefix = context + "/" + HRM_INCOMING_DIR + "/"
+    incoming = {}
+    for kind, raw, size in entries:
+        path = os.path.normpath(raw)
+        if kind == o19bundle.TAR_TYPE_FILE and path.startswith(hrm_prefix):
+            incoming.setdefault(os.path.basename(path), {})[path] = size
+    report_names = {served_name(report) for _, report in hrm_rows}
+    reserved = set(documents) | claimed | incoming.keys() | report_names
+    missing, blocked = attachment_gaps(chart_rows, documents, reserved)
+    if len(hrm_rows) > 1:
+        blocked.extend(source_hrm_basename_problems(query, schema, tables["hrmdocument"], ctx["target_db"]))
+    # P5 moves every incoming HRM file, including ones without an HRM row.
+    # A chart row owns its basename even when its attachment is missing.
+    for name in sorted(claimed & (incoming.keys() | report_names)):
+        blocked.append("HRM report {0!r}: a chart document already claims this filename".format(name))
+    try:
+        conflicts = _differing_hrm_files(ctx["documents"], context, incoming, documents, claimed)
+        blocked.extend("HRM report {0!r}: conflicting files would share this filename in document/".format(name)
+                       for name in sorted(conflicts))
+    except o19bundle.ARCHIVE_ERRORS as exc:
+        blocked.append("Cannot compare colliding HRM files in the source archive: {0}".format(exc))
+    for number, report in hrm_rows:
+        name = served_name(report)
+        if name not in claimed and not (documents.get(name) or any(incoming.get(name, {}).values())):
+            blocked.append("HRMDocument {0}: {1!r} has no nonempty source report".format(number, report))
     if "eform" in tables:
         assets = source_eform_asset_names(entries, context)
         if not ctx["dev_target"]:
@@ -1996,9 +2082,7 @@ def run_docs(ctx) -> None:
     # reduced to the name CARLOS serves: a row storing `sub/report.pdf`
     # reserves `report.pdf`, which is the name the relocation would put
     # an HRM report under
-    claimed = {served_name(r[0]) for r in query(
-        "SELECT DISTINCT docfilename FROM `{0}`.document"
-        .format(ctx["target_db"])) if r and r[0]}
+    claimed = claimed_document_names(query, ctx["target_db"])
     hrm_lines = relocate_hrm_reports(ctx_root, private=private,
                                      reserved=claimed)
     if hrm_lines:

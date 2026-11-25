@@ -21,6 +21,7 @@ Run (from the repository root):
 
 import contextlib
 import csv
+import gzip
 import io
 import os
 import re
@@ -71,14 +72,16 @@ class FakeDb(object):
         # select and silently answers "no twins".
         if "HAVING paths > 1" in sql:
             return self.twins
-        if sql.startswith("SELECT DISTINCT docfilename"):
-            return [[f] for _no, f in self.documents]
+        if sql.startswith("SELECT DISTINCT BINARY CONVERT(docfilename"):
+            return [[f] for _no, f in self.documents if f]
         if sql.startswith("SELECT document_no, docfilename"):
             return [list(r) for r in self.documents]
         if sql.startswith("SELECT fid, form_name, form_html"):
             return self.eforms
         if "information_schema.TABLES" in sql:
             return [[t] for t in self.archive_tables]
+        if sql.startswith("SELECT CHARACTER_SET_NAME FROM"):
+            return [["utf8mb4"]]
         if "information_schema.COLUMNS" in sql:
             table = re.search(r"TABLE_NAME = '([^']+)'", sql).group(1)
             return [[c] for c in self.archive.get(table, ([], []))[0]]
@@ -378,6 +381,64 @@ class TestDocumentAssessment(DocsDriverBase):
         for name in ("empty.pdf", "outside.pdf", "report.hl7", "missing.png"):
             self.assertIn(name, details)
         self.assertNotIn("logo.png", details)
+
+    def test_preflight_respects_chart_and_hrm_filename_ownership(self):
+        self.tar = make_tar(os.path.join(self.tmp, "collisions.tar.gz"), {
+            "document/shared.pdf": "private scan",
+            "hrm/nested/claimed.hl7": "private report",
+            "hrm/nested/o19-source-unavailable-4.pdf": "another report",
+        })
+        db = FakeDb(documents=[["1", "shared.pdf"], ["2", "claimed.hl7"], ["4", "absent.pdf"]],
+                    hrm=[["3", "/legacy/shared.pdf"]])
+        report = self.assess(db, [o19docs.MISSING_DOCUMENTS_ACCEPT])
+        self.assertEqual(report["exit_code"], 2)
+        details = Path(self.state_dir, o19docs.DOCUMENT_PREFLIGHT_DETAILS).read_text()
+        self.assertIn("shared.pdf", details)
+        self.assertIn("claimed.hl7", details)
+        self.assertIn("already uses the placeholder's filename", details)
+        self.assertNotIn("shared.pdf", Path(self.state_dir, "preflight.txt").read_text())
+        self.assertEqual(db.writes, [])
+
+    def test_preflight_accepts_an_unclaimed_report_in_either_supported_location(self):
+        self.tar = make_tar(os.path.join(self.tmp, "unclaimed.tar.gz"), {
+            "document/archived.hl7": "report one", "hrm/download/second.hl7": "report two"})
+        db = FakeDb(hrm=[["1", "/legacy/archived.hl7"], ["2", "C:\\legacy\\second.hl7"]])
+        with patch.object(o19docs.tarfile, "open", wraps=tarfile.open) as opened:
+            self.assertEqual(self.assess(db)["exit_code"], 0)
+        self.assertEqual([c.args[1] for c in opened.call_args_list if c.args[0] == self.tar], ["r:gz"])
+
+    def test_preflight_reports_distinct_paths_which_would_become_one_filename(self):
+        self.tar = make_tar(os.path.join(self.tmp, "repeated.tar.gz"),
+                            {"hrm/first/report.hl7": "first", "hrm/second/report.hl7": "second"})
+        db = FakeDb(hrm=[["1", "/first/report.hl7"], ["2", "/second/report.hl7"]], twins=[["report.hl7", "2"]])
+        report = self.assess(db)
+        self.assertEqual(report["exit_code"], 2)
+        self.assertIn("2 distinct source paths", Path(self.state_dir, o19docs.DOCUMENT_PREFLIGHT_DETAILS).read_text())
+
+    def test_preflight_compares_only_colliding_payloads_once_in_compressed_and_plain_archives(self):
+        reports = {"hrm/day1/repeat.hl7": "ABCD", "hrm/day2/repeat.hl7": "ABCD",
+                   "hrm/download/shared.hl7": "DATA", "document/shared.hl7": "DATE",
+                   "hrm/unique.hl7": "ignored", "document/private.pdf": "ignored too"}
+        compressed = make_tar(os.path.join(self.tmp, "repeat.tar.gz"), reports)
+        plain = os.path.join(self.tmp, "repeat.tar")
+        with gzip.open(compressed, "rb") as src, open(plain, "wb") as out:
+            shutil.copyfileobj(src, out)
+        multi = os.path.join(self.tmp, "repeat-multi.tar.gz")
+        tar_bytes = Path(plain).read_bytes()
+        Path(multi).write_bytes(gzip.compress(tar_bytes[:2048]) + gzip.compress(tar_bytes[2048:]))
+        for archive in (compressed, plain, multi):
+            with self.subTest(archive=archive):
+                self.tar = archive
+                with patch.object(o19docs.hashlib, "file_digest", wraps=o19docs.hashlib.file_digest) as digest:
+                    self.assertEqual(self.assess(FakeDb())["exit_code"], 2)
+                self.assertEqual(digest.call_count, 4)
+                details = Path(self.state_dir, o19docs.DOCUMENT_PREFLIGHT_DETAILS).read_text()
+                self.assertIn("shared.hl7", details)
+                self.assertNotIn("repeat.hl7", details)
+                self.assertNotIn("DATA", details)
+        reports["document/shared.hl7"] = "DATA"
+        self.tar = make_tar(compressed, reports)
+        self.assertEqual(self.assess(FakeDb())["exit_code"], 0)
 
 
 class TestTheResume(DocsDriverBase):

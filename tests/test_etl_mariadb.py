@@ -5,15 +5,17 @@
 Set CARLOS_TEST_MARIADB_SOCKET to enable. Temporary ledger files follow TMPDIR.
 """
 
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
-from carlos_ctl import o19etl, o19import
+from carlos_ctl import o19debug, o19etl, o19import
 
 
 @unittest.skipUnless(os.environ.get("CARLOS_TEST_MARIADB_SOCKET")
@@ -73,8 +75,19 @@ class TestCopyMariaDB(unittest.TestCase):
         self.assertEqual(self.run.counts["copy"], 0)
 
     def test_should_refuse_duplicate_unique_values_before_recording_completion(self):
-        self.seed("(1,'same'),(2,'same')")
+        self.seed("(1,'private name'),(2,'private name')")
+        self.run.src_info = o19etl.introspect_columns(self.plain, self.src)
+        self.run.diagnostics = o19debug.Diagnostics(
+            self.ledger.name, o19import.append_private, verbose=False, mode="import",
+            resume=False, version="test", manifest="test", timeout=10)
         self.assert_collision_refused()
+        text = Path(self.ledger.name, o19debug.FILENAME).read_text()
+        error = json.loads(text)
+        self.assertEqual((error["operation"], error["mariadb_errno"], error["sqlstate"]),
+                         ("insert copied rows", 1062, "23000"))
+        self.assertEqual(error["source_column_by_target"], {"id": "id", "name": "name"})
+        self.assertNotIn("private name", text)
+        self.assertNotIn("checkpoint_through", error)
 
     def test_should_refuse_target_collation_collisions(self):
         self.seed("(1,'Same'),(2,'same')")

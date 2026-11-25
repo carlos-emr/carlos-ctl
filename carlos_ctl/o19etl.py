@@ -33,9 +33,10 @@ import json
 import os
 import re
 import time
+from contextlib import nullcontext
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import o19billing, o19digest, o19map_schema, o19_preflight, schema_contract
+from . import o19billing, o19debug, o19digest, o19map_schema, o19_preflight, schema_contract
 from .util import sql_escape, warn
 
 ETL_CONTRACT_VERSION = 6
@@ -2482,6 +2483,7 @@ def overlength_precheck_sql(table: str, entry: dict, src_schema: str,
                             repaired: Optional[set] = None,
                             archive_schema: Optional[str] = None,
                             deferred: Optional[set] = None,
+                            *, direct_counts=None, proven=None,
                             ) -> List[Tuple[str, str]]:
     """(column, COUNT-sql) pairs for target text columns that cannot hold
     what the source has — a non-zero count must ERROR, never truncate.
@@ -2522,6 +2524,8 @@ def overlength_precheck_sql(table: str, entry: dict, src_schema: str,
         if d["type"] in BYTE_CAPACITY_TYPES:
             cap = d.get("octet_len") or LOB_BYTE_CAPACITY[d["type"]]
             if direct and direct_bytes_fit(s, d):
+                if proven is not None:
+                    proven.append(c)
                 continue
             # a BLOB is bytes, not text: converting it through utf8mb4
             # would measure a re-encoding of binary data (and could
@@ -2543,6 +2547,10 @@ def overlength_precheck_sql(table: str, entry: dict, src_schema: str,
             measure = "CHAR_LENGTH({0})".format(expr)
         sql = ("SELECT COUNT(*) FROM {0}.{1} s WHERE {2} > {3}"
                .format(ident(src_schema), ident(table), measure, cap))
+        if direct and direct_counts is not None:
+            # This COUNT uses only identifiers, a validated charset and numeric bounds.
+            # A derived expression can contain clinical literals and cannot be traced as SQL.
+            direct_counts.add(c)
         out.append((c, sql))
     return out
 
@@ -2561,7 +2569,8 @@ def range_error(operation, exc):
     reason = _query_reason(exc)
     if "ERROR 1030" in reason and "innodb" in reason.lower():
         reason += ". Check the MariaDB error log at the time of this statement for the InnoDB diagnostic."
-    return QueryError(operation + ": " + reason, getattr(exc, "stderr", ""))
+    return QueryError(operation + ": " + reason, getattr(exc, "stderr", ""),
+                      client_exit_status=getattr(exc, "client_exit_status", None))
 
 
 def check_windows(query, schema, table, entry, src_cols):
@@ -2605,24 +2614,74 @@ def window_count(query, sql, label, key, window):
         raise range_error(label + window_label(key, window) + " could not be checked", exc) from exc
 
 
+def _table_diagnostic(src, table, dst, target_table, entry, src_cols, dst_cols, columns, archive):
+    # Use the copy's resolved expression for both curated values and FK lookups.
+    # Only identifier tokens reach the trace. A charset repair adds no table reads.
+    expressions = {col: source_expr(entry, col, None, archive, dst_cols[col].get("nullable"))
+                   for col in columns if col in entry.get("value_exprs", {})
+                   or (archive and col in entry.get("fk_remap", {}))}
+    return o19debug.table_fields(src, table, dst, target_table, entry, src_cols, columns,
+                                 expressions=expressions, archive=archive)
+
+
+def _width_diagnostic(context, column, src_cols, dest):
+    source = context["source_column_by_target"][column]
+    fields = dict(context, source_column_by_target={column: source})
+    for key in ("expression_source_columns", "archive_reads_by_target"):
+        all_columns = fields.pop(key, {})
+        if column in all_columns:
+            fields[key] = {column: all_columns[column]}
+    # Defaults and enum members can contain values.
+    for role, definition in (("source", src_cols.get(source, {})), ("target", dest)):
+        fields[role + "_definition"] = {k: definition[k] for k in ("type", "charset", "char_len", "octet_len")
+                                        if definition.get(k) is not None}
+    if dest["type"] in BYTE_CAPACITY_TYPES:
+        fields["limit_bytes"] = dest.get("octet_len") or LOB_BYTE_CAPACITY[dest["type"]]
+    else:
+        fields["limit_characters"] = dest["char_len"]
+    return fields
+
+
 def width_problems(query, table, entry, schema, dst_cols, src_cols, repaired=None, archive_schema=None,
-                   verified=None, deferred=None):
+                   verified=None, deferred=None, *, diagnostics=None, phase="P4", target_schema=None,
+                   target_table=None):
     """Measure each unresolved width. Within one locked import, P4 can reuse a
     successful P2 count for identical SQL reading an unchanged staged column.
     Derived expressions are rechecked and no result survives a resume."""
-    checks = overlength_precheck_sql(table, entry, schema, dst_cols, src_cols, repaired, archive_schema, deferred)
+    direct_counts = set() if diagnostics else None
+    proven = [] if diagnostics and diagnostics.verbose else None
+    checks = overlength_precheck_sql(table, entry, schema, dst_cols, src_cols, repaired, archive_schema, deferred,
+                                     direct_counts=direct_counts, proven=proven)
     if verified is not None:
         checks = [(col, sql) for col, sql in checks if sql not in verified]
+    context = {}
+    if diagnostics and (checks or proven):
+        context = _table_diagnostic(schema, table, target_schema, target_table or table, entry, src_cols, dst_cols,
+                                    [col for col, _ in checks] + (proven or []), archive_schema)
+        for column in proven or ():
+            diagnostics.record("width_proven", phase=phase, operation="verify width from column definitions",
+                               **_width_diagnostic(context, column, src_cols, dst_cols[column]))
     if not checks:
         return []
-    windows = check_windows(query, schema, table, entry, src_cols)
     key = entry.get("chunk_by")
+    with o19debug.operation(diagnostics, phase, "find width check ranges", {"source_schema": schema,
+                            "source_table": table}, key, scope="range discovery") as observed:
+        windows = check_windows(query, schema, table, entry, src_cols)
+        if observed is not None:
+            observed["selected_scope"] = "whole table" if windows == (None,) else "ID ranges"
     problems = []
     for column, sql in checks:
         label = table + "." + column
         total, first = 0, ""
+        width = _width_diagnostic(context, column, src_cols, dst_cols[column]) if diagnostics else {}
         for window in windows:
-            count = window_count(query, sql, label, key, window)
+            if direct_counts and column in direct_counts:
+                width["width_count_sql"] = sql + window_filter(key, window)
+            with o19debug.operation(diagnostics, phase, "measure column width", width, key, window,
+                                    scope="whole table") as observed:
+                count = window_count(query, sql, label, key, window)
+                if observed is not None:
+                    observed["over_limit_rows"] = count
             if count and not total and window:
                 first = ". First affected range" + window_label(key, window)
             total += count
@@ -2758,12 +2817,13 @@ class QueryError(RuntimeError):
     part the absent-object test may look at (the SQL can contain a patient
     id such as 1054)."""
 
-    def __init__(self, message: str, stderr: str = ""):
+    def __init__(self, message: str, stderr: str = "", *, client_exit_status=None):
         """`stderr` is kept separately because the verdict on an error
         must come from the SERVER's text: the statement in `message`
         can carry a patient identifier."""
         RuntimeError.__init__(self, message)
         self.stderr = stderr
+        self.client_exit_status = client_exit_status
 
 
 def absent_object_error(exc: Exception) -> bool:
@@ -3170,7 +3230,8 @@ def etl_precheck_problems(ctx, plain, query, src_schema: str,
                 "{0}: NOT NULL target column(s) without default or "
                 "value_exprs: {1}".format(table, ", ".join(required)))
         problems.extend(width_problems(query, table, entry, src, dst_info[table], src_info[table],
-                                       repairs.get(table), verified=ctx.get("verified_width_sql")))
+                                       repairs.get(table), verified=ctx.get("verified_width_sql"),
+                                       diagnostics=ctx.get("diagnostics"), target_schema=ctx.get("target_db")))
         for col, sql in coercion_precheck_sql(
                 table, entry, src, dst_info[table], src_info[table]):
             n = int(query(sql)[0][0])
@@ -3379,6 +3440,7 @@ class EtlRun(object):
                  tolerated_tables, counts, kept, absent_tables):
         self.query = ctx["query_etl"]      # carries the session prelude
         self.plain = ctx["query"]
+        self.diagnostics = ctx.get("diagnostics")
         self.src = ctx["src_schema"]
         self.dst = ctx["target_db"]
         self.arch = ctx["archive_schema"]
@@ -3676,43 +3738,78 @@ def etl_copy_table(run: 'EtlRun', table: str, entry: dict, tstate: dict,
     state_dir, progress = run.state_dir, run.progress
     counts, seed_group = run.counts, run.seed_group
     admin_user, admin_pn = run.admin_user, run.admin_pn
+    diagnostics = getattr(run, "diagnostics", None)
+    context = (_table_diagnostic(src, table, dst, table, entry, run.src_info[table], dcols, entry["cols"], arch)
+               if diagnostics else {})
+    insert_context = context
+    if diagnostics:
+        supplied = [col for col, _ in primitive_supplied_columns(entry, dcols)]
+        if supplied:
+            insert_context = dict(context, supplied_target_columns=supplied)
+    target = {"target_schema": dst, "target_table": table}
+    source = {"source_schema": src, "source_table": table}
+
+    def operation(name, window=None, *, fields=None, scope=None):
+        return o19debug.operation(diagnostics, "P4", name, context if fields is None else fields,
+                                  entry.get("chunk_by"), window, tstate.get("done_through"), scope=scope)
+
     if not hasattr(run, "copy_primary_keys"):
-        run.copy_primary_keys = primary_key_columns(plain, dst)
+        with operation("read target primary keys", fields={"target_schema": dst}, scope="schema metadata"):
+            run.copy_primary_keys = primary_key_columns(plain, dst)
     key = run.copy_primary_keys.get(table) or []
     pairable = bool(key) and all(column in entry["cols"] and column in dcols for column in key)
     if entry.get(o19billing.GENERATION_FILES) and (not pairable or key != ["id"]):
         raise QueryError(table + ": file-backed billing generations require the primary key id")
     if (not pairable and not entry.get("replace_seed")
             and table not in seed_group and not tstate.get("started")):
-        before = int(plain("SELECT COUNT(*) FROM `{0}`.`{1}`".format(dst, table))[0][0])
+        with operation("count target rows before replacement", fields=target, scope="whole table"):
+            before = int(plain("SELECT COUNT(*) FROM `{0}`.`{1}`".format(dst, table))[0][0])
         if before:
             # A refusal must not grant the retry permission to delete these
             # rows. Check before either branch persists its started marker.
             raise QueryError("{0}: keyless target already holds rows without a declared replacement policy; refusing before copy".format(table))
 
     def insert_and_verify(window=None):
-        before = None if pairable else int(plain("SELECT COUNT(*) FROM `{0}`.`{1}`".format(dst, table))[0][0])
-        query(copy_statement(table, entry, src, dst, dcols, repaired, window, arch))
+        before = None
+        if not pairable:
+            with operation("count target rows before copy", fields=target, scope="whole table"):
+                before = int(plain("SELECT COUNT(*) FROM `{0}`.`{1}`".format(dst, table))[0][0])
+        scope = "retained billing rows" if entry.get(o19billing.GENERATION_FILES) else "whole table"
+        with operation("insert copied rows", window, fields=insert_context, scope=scope):
+            query(copy_statement(table, entry, src, dst, dcols, repaired, window, arch))
         if pairable:
-            n = int(query(copy_value_mismatch_sql(table, entry, src, dst, dcols, key,
-                repaired, arch, include_missing=True, window=window))[0][0])
-            if n:
-                raise QueryError("{0}: {1} copied row(s) differ from their declared values; no completion checkpoint recorded".format(table, n))
-        else:
-            condition = (" WHERE s.`{0}` > {1} AND s.`{0}` <= {2}".format(entry["chunk_by"], *window)
-                         if window else "")
+            with operation("verify copied values before checkpoint", window, scope=scope) as observed:
+                n = int(query(copy_value_mismatch_sql(table, entry, src, dst, dcols, key,
+                    repaired, arch, include_missing=True, window=window))[0][0])
+                if observed is not None:
+                    observed["mismatched_rows"] = n
+                if n:
+                    raise QueryError("{0}: {1} copied row(s) differ from their declared values; no completion checkpoint recorded".format(table, n))
+            return
+        condition = (" WHERE s.`{0}` > {1} AND s.`{0}` <= {2}".format(entry["chunk_by"], *window)
+                     if window else "")
+        with operation("count source rows for copy verification", window, fields=source, scope="whole table"):
             expected = int(plain("SELECT COUNT(*) FROM `{0}`.`{1}` s{2}".format(src, table, condition))[0][0])
+        with operation("count target rows after copy", fields=target, scope="whole table"):
             after = int(plain("SELECT COUNT(*) FROM `{0}`.`{1}`".format(dst, table))[0][0])
+        compare_values = before == 0 or window is not None
+        check = "verify copied values before checkpoint" if compare_values else "verify copied row count before checkpoint"
+        with operation(check, window, scope="whole table") as observed:
+            if observed is not None:
+                observed.update(expected_rows=expected, inserted_rows=after - before)
             if after - before != expected:
                 raise QueryError("{0}: copied row count differs before checkpoint".format(table))
-            if before == 0 or window:
+            if compare_values:
                 failures = copy_multiset_parity(plain, table, entry, src, dst, dcols, repaired, arch,
                                                window=window)
+                if observed is not None:
+                    observed["mismatch_checks"] = len(failures)
                 if failures:
                     raise QueryError("{0}: {1}; no completion checkpoint recorded".format(table, "; ".join(failures)))
     if entry.get("chunk_by"):
         chunk = entry["chunk_by"]
-        lo, hi = chunk_bounds(plain, src, table, chunk)
+        with operation("find copy range", fields=source, scope="range discovery"):
+            lo, hi = chunk_bounds(plain, src, table, chunk)
         # a table this run has touched before (any window, even
         # the first one, may have committed without its
         # checkpoint) clears its first unconfirmed window
@@ -3731,7 +3828,8 @@ def etl_copy_table(run: 'EtlRun', table: str, entry: dict, tstate: dict,
                 # with on its id-intact insert (`log` carries the
                 # deploy's own audit rows). Once a window has
                 # landed, `started` is set and this never re-runs.
-                query("DELETE FROM `{0}`.`{1}`".format(dst, table))
+                with operation("clear target seed rows", fields=target, scope="whole table"):
+                    query("DELETE FROM `{0}`.`{1}`".format(dst, table))
             tstate["started"] = True
             save_progress(state_dir, progress)
         windows = chunk_windows(lo, hi)
@@ -3744,8 +3842,8 @@ def etl_copy_table(run: 'EtlRun', table: str, entry: dict, tstate: dict,
             if window[1] <= done_through:
                 continue
             if resumed:
-                query(window_delete_statement(table, entry, dst,
-                                              window))
+                with operation("clear unconfirmed range on resume", window, fields=target):
+                    query(window_delete_statement(table, entry, dst, window))
                 resumed = False
             try:
                 insert_and_verify(window)
@@ -3757,10 +3855,12 @@ def etl_copy_table(run: 'EtlRun', table: str, entry: dict, tstate: dict,
     else:
         if not tstate.get("done"):
             if table in seed_group:
-                query(seed_group_retry_delete(
-                    table, dst, admin_user, admin_pn or "", dcols))
+                with operation("clear replaceable target rows", fields=target):
+                    query(seed_group_retry_delete(
+                        table, dst, admin_user, admin_pn or "", dcols))
             elif entry.get("replace_seed") or tstate.get("started"):
-                query("DELETE FROM `{0}`.`{1}`".format(dst, table))
+                with operation("clear replaceable target rows", fields=target, scope="whole table"):
+                    query("DELETE FROM `{0}`.`{1}`".format(dst, table))
             tstate["started"] = True
             save_progress(state_dir, progress)
             insert_and_verify()
@@ -4353,7 +4453,8 @@ def run_etl(ctx, make_password_hash: Callable[[], Tuple[str, str, str]]):
         dcols = dst_info[table]
         repaired = repairs.get(table)
         mapped = dict(entry, cols=[c for c in entry.get("cols", []) if c in entry.get("fk_remap", {})])
-        widths = width_problems(query, table, mapped, src, dcols, src_info[table], repaired, arch)
+        widths = width_problems(query, table, mapped, src, dcols, src_info[table], repaired, arch,
+                                diagnostics=ctx.get("diagnostics"), target_schema=dst)
         if widths:
             raise QueryError("\n".join(widths))
         for col, sql in numeric_capacity_precheck_sql(
@@ -4624,7 +4725,7 @@ def key_projection(key: Sequence[str], alias: str) -> str:
 
 
 def detail_lines(plain_query, table: str, label: str, sql: str,
-                 key: Sequence[str], limit: int = DETAIL_ROWS) -> List[str]:
+                 key: Sequence[str], limit: int = DETAIL_ROWS, *, operation=None) -> List[str]:
     """The keys of the rows one value check disagreed about, for the
     run's PRIVATE details file. `sql` is the same check built with
     `select=key_projection(...)`, so the rows named are exactly the rows
@@ -4639,7 +4740,8 @@ def detail_lines(plain_query, table: str, label: str, sql: str,
     finding and this only says WHICH rows -- so the reason is recorded
     in place of the keys."""
     try:
-        rows = plain_query("{0} LIMIT {1}".format(sql, limit))
+        with operation or nullcontext():
+            rows = plain_query("{0} LIMIT {1}".format(sql, limit))
     except Exception as exc:                          # noqa: BLE001
         return ["{0} ({1}): keys unavailable ({2})".format(
             table, label, _query_reason(exc))]
@@ -4865,6 +4967,7 @@ def copy_content_parity(plain_query, src_schema: str, dst_schema: str,
                         post_copy: Optional[Dict[str, Tuple[str, Dict[str, str]]]] = None,
                         protect_charset_residuals: bool = True,
                         read_errors: Optional[List[str]] = None,
+                        *, diagnostics=None, phase="P7",
                         ) -> Tuple[List[str], List[str]]:
     """(ok_lines, mismatch_lines) proving every copied row's target twin
     holds the values the copy wrote. `details`, when given, collects the
@@ -4880,8 +4983,10 @@ def copy_content_parity(plain_query, src_schema: str, dst_schema: str,
     ok, bad = [], []
     unreadable = bad if read_errors is None else read_errors
     repairs = repairs or {}
-    src_tables = schema_tables(plain_query, src_schema)
-    dst_keys = primary_key_columns(plain_query, dst_schema)
+    with o19debug.operation(diagnostics, phase, "read schemas for copied value checks",
+                            {"source_schema": src_schema, "target_schema": dst_schema}):
+        src_tables = schema_tables(plain_query, src_schema)
+        dst_keys = primary_key_columns(plain_query, dst_schema)
 
     def unchecked(table: str, why: str) -> None:
         # loud, and in the PASSING list: a table whose values cannot be
@@ -4922,12 +5027,18 @@ def copy_content_parity(plain_query, src_schema: str, dst_schema: str,
         if table in POST_ETL_REWRITTEN:
             unchecked(table, POST_ETL_REWRITTEN[table])
             continue
+        context = (_table_diagnostic(src_schema, table, dst_schema, table, entry, src_info[table],
+                                     dst_info[table], cols, archive_schema)
+                   if diagnostics else {})
         reason = _unpairable_reason(table, entry, dst_keys.get(table) or [],
                                     dst_info[table])
         if reason:
             try:
-                failures = copy_multiset_parity(plain_query, table, entry, src_schema, dst_schema,
-                    dst_info[table], set(repairs.get(table) or ()), archive_schema, allow_appended=True)
+                with o19debug.operation(diagnostics, phase, "compare keyless copied values", context) as observed:
+                    failures = copy_multiset_parity(plain_query, table, entry, src_schema, dst_schema,
+                        dst_info[table], set(repairs.get(table) or ()), archive_schema, allow_appended=True)
+                    if observed is not None:
+                        observed["mismatch_checks"] = len(failures)
                 if failures:
                     bad.extend(failures)
                 else:
@@ -4947,14 +5058,25 @@ def copy_content_parity(plain_query, src_schema: str, dst_schema: str,
         sql = copy_value_mismatch_sql(*args, include_missing=check_missing, post_copy=overrides)
         try:
             n = 0
-            for window in check_windows(plain_query, src_schema, table, entry, src_info[table]):
-                count = window_count(plain_query, sql, table + " values", chunk, window)
+            with o19debug.operation(diagnostics, phase, "find copied value check ranges", {"source_schema": src_schema,
+                                    "source_table": table}, chunk, scope="range discovery") as observed:
+                windows = check_windows(plain_query, src_schema, table, entry, src_info[table])
+                if observed is not None:
+                    observed["selected_scope"] = "whole table" if windows == (None,) else "ID ranges"
+            for window in windows:
+                with o19debug.operation(diagnostics, phase, "compare copied values", context, chunk, window,
+                                        scope="whole table") as observed:
+                    count = window_count(plain_query, sql, table + " values", chunk, window)
+                    if observed is not None:
+                        observed["mismatched_rows"] = count
                 if count and details is not None and n < DETAIL_ROWS:
                     projection = (", ".join(written_expr(entry, col, dst_info[table], repaired, archive_schema)
                                             for col in key) if check_missing else key_projection(key, "d"))
                     keys_sql = copy_value_mismatch_sql(*args, select=projection, include_missing=check_missing,
                                                        window=window, post_copy=overrides)
-                    details.extend(detail_lines(plain_query, table, "copy", keys_sql, key, DETAIL_ROWS - n))
+                    operation = o19debug.operation(diagnostics, phase, "collect mismatch details", context, chunk, window)
+                    details.extend(detail_lines(plain_query, table, "copy", keys_sql, key, DETAIL_ROWS - n,
+                                                operation=operation))
                 n += count
         except Exception as exc:                      # noqa: BLE001
             unreadable.append("{0}: values could not be checked ({1})".format(

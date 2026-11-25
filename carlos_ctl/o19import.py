@@ -49,7 +49,7 @@ import time
 from typing import (Callable, Dict, Iterator, List, Optional,
                     Sequence, Set, Tuple)
 
-from . import (o19_preflight, o19billing, o19bundle, o19digest, o19docs,
+from . import (o19_preflight, o19billing, o19bundle, o19debug, o19digest, o19docs,
                o19etl, o19host, o19manifest, o19map_props, o19map_schema,
                o19report, o19sql, o19sources, schema_contract)
 from .util import (die, genpw, genrandom, log, run, warn)
@@ -358,7 +358,7 @@ def make_query(mariadb_args: Optional[List[str]],
         cp = run_sql_client(argv, sql)
         if cp.returncode != 0:
             raise o19etl.QueryError("SQL failed ({0}): {1}".format(
-                redact_statement(sql), cp.stderr.strip()), cp.stderr)
+                redact_statement(sql), cp.stderr.strip()), cp.stderr, client_exit_status=cp.returncode)
         return batch_rows(cp.stdout)
 
     query.base_argv = base  # type: ignore[attr-defined]
@@ -1788,8 +1788,10 @@ def preflight_width_problems(ctx, staged_names, findings, verified):
               if table.lower() in staged_names and entry["class"] in ("copy", "merge")}
     if not mapped:
         return []
-    src = o19etl.introspect_columns(ctx["query"], STAGING_SCHEMA)
-    dst = o19etl.introspect_columns(ctx["query"], ctx["target_db"])
+    with o19debug.operation(ctx.get("diagnostics"), "P2", "read column definitions for width checks",
+                            {"source_schema": STAGING_SCHEMA, "target_schema": ctx["target_db"]}):
+        src = o19etl.introspect_columns(ctx["query"], STAGING_SCHEMA)
+        dst = o19etl.introspect_columns(ctx["query"], ctx["target_db"])
     source_tables = {table for table in o19map_schema.TABLES if table.lower() in staged_names}
     repaired = next((f["data"] for f in findings if f["id"] == "charset-mojibake"), {})
     deferred = set()
@@ -1811,7 +1813,8 @@ def preflight_width_problems(ctx, staged_names, findings, verified):
         try:
             problems.extend(o19etl.width_problems(ctx["query_etl"], actual, entry, STAGING_SCHEMA,
                                                   dst[table], src[actual], targets, verified=verified,
-                                                  deferred=deferred))
+                                                  deferred=deferred, diagnostics=ctx.get("diagnostics"), phase="P2",
+                                                  target_schema=ctx["target_db"], target_table=table))
         except o19etl.QueryError as exc:
             problems.append(str(exc))
     if deferred:
@@ -2194,17 +2197,24 @@ def make_etl_query(base_argv: List[str],
             argv.append(db)
         cp = run_sql_client(argv, sql)
         if cp.returncode != 0:
-            error = cp.stderr
-            if re.search(r"^ERROR\s+1062\b", error, re.MULTILINE):
-                # Duplicate-key diagnostics echo the conflicting value, which
-                # may identify a patient. Keep the error code for classification
-                # and the statement's table context without exposing that value.
-                error = "ERROR 1062: duplicate unique key during ETL copy"
+            server = o19debug.server_error(cp.stderr)
+            if server is None:
+                # The client's SQL echo and a quoted row value can both contain a line
+                # that looks like a diagnostic. Neither is safe to print or classify.
+                error = f"database client exited with status {cp.returncode} without an identifiable MariaDB diagnostic"
+                raise o19etl.QueryError("ETL statement failed: " + error, error, client_exit_status=cp.returncode)
+            if server[1] == "1062":
+                # Both the submitted statement and the duplicate-key message can contain
+                # the conflicting value. Preserve only the verified database codes here.
+                state = f" ({server[2]})" if server[2] else ""
+                error = f"ERROR 1062{state}: duplicate unique key during ETL copy"
+                raise o19etl.QueryError("ETL statement failed: " + error, error, client_exit_status=cp.returncode)
+            error = server.string[server.start():]
             raise o19etl.QueryError(
                 "ETL statement failed ({0} ...): {1}".format(
                     redact_statement(sql, 120),
                     CREDENTIAL_SQL_RE.sub(r"\1'<redacted>'",
-                                          error.strip())), error)
+                                          error.strip())), error, client_exit_status=cp.returncode)
         warning_codes = sql_warning_codes(cp.stdout)
         if warning_codes:
             codes = sorted(warning_codes)
@@ -2218,7 +2228,7 @@ def make_etl_query(base_argv: List[str],
     return query
 
 
-def _row_parity(ctx, document_placeholders=()):
+def _row_parity(ctx, document_placeholders=(), *, phase="P4"):
     """Parity with the exact break-glass delta (the admin identity the ETL
     recorded in its ledger); merge tables are checked in reverse (every
     staging row has a target twin), which needs the target's columns.
@@ -2286,7 +2296,8 @@ def _row_parity(ctx, document_placeholders=()):
         src_info, dst_info,
         repairs=progress.get("repairs"), archive_schema=archive,
         details=details, post_copy=post_copy,
-        protect_charset_residuals=protect_residuals, read_errors=copy_read_errors)
+        protect_charset_residuals=protect_residuals, read_errors=copy_read_errors,
+        diagnostics=ctx.get("diagnostics"), phase=phase)
     bad.extend(copy_read_errors)
     # and the merge class, whose live rows come from two places: the
     # pre-merge snapshot is what lets the check say which is which, so
@@ -2599,22 +2610,10 @@ def split_parity_lines(parity_ok: Sequence[str]
     return passed, unchecked, acknowledged
 
 
-def package_version() -> str:
-    """The carlos-emr package version executing this run, for the report
-    header.
-
-    Provenance the manifest cannot give. `o19report.HEADER_ORDER`
-    reserved the row from the start but nothing ever filled it, so two
-    package builds shipping the SAME manifest produced reports a
-    reviewer could not tell apart -- and diffing two imports is the
-    stated purpose of the JSON twin. Read the way config.py reads it for
-    the build stamp; "unknown" rather than None on an unpackaged
-    development host, so the row prints the gap instead of silently
-    vanishing (an absent header row reads as a report format without the
-    field, not as a version nobody recorded)."""
+def package_version(package="carlos-emr") -> str:
+    """Installed Debian package version, or 'unknown' on an unpackaged host."""
     from .util import out
-    return out(["dpkg-query", "-f", "${Version}", "-W",
-                "carlos-emr"]) or "unknown"
+    return out(["dpkg-query", "-f", "${Version}", "-W", package]) or "unknown"
 
 
 def truncated_problems_note(total: int, path: Optional[str]) -> str:
@@ -2980,7 +2979,7 @@ def run_p7(ctx) -> None:
                 problems.append("final document verification could not run — see "
                                 "verify-documents-details.txt")
 
-    ok, bad = _row_parity(ctx, placeholders)
+    ok, bad = _row_parity(ctx, placeholders, phase="P7")
     # three counts, never one: NOT CHECKED lines and acknowledged
     # mismatches travel in `ok` so that the phase does not fail on
     # them, and `len(ok)` told the operator "345 check(s) pass" when 31
@@ -3414,13 +3413,19 @@ def archive_state(state_dir: str) -> Optional[str]:
     directory starts its own (the next roles step would otherwise append
     to the old lists and P7 would rewrite the wrong block)."""
     path = state_path(state_dir)
-    if not os.path.exists(path):
-        return None
+    has_state = os.path.exists(path)
+    # A verbose assessment can stop at P0, before the first staging ledger.
+    run_files = RUN_FILES if has_state else (o19debug.FILENAME,)
     suffix = ".completed-" + time.strftime("%Y%m%dT%H%M%S")
-    for name in RUN_FILES:
+    if os.path.exists(os.path.join(state_dir, o19debug.FILENAME) + suffix):
+        # A pre-staging assessment and the next cleanup can finish in the same second.
+        suffix += "-" + str(time.time_ns())
+    for name in run_files:
         run_file = os.path.join(state_dir, name)
         if os.path.exists(run_file):
             os.replace(run_file, run_file + suffix)
+    if not has_state:
+        return None
     target = path + suffix
     os.replace(path, target)
     return os.path.basename(target)
@@ -3486,7 +3491,7 @@ FAILED_NEXT_STEPS = (
 
 #: per-run outputs retired alongside state.json (admin-credentials.txt is
 #: deliberately not among them: the operator is told where it is)
-RUN_FILES = ("report.txt", "import-report.txt", "import-report.json",
+RUN_FILES = ("report.txt", "import-report.txt", "import-report.json", o19debug.FILENAME,
              "roles-details.txt", "privilege-diff.txt",
              "verify-details.txt", "verify-documents-details.txt", PRISTINE_DETAILS,
              "documents-details.txt", o19docs.DOCUMENT_PREFLIGHT_DETAILS, "billing-files-details.txt",
@@ -3612,6 +3617,9 @@ def _parser(prog: str, import_mode: bool) -> argparse.ArgumentParser:
                          "default 'oscar'. Exists so two provinces can be "
                          "rehearsed on one development server without one "
                          "destroying the other's target")
+    ap.add_argument("--debug", action="store_true",
+                    help="trace database width, copy and value verification operations to the private "
+                         "import-debug.jsonl in the import workspace (failures are recorded by default)")
     if import_mode:
         ap.add_argument("--documents", metavar="FILE", action=_InputPart,
                         help="tar of the OscarDocument tree")
@@ -4451,7 +4459,7 @@ def _make_ctx(args, import_mode: bool,
         save_state(state_dir, state)
     retire_input_snapshots(inputs, state_dir, workdir_name)
 
-    return {
+    ctx = {
         "state_dir": state_dir,
         "state": state,
         "query": make_query(args.mariadb_arg,
@@ -4491,6 +4499,13 @@ def _make_ctx(args, import_mode: bool,
         "role_templates": role_templates,
         "fixups_dir": getattr(args, "fixups_dir", None),
     }
+    mode = "preflight" if not import_mode else "dry-run" if ctx["dry_run"] else "import"
+    ctx["diagnostics"] = o19debug.Diagnostics(
+        state_dir, append_private, verbose=getattr(args, "debug", False), mode=mode,
+        resume=ctx["resume"], version=package_version("carlos-ctl"), emr_version=ctx["tool_version"],
+        manifest=o19map_schema.SCHEMA_MAP_VERSION,
+        timeout=ctx["statement_timeout"])
+    return ctx
 
 
 def _nonnegative_seconds(text: str) -> int:

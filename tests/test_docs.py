@@ -121,7 +121,7 @@ class TestHrmRewrite(unittest.TestCase):
                       "'/var/lib/carlos-emr/CarlosDocument/carlos/document/', "
                       "SUBSTRING_INDEX(REPLACE(reportFile, '\\\\', '/'), "
                       "'/', -1))", update)
-        self.assertIn("WHERE reportFile IS NOT NULL AND reportFile <> ''",
+        self.assertIn("WHERE reportFile IS NOT NULL AND BINARY reportFile <> ''",
                       update)
         self.assertTrue(select.startswith(
             "SELECT id, reportFile FROM `carlos`.HRMDocument WHERE"))
@@ -136,7 +136,7 @@ class TestHrmRewrite(unittest.TestCase):
 
     def test_basename_twins_query_counts_distinct_paths(self):
         sql = o19docs.hrm_basename_twins_sql("carlos")
-        self.assertIn("COUNT(DISTINCT REPLACE(reportFile, '\\\\', '/'))",
+        self.assertIn("COUNT(DISTINCT BINARY REPLACE(CONVERT(reportFile USING utf8mb4), '\\\\', '/'))",
                       sql)
         self.assertIn("HAVING paths > 1", sql)
 
