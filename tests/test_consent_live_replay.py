@@ -727,26 +727,32 @@ class TestTheImportRanksAsTheMigrationDoes(unittest.TestCase):
     UNWRAP = (("NULLIF(`edit_date`, '0000-00-00 00:00:00')", "`edit_date`"),
               ("IFNULL(`explicit`, 0)", "`explicit`"))
 
-    def migration_text(self):
-        # found by name, not number: renumbering at merge must not turn
-        # these into a skip
+    def migration_texts(self):
         found = sorted(MIGRATIONS.glob("V*__one_live_consent_per_type.sql"))
-        self.assertEqual(len(found), 1, found)
-        return found[0].read_text(encoding="utf-8")
+        reviewed_pair = {"V1.0.59.30__one_live_consent_per_type.sql",
+                         "V1.0.77__one_live_consent_per_type.sql"}
+        self.assertTrue(found, "The audited Consent migration must remain present")
+        if len(found) != 1:
+            self.assertEqual({path.name for path in found}, reviewed_pair)
+        return [(path.name, path.read_text(encoding="utf-8")) for path in found]
 
     def test_every_order_in_the_migration_is_the_imports(self):
-        orders = re.findall(r"ORDER BY (.+)$", self.migration_text(), re.M)
-        self.assertEqual(len(orders), 2, orders)
-        for order in orders:
-            for wrapped, bare in self.UNWRAP:
-                order = order.replace(wrapped, bare)
-            self.assertEqual(order.strip(), o19etl.CONSENT_LIVE_ORDER)
+        for name, text in self.migration_texts():
+            with self.subTest(migration=name):
+                orders = re.findall(r"ORDER BY (.+)$", text, re.M)
+                self.assertEqual(len(orders), 2, orders)
+                for order in orders:
+                    for wrapped, bare in self.UNWRAP:
+                        order = order.replace(wrapped, bare)
+                    self.assertEqual(order.replace("`", "").strip(),
+                                     o19etl.CONSENT_LIVE_ORDER.replace("`", ""))
 
     def test_the_migration_audits_with_the_imports_words(self):
-        reasons = re.findall(r"'one_live_consent_per_type', '(\w+)'",
-                             self.migration_text())
-        self.assertEqual(sorted(reasons), sorted(
-            (o19etl.CONSENT_NULL_FLAG, o19etl.CONSENT_DUPLICATE)))
+        for name, text in self.migration_texts():
+            with self.subTest(migration=name):
+                reasons = re.findall(r"'one_live_consent_per_type', '(\w+)'", text)
+                self.assertEqual(sorted(reasons), sorted(
+                    (o19etl.CONSENT_NULL_FLAG, o19etl.CONSENT_DUPLICATE)))
 
 
 if __name__ == "__main__":
