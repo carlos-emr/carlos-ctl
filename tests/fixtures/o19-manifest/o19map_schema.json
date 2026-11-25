@@ -2,7 +2,7 @@
  "format": 3,
  "kind": "o19map-schema",
  "generator": "scripts/migration/o19/generate_manifests.py",
- "SCHEMA_MAP_VERSION": "o19map-8+37a29865",
+ "SCHEMA_MAP_VERSION": "o19map-8+99e99907",
  "O19_PROFILE": "on",
  "O19_SOURCE_COMMIT": "a7900d569d3faf741993e5e1da8c14021bbefede",
  "TABLES": {
@@ -12930,7 +12930,8 @@
    "id",
    "demographicNo",
    "hrmDocumentId",
-   "timeAssigned"
+   "timeAssigned",
+   "cds_patient_key"
   ],
   "HRMDocumentToProvider": [
    "id",
@@ -14493,7 +14494,8 @@
    "pharmacyId",
    "cds_currentness",
    "cds_dose_text",
-   "cds_projection_incomplete"
+   "cds_projection_incomplete",
+   "row_version"
   ],
   "dsGuidelineProviderMap": [
    "mapid",
@@ -22115,7 +22117,8 @@
    "textView",
    "rx_comments",
    "digital_signature_id",
-   "lastUpdateDate"
+   "lastUpdateDate",
+   "row_version"
   ],
   "preventions": [
    "id",
@@ -23000,7 +23003,7 @@
   "scheduleholiday": 28,
   "scheduletemplate": 1,
   "scheduletemplatecode": 23,
-  "secObjPrivilege": 514,
+  "secObjPrivilege": 516,
   "secObjectName": 133,
   "secRole": 33,
   "secUserRole": 2,
@@ -23294,7 +23297,6 @@
    "batchcount"
   ],
   "billing": [
-   "appointment_no",
    "clinic_no",
    "demographic_no"
   ],
@@ -24721,15 +24723,9 @@
    "reportgroup"
   ],
   "reportConfig": [
-   "order_no",
    "report_id"
   ],
   "reportFilter": [
-   "order_no",
-   "report_id",
-   "status"
-  ],
-  "reportItem": [
    "status"
   ],
   "reportTemplates": [
@@ -24780,7 +24776,7 @@
  },
  "PROFILES": {
   "bc": {
-   "SCHEMA_MAP_VERSION": "o19map-8+bfb0898a",
+   "SCHEMA_MAP_VERSION": "o19map-8+721abab3",
    "O19_PROFILE": "bc",
    "TABLES": {
     "AppDefinition": {
@@ -42989,7 +42985,8 @@
      "id",
      "demographicNo",
      "hrmDocumentId",
-     "timeAssigned"
+     "timeAssigned",
+     "cds_patient_key"
     ],
     "HRMDocumentToProvider": [
      "id",
@@ -44517,7 +44514,8 @@
      "pharmacyId",
      "cds_currentness",
      "cds_dose_text",
-     "cds_projection_incomplete"
+     "cds_projection_incomplete",
+     "row_version"
     ],
     "dsGuidelineProviderMap": [
      "mapid",
@@ -56277,7 +56275,8 @@
      "textView",
      "rx_comments",
      "digital_signature_id",
-     "lastUpdateDate"
+     "lastUpdateDate",
+     "row_version"
     ],
     "preventions": [
      "id",
@@ -57415,7 +57414,7 @@
     "scheduleholiday": 28,
     "scheduletemplate": 1,
     "scheduletemplatecode": 23,
-    "secObjPrivilege": 516,
+    "secObjPrivilege": 518,
     "secObjectName": 134,
     "secRole": 33,
     "secUserRole": 2,
@@ -57510,7 +57509,6 @@
      "batchcount"
     ],
     "billing": [
-     "appointment_no",
      "clinic_no",
      "demographic_no"
     ],
@@ -58968,15 +58966,9 @@
      "reportgroup"
     ],
     "reportConfig": [
-     "order_no",
      "report_id"
     ],
     "reportFilter": [
-     "order_no",
-     "report_id",
-     "status"
-    ],
-    "reportItem": [
      "status"
     ],
     "reportTemplates": [

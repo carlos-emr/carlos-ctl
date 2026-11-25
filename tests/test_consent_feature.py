@@ -230,14 +230,20 @@ class TestConsentFeature(unittest.TestCase):
                     classify(self.root)
 
     def test_manifest_format_and_kind_must_match_the_actual_schema_contract(self):
+        # Formats 1-3 are all real schema-manifest formats (3 since the OSCAR 19 beta8 line).
         for field, value in (("format", True), ("format", "1"), ("format", 1.0),
-                             ("format", 0), ("format", None), ("kind", "wrong"),
+                             ("format", 0), ("format", 4), ("format", None), ("kind", "wrong"),
                              ("kind", None)):
             with self.subTest(field=field, value=value):
                 self.fixture()
                 self.change_manifest(lambda m: m.update({field: value}))
                 with self.assertRaises(ConsentFeatureError):
                     classify(self.root)
+
+    def test_schema_protocol_two_preserves_the_complete_consent_contract(self):
+        self.fixture(True, True, True)
+        self.change_manifest(lambda model: model.update({"format": 2}))
+        self.assertTrue(classify(self.root))
 
     def test_missing_or_unreadable_evidence_is_not_absence(self):
         self.fixture()
@@ -265,6 +271,23 @@ class TestConsentFeature(unittest.TestCase):
         (self.migrations / "V100__one_live_consent_per_type.sql").write_text(SQL, encoding="utf-8")
         with self.assertRaises(ConsentFeatureError):
             classify(self.root)
+
+    def test_only_the_reviewed_published_pair_is_accepted_and_both_guards_are_required(self):
+        names = ("V1.0.59.30__one_live_consent_per_type.sql",
+                 "V1.0.77__one_live_consent_per_type.sql")
+        for damaged in (None, *names, "V100__one_live_consent_per_type.sql"):
+            with self.subTest(damaged=damaged):
+                self.fixture(True, True, False)
+                for name in names:
+                    sql = SQL.replace("UNIQUE KEY", "KEY") if name == damaged else SQL
+                    (self.migrations / name).write_text(sql, encoding="utf-8")
+                if damaged == "V100__one_live_consent_per_type.sql":
+                    (self.migrations / damaged).write_text(SQL, encoding="utf-8")
+                if damaged is None:
+                    self.assertTrue(classify(self.root))
+                else:
+                    with self.assertRaises(ConsentFeatureError):
+                        classify(self.root)
 
     def test_missing_generated_or_unique_contract_is_an_error(self):
         for sql in (SQL.replace("GENERATED ALWAYS AS", "DEFAULT"),
