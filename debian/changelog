@@ -1,3 +1,15 @@
+carlos-ctl (1.3.6) resolute; urgency=medium
+
+  * Detect missing OSCAR 19 chart attachments in preflight and offer
+    source-unavailable PDF notices with explicit operator acceptance.
+  * Verify HRM archive filename ownership and file collisions in preflight.
+  * Reconcile Ontario billing generations with the files in the source backup
+    and preserve original text when a lossless charset repair cannot be made.
+  * Bound audit-log width and verification reads by indexed ID ranges when
+    needed. Record private diagnostics for failed checks and resumed copies.
+
+ -- CARLOS EMR Maintainers <michael@maplecreekmedical.ca>  Tue, 24 Nov 2026 20:35:00 -0500
+
 carlos-ctl (1.3.5) resolute; urgency=medium
 
   * Add `cds-import --abandon --run RUN_ID --confirm RUN_ID --reason TEXT`,
