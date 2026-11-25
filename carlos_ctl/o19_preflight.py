@@ -71,7 +71,7 @@ import subprocess
 import sys
 
 # === BEGIN GENERATED DATA (generate_manifests.py) ===
-SCHEMA_MAP_VERSION = 'o19map-8+3dce0b8d'
+SCHEMA_MAP_VERSION = 'o19map-8+37a29865'
 O19_PROFILE = 'on'
 SUPPORTED_PROVINCES = ['on', 'bc']
 REQUIRED_TABLES = [
@@ -918,7 +918,7 @@ LEGACY_PREVENTION_TYPES = [
     'fIPV',
 ]
 PROFILE_BC = {
-    'SCHEMA_MAP_VERSION': 'o19map-8+783f30f4',
+    'SCHEMA_MAP_VERSION': 'o19map-8+bfb0898a',
     'O19_PROFILE': 'bc',
     'PATIENT_DATA_TABLES': [
         'DrugDispensing',
