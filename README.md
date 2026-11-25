@@ -41,13 +41,13 @@ an older `carlos-emr` calls, it adds `Breaks: carlos-emr (<< M)`.
 
 Every carlos release re-attaches the pinned `carlos-ctl` package
 (`debian/carlos-ctl.pin` in carlos). Download the three `.deb` files from
-the release page. The application package includes the eForm renderer.
-Use the downloaded filenames to install or upgrade all three together.
+one release into an empty directory. The application package includes the
+eForm renderer. From that directory, install or upgrade all three together.
 
 ```bash
-sudo apt install --no-remove ./carlos-emr_<version>_amd64.deb \
-                 ./carlos-ctl_<version>_all.deb \
-                 ./carlos-emr-drugref_<version>_all.deb
+sudo apt install --no-remove ./carlos-emr_*_amd64.deb \
+                 ./carlos-ctl_*_all.deb \
+                 ./carlos-emr-drugref_*_all.deb
 ```
 
 ## CDS patient-data import
