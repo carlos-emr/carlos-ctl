@@ -102,16 +102,22 @@ jobs:
             echo "SKIP=false" >> "$GITHUB_ENV"
           fi
 
-      - name: Stamp the package version from the tag
+      - name: Prepare the package changelog for the tag
         if: env.SKIP != 'true'
         run: |
           set -euo pipefail
-          # Replace the in-tree dev stanza (1.0.0~dev1-shaped, which sorts
-          # BELOW the release) with the release's own; git is the history.
+          # CARLOS qualifies the exact binary built from a versioned changelog.
+          # Keep those bytes when publishing the same version.
+          if [ "$(dpkg-parsechangelog -S Version)" = "$DEB_VERSION" ]; then
+            exit 0
+          fi
+          # A dev checkout can still produce a release or RC. Derive its
+          # changelog timestamp from the tagged commit so retries reproduce it.
+          release_date="$(git log -1 --format=%cD HEAD)"
           {
             printf 'carlos-ctl (%s) resolute; urgency=medium\n\n' "$DEB_VERSION"
             printf '  * Automated package build of the %s release.\n\n' "$RELEASE_TAG"
-            printf ' -- CARLOS Release CI <releases@carlos-emr.invalid>  %s\n' "$(date -R)"
+            printf ' -- CARLOS Release CI <releases@carlos-emr.invalid>  %s\n' "$release_date"
           } > debian/changelog
 
       - name: Build the package
