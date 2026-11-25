@@ -22,7 +22,7 @@ import re
 import unittest
 from pathlib import Path
 
-from carlos_ctl import o19_preflight, o19import
+from carlos_ctl import cdsruntime, o19_preflight, o19import
 
 from .carlos_src import carlos_path
 
@@ -273,6 +273,15 @@ class TestNamedJavaGuardsExist(unittest.TestCase):
                 list(java_root.rglob(name + ".java")),
                 "the guide names {0}, which does not exist under "
                 "src/test/java".format(name))
+
+
+@unittest.skipUnless(MAN_PAGE.is_file(), "man page not in this checkout")
+class TestCdsRuntimeDocumentation(unittest.TestCase):
+    def test_manual_matches_the_heap_range_accepted_from_the_engine(self):
+        heap = MAN_PAGE.read_text(encoding="utf-8").split(".B cds.import.cliHeapMiB\n", 1)[1]
+        paragraph = heap.split("\n.", 1)[0]
+        self.assertIn(f"{cdsruntime.MIN_ENGINE_HEAP_MIB} through {cdsruntime.MAX_ENGINE_HEAP_MIB} MiB",
+                      paragraph)
 
 
 if __name__ == "__main__":

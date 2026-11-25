@@ -521,8 +521,8 @@ supervisor relays signals and removes its own attestation after execution;
 root-owned expiry cleanup retires leftovers from abnormal termination.
 Its heap is configured by
 .B cds.import.cliHeapMiB
-(default 512 MiB, integer 128 through 16384). This is a configurable process
-budget, not a guarantee that arbitrary input fits the heap. The engine must
+(default 512 MiB). The engine accepts integers from 128 through 2147483647 MiB.
+Available host memory limits the usable heap. The engine must
 bound parsing/payloads, persistence and reporting and reserve resources across
 web and CLI workers.
 .IP
