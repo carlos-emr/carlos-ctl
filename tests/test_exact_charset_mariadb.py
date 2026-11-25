@@ -241,3 +241,14 @@ class TestExactCharsetMariaDB(unittest.TestCase):
         with self.assertRaises(o19etl.QueryError):
             self.copy(repairs)
         self.assertFalse(self.state.get("done"))
+
+    def test_hosted_width_check_measures_the_repaired_prescription_instructions(self):
+        self.query("ALTER TABLE `{0}`.drugs MODIFY special VARCHAR(1)".format(self.dst))
+        self.seed([DASH])
+        ctx = {"target_db": self.dst, "query": self.query, "query_etl": self.run.query}
+        with patch.object(o19import, "STAGING_SCHEMA", self.src):
+            self.assertTrue(o19import.preflight_width_problems(ctx, {"drugs": "drugs"}, [], None))
+            self.assertEqual(o19import.preflight_width_problems(ctx, {"drugs": "drugs"}, self.assessment(), None), [])
+            self.query("UPDATE `{0}`.drugs SET special={1}".format(self.src, literal(DASH + LE)))
+            problems = o19import.preflight_width_problems(ctx, {"drugs": "drugs"}, self.assessment(), None)
+            self.assertIn("drugs.special: 1 value(s)", problems[0])

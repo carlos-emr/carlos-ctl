@@ -643,6 +643,15 @@ For an import that stopped at document reconciliation, repeat the command
 with the same inputs and add
 .BR "\-\-resume \-\-accept missing-source-documents" .
 .PP
+On the CARLOS host, preflight checks whether the staged values fit the
+target columns after conversion. For example, a stock OSCAR 19
+.B log.data
+TEXT column fits the CARLOS utf8mb4 MEDIUMTEXT column by definition.
+When a column definition cannot establish the bound, the importer measures
+the values. On large tables with a declared, indexed, non-null integer chunk key,
+it checks successive ID ranges. Oversized values and failed reads block
+the import. Copy verification also reads the audit log in ranges.
+.PP
 .B \-\-dry-run
 stages and reports without writing to the EMR schema (its
 .B \-\-accept

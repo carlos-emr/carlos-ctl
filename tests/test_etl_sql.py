@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import Mock
 
 from carlos_ctl import o19etl, o19map_schema
 
@@ -2440,6 +2441,86 @@ class TestOverlengthByteCapacity(unittest.TestCase):
     A same-declared TEXT column is not the same capacity once the
     charset widens, which is exactly the latin1 -> utf8mb4 move this
     import makes."""
+    def test_proven_direct_log_width_issues_no_queries(self):
+        entry = {"cols": ["data"], "chunk_by": "id", "renames": {"data": "Data"}}
+        target = {"data": dict(col("mediumtext", char_len=16777215), charset="utf8mb4")}
+        source = {"DATA": dict(col("text", char_len=65535), charset="latin1"),
+                  "id": col("bigint", nullable=False)}
+        no_reads = Mock(side_effect=AssertionError("a proven width must not read the table"))
+        self.assertEqual(o19etl.width_problems(no_reads, "log", entry, "src", target, source), [])
+        no_reads.assert_not_called()
+
+    def test_a_proof_applies_only_to_the_direct_copy_in_the_known_target_encoding(self):
+        source = {"data": dict(col("text", char_len=65535), charset="latin1")}
+        target = {"data": dict(col("mediumtext", char_len=16777215), charset="utf8mb4")}
+        for entry, repaired, src, dst in (
+                ({"cols": ["data"], "value_exprs": {"data": "REPEAT(s.`data`, 999)"}}, None, source, target),
+                ({"cols": ["data"]}, {"data"}, source, target),
+                ({"cols": ["data"]}, None, {"data": dict(source["data"], charset=None)}, target),
+                ({"cols": ["data"]}, None, source, {"data": dict(target["data"], charset="utf32")}),
+                ({"cols": ["data"]}, None, source, {"data": dict(col("text", char_len=65535), charset="utf8mb4")})):
+            with self.subTest(entry=entry, repaired=repaired, src=src, dst=dst):
+                self.assertEqual(len(o19etl.overlength_precheck_sql("log", entry, "src", dst, src, repaired)), 1)
+        for charset in ("utf8mb3", "utf8mb4", "ascii"):
+            self.assertTrue(o19etl.direct_bytes_fit(dict(source["data"], charset=charset),
+                            dict(col("text", char_len=65535), charset="utf8mb4")))
+        self.assertTrue(o19etl.direct_bytes_fit(col("blob", char_len=65535), col("mediumblob", char_len=16777215)))
+
+    def test_measured_width_uses_the_actual_target_encoding_and_type_byte_ceiling(self):
+        source = {"data": dict(col("mediumtext", char_len=16777215), charset="latin1")}
+        target = {"data": dict(col("text", char_len=0), charset="utf32")}
+        entry = {"cols": ["data"]}
+        check, = o19etl.overlength_precheck_sql("log", entry, "stage", target, source)
+        self.assertIn("LENGTH(CONVERT(s.`data` USING utf32)) > 65535", check[1])
+        target["data"]["charset"] = None
+        with self.assertRaisesRegex(o19etl.QueryError, "log.data.*target text encoding"):
+            o19etl.overlength_precheck_sql("log", entry, "stage", target, source)
+
+    def test_only_identical_successful_direct_checks_can_be_reused_in_one_import(self):
+        source = {"data": dict(col("mediumtext", char_len=16777215), charset="latin1")}
+        target = {"data": dict(source["data"], charset="utf8mb4")}
+        entry = {"cols": ["data"]}
+        verified = set()
+        query = Mock(return_value=[["0"]])
+        for table, columns, measured in (("log", entry, 1), ("log", entry, 1), ("LOG", entry, 2),
+                ("log", dict(entry, value_exprs={"data": "UPPER(s.`data`)"}), 3)):
+            self.assertEqual(o19etl.width_problems(query, table, columns, "stage", target, source,
+                                                  verified=verified), [])
+            self.assertEqual(query.call_count, measured)
+        query.return_value = [["1"]]
+        for _ in range(2):
+            self.assertTrue(o19etl.width_problems(query, "log", entry, "stage",
+                            {"data": dict(col("text", char_len=65535), charset="utf8mb4")}, source, verified=verified))
+        self.assertEqual(query.call_count, 5)
+
+    def test_an_unproven_width_counts_every_window_and_fails_closed_on_a_late_read_error(self):
+        entry = {"cols": ["data"], "chunk_by": "id"}
+        dst = {"data": dict(col("mediumtext", char_len=16777215), charset="utf8mb4")}
+        src = {"id": col("bigint", nullable=False), "data": dict(dst["data"], charset="latin1")}
+        for last in ([["3"]], [], [["NULL"]], o19etl.QueryError("ERROR 1030: Got error 168 from InnoDB")):
+            query = Mock(side_effect=[[["id"]], [["-1", "50000"]], [["2"]], last])
+            with self.subTest(last=last):
+                if last == [["3"]]:
+                    problems = o19etl.width_problems(query, "log", entry, "src", dst, src)
+                    self.assertIn("5 value(s)", problems[0])
+                else:
+                    with self.assertRaisesRegex(o19etl.QueryError, r"log\.data \(id 49999\.\.50000\)") as error:
+                        o19etl.width_problems(query, "log", entry, "src", dst, src)
+                    if isinstance(last, Exception):
+                        self.assertIn("1030: Got error 168", str(error.exception))
+                counts = [call.args[0] for call in query.call_args_list[2:]]
+                self.assertIn("s.`id` > -2 AND s.`id` <= 49998", counts[0])
+                self.assertIn("s.`id` > 49998 AND s.`id` <= 50000", counts[1])
+
+    def test_nullable_or_unindexed_keys_do_not_omit_rows_from_width_checks(self):
+        for key, metadata in ((col("int", nullable=True), []), (col("varchar"), []),
+                              (col("int", nullable=False), [[]])):
+            query = Mock(side_effect=metadata + [[["1"]]])
+            problems = o19etl.width_problems(query, "log", {"cols": ["data"], "chunk_by": "id"}, "src",
+                {"data": col("text", char_len=65535)}, {"data": col("mediumtext", char_len=16777215), "id": key})
+            self.assertIn("1 value(s)", problems[0])
+            self.assertNotIn("s.`id`", query.call_args.args[0])
+
     def test_a_same_declared_text_column_is_measured_in_bytes(self):
         # latin1 `text` holds 65535 CHARACTERS, utf8mb4 `text` 65535
         # BYTES: identical declarations, different capacity, and the

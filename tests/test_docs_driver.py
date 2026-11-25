@@ -345,6 +345,7 @@ class TestDocumentAssessment(DocsDriverBase):
                           return_value={"schema_map_version": "test", "findings": []}), \
                 patch.object(o19import.o19etl, "schema_tables",
                              return_value={"Document", "HRMDocument", "eform"}), \
+                patch.object(o19import, "preflight_width_problems", return_value=[]), \
                 contextlib.redirect_stdout(io.StringIO()):
             return o19import.run_p2(ctx)
 

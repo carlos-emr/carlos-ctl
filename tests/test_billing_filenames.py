@@ -22,6 +22,7 @@ class TestBillingContract(unittest.TestCase):
             stack.enter_context(mock.patch.object(o19import.o19map_schema, "TABLES", entries))
             stack.enter_context(mock.patch.object(o19import.o19_preflight, "run_checks", return_value=report))
             stack.enter_context(mock.patch.object(o19import.o19_preflight, "render_text", return_value=""))
+            stack.enter_context(mock.patch.object(o19import, "preflight_width_problems", return_value=[]))
             stack.enter_context(mock.patch.object(o19etl, "schema_tables", return_value=list(sources.values())))
             stack.enter_context(mock.patch.object(o19etl, "introspect_columns", return_value={
                 table: {o19billing.TABLES[table][0]: {}} for table in sources}))

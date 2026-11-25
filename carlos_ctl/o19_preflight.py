@@ -3901,21 +3901,11 @@ def check_unknown_columns(c, schema_map):
             "column-checks-deferred", ADVISORY,
             "column-level checks could not run without a CARLOS schema "
             "to compare against",
-            "Two things are unmeasured here and both refuse at P4 — "
-            "after the pre-import snapshot and the full staging restore "
-            "— with no --accept. (1) The vendor-column inventory (B2 "
-            "unknown columns) needs the schema manifest carlos-ctl "
-            "supplies. (2) o19etl's overlength and numeric-coercion "
-            "pre-checks compare every value against the TARGET column's "
-            "capacity and type, which exist only on the CARLOS host: the "
-            "manifest carries no widths. The realistic instance is "
-            "charset-driven — TEXT/BLOB capacity is BYTES, so a latin1 "
-            "`text` holding 65535 CHARACTERS at the clinic becomes a "
-            "utf8mb4 `text` holding 65535 BYTES in CARLOS, and an "
-            "identically-declared column has genuinely narrowed for any "
-            "accented content (casemgmt_note.note, eform_data, document "
-            "descriptions). Nothing here can predict either; --dry-run "
-            "cannot either, since it returns after P2."))
+            "The vendor-column inventory needs the installed CARLOS manifest. "
+            "Run import-o19 --dry-run on the CARLOS host to check those columns "
+            "and detect overlength values using the target's actual widths and "
+            "encodings. Numeric-coercion checks run before the copy. A value "
+            "that would be truncated has no --accept override."))
 
 
 def record_inventory(c):

@@ -24,6 +24,9 @@ CHARSET_MAX_BYTES = {
     **dict.fromkeys("gb18030 utf16 utf16le utf32 utf8mb4".split(), 4),
 }
 
+TEXT_BYTE_CAPACITY = {"tinytext": 255, "text": 65535, "mediumtext": 16777215, "longtext": 4294967295}
+BLOB_BYTE_CAPACITY = {k.replace("text", "blob"): v for k, v in TEXT_BYTE_CAPACITY.items()}
+
 FIELDS = {
     "defaults": ("SCHEMATA", ["SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME"], "1=1"),
     "tables": ("TABLES", ["TABLE_NAME", "ENGINE", "ROW_FORMAT", "TABLE_COLLATION"], "TABLE_TYPE = 'BASE TABLE'"),
@@ -143,19 +146,15 @@ def widening_columns(expected, actual):
     No values are scanned. Every other metadata attribute must match;
     this is used only to recover an import that has never copied rows.
     """
-    text = {"tinytext": 255, "text": 65535,
-            "mediumtext": 16777215, "longtext": 4294967295}
-    binary = {k.replace("text", "blob"): v for k, v in text.items()}
-
     def capacity(decl):
         """Return the storage family, size and whether that size counts bytes."""
         sized = re.fullmatch(r"(var)?(char|binary)\((\d+)\)", decl.lower())
         if sized:
             return sized.group(2), int(sized.group(3)), False
-        if decl.lower() in text:
-            return "char", text[decl.lower()], True
-        if decl.lower() in binary:
-            return "binary", binary[decl.lower()], True
+        if decl.lower() in TEXT_BYTE_CAPACITY:
+            return "char", TEXT_BYTE_CAPACITY[decl.lower()], True
+        if decl.lower() in BLOB_BYTE_CAPACITY:
+            return "binary", BLOB_BYTE_CAPACITY[decl.lower()], True
         return None
 
     adjusted = dict(actual, columns=[list(row) for row in actual["columns"]])

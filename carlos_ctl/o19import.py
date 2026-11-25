@@ -1781,6 +1781,48 @@ def run_p1(ctx) -> None:
 # P2 — preflight (import mode)
 # --------------------------------------------------------------------------
 
+def preflight_width_problems(ctx, staged_names, findings, verified):
+    """Assess the same effective columns and repair expressions as the copy,
+    using the restored table names before P4 normalizes their case."""
+    mapped = {table: entry for table, entry in o19map_schema.TABLES.items()
+              if table.lower() in staged_names and entry["class"] in ("copy", "merge")}
+    if not mapped:
+        return []
+    src = o19etl.introspect_columns(ctx["query"], STAGING_SCHEMA)
+    dst = o19etl.introspect_columns(ctx["query"], ctx["target_db"])
+    source_tables = {table for table in o19map_schema.TABLES if table.lower() in staged_names}
+    repaired = next((f["data"] for f in findings if f["id"] == "charset-mojibake"), {})
+    deferred = set()
+    problems = []
+    for table, manifest in sorted(mapped.items()):
+        actual = table if table in src else staged_names[table.lower()]
+        if actual not in src or table not in dst:
+            problems.append("{0}: missing staged or target column definitions".format(table))
+            continue
+        entry, _ = o19etl.effective_entry(table, manifest, src[actual], source_tables)
+        missing = [col for col in entry["cols"] if col not in dst[table]]
+        if missing:
+            problems.append("{0}: missing target column(s): {1}".format(table, ", ".join(missing)))
+            continue
+        targets = set()
+        for col in entry.get("charset_scan", ()):
+            if repaired.get(table + "." + col):
+                targets.update(o19etl.repair_targets(table, col, entry))
+        try:
+            problems.extend(o19etl.width_problems(ctx["query_etl"], actual, entry, STAGING_SCHEMA,
+                                                  dst[table], src[actual], targets, verified=verified,
+                                                  deferred=deferred))
+        except o19etl.QueryError as exc:
+            problems.append(str(exc))
+    if deferred:
+        findings.append(o19_preflight.finding(
+            "remapped-column-width", o19_preflight.ADVISORY,
+            "some identifier widths depend on the IDs assigned during the import",
+            "The importer checks these values after building the ID map and before writing the dependent rows.",
+            data=sorted(deferred)))
+    return problems
+
+
 def run_p2(ctx) -> Dict:
     """P2 preflight -- assess the staged dump and record the verdict.
 
@@ -1797,6 +1839,7 @@ def run_p2(ctx) -> Dict:
     since, so re-assessing could only refuse a target that is mid-import
     by design."""
     query = ctx["query"]
+    ctx.pop("verified_width_sql", None)
     prior = ctx["state"].get("phases", {}).get("preflight", {})
     if ctx.get("resume") and prior.get("status") == "done" \
             and etl_started(ctx["state_dir"]):
@@ -1870,6 +1913,17 @@ def run_p2(ctx) -> Dict:
             "the installed application manifest lacks the Consent import rule",
             "Install the compatible fixed carlos-emr/carlos-ctl pair. "
             "Unmodified older package files can carry this incompatible mapping."))
+    verified = None if ctx.get("dry_run") else set()
+    try:
+        widths = preflight_width_problems(ctx, staged_names, report["findings"], verified)
+    except (RuntimeError, ValueError) as exc:
+        widths = ["Could not read column metadata: " + o19etl._query_reason(exc)]
+    if widths:
+        report["findings"].append(o19_preflight.finding(
+            "target-column-width", o19_preflight.BLOCKER,
+            "target column capacity could not be verified", "\n".join(widths)))
+    elif verified:
+        ctx["verified_width_sql"] = verified
     verdict, code, acknowledged, outstanding = o19_preflight.preflight_verdict(
         report["findings"], ctx["accepted"])
     report.update(verdict=verdict, exit_code=code, acknowledged=acknowledged,
@@ -2226,12 +2280,14 @@ def _row_parity(ctx, document_placeholders=()):
         post_copy["document"] = (o19docs.placeholder_predicate(document_placeholders, "s"),
                                  o19docs.placeholder_values("s"))
     protect_residuals = progress.get(o19etl.PROTECT_CHARSET_RESIDUALS, False)
+    copy_read_errors = []
     copy_ok, copy_bad = o19etl.copy_content_parity(
-        ctx["query"], STAGING_SCHEMA, ctx["target_db"],
+        ctx.get("query_etl", ctx["query"]), STAGING_SCHEMA, ctx["target_db"],
         src_info, dst_info,
         repairs=progress.get("repairs"), archive_schema=archive,
         details=details, post_copy=post_copy,
-        protect_charset_residuals=protect_residuals)
+        protect_charset_residuals=protect_residuals, read_errors=copy_read_errors)
+    bad.extend(copy_read_errors)
     # and the merge class, whose live rows come from two places: the
     # pre-merge snapshot is what lets the check say which is which, so
     # "the seed won" and "the clinic's row arrived" become separate
@@ -2257,7 +2313,7 @@ def _row_parity(ctx, document_placeholders=()):
         body = ("rows whose values disagree, by primary key (at most "
                 "{0} per check)\n".format(o19etl.DETAIL_ROWS)
                 + "\n".join(details) + "\n")
-    elif content_bad:
+    elif content_bad or copy_read_errors:
         # a check can FAIL without naming rows: the count query itself
         # errored, or the check is a whole-table digest with no keys to
         # give. Writing "clean" beside a FAILED verification would say
@@ -2276,7 +2332,7 @@ def _row_parity(ctx, document_placeholders=()):
     # to say carries no pointer: "clean" is nothing to send a reviewer to
     # open, but a failure with no keys still needs explaining.
     ctx.pop("content_details", None)
-    if details or content_bad:
+    if details or content_bad or copy_read_errors:
         ctx["content_details"] = path
     if content_bad and "content-migration" in (ctx.get("accepted") or ()):
         # a recorded sign-off: the operator was shown the mismatches and
@@ -2316,8 +2372,9 @@ def run_p4(ctx) -> None:
     if phase_done(ctx["state"], "etl"):
         log("etl: already complete — skipping")
         return
-    ctx["query_etl"] = make_etl_query(ctx["query"].base_argv,
-                                      ctx.get("statement_timeout", 0))
+    if "query_etl" not in ctx:
+        ctx["query_etl"] = make_etl_query(ctx["query"].base_argv,
+                                          ctx.get("statement_timeout", 0))
     ctx["src_schema"] = STAGING_SCHEMA
     ctx["archive_schema"] = ARCHIVE_SCHEMA
     ctx["dump_sha256"] = ctx["state"].get("phases", {}).get(
@@ -2338,18 +2395,13 @@ def run_p4(ctx) -> None:
                       len(ok), len(bad))
                   + ("MISMATCHES:\n  " + "\n  ".join(bad) if bad else ""))
     if bad:
-        # the copy is COMPLETE at this point: run_etl returned, so the
-        # target holds the clinic's data and every table is marked done
-        # in the ledger. A --resume re-enters, skips all of them, and
-        # re-computes the identical mismatch — saying "until this is
-        # explained" without saying that sent operators into a loop.
-        die("row parity failed for {0} table(s) — see {1}/report.txt for "
-            "the per-table mismatch. The copy is COMPLETE and the target "
-            "holds clinic data; a --resume will only re-check and "
-            "re-fail, and no flag overrides parity. {2}, and send "
-            "report.txt with the mismatch list.".format(
+        die("post-copy verification failed for {0} check(s). See {1}/report.txt. "
+            "The copy is complete. If a check could not read the data, resolve "
+            "the database error and re-run with --resume to verify it. "
+            "For a confirmed row mismatch, {2} and include report.txt when "
+            "reporting the discrepancy.".format(
                 len(bad), ctx["state_dir"],
-                rollback_hint(ctx["state"]).capitalize()))
+                rollback_hint(ctx["state"])))
     from . import o19signatures
     try:
         frozen, unresolved = o19signatures.install_owners(
@@ -3590,7 +3642,7 @@ def _parser(prog: str, import_mode: bool) -> argparse.ArgumentParser:
                              "0 = no bound). A sparse or crafted dump "
                              "cannot then hold one statement forever")
         ap.add_argument("--dry-run", action="store_true",
-                        help="run P0-P2, including source document checks, plus the properties report; no "
+                        help="run P0-P2, including source documents and target column widths, plus the properties report; no "
                              "writes beyond the throwaway staging schema. "
                              "--accept flags are NOT recorded, and a "
                              "workspace whose import is in progress is "
@@ -4404,6 +4456,8 @@ def _make_ctx(args, import_mode: bool,
         "state": state,
         "query": make_query(args.mariadb_arg,
                             getattr(args, "statement_timeout", 0)),
+        "query_etl": make_etl_query(HOST.client_base_argv(args.mariadb_arg),
+                                    getattr(args, "statement_timeout", 0)),
         # the unbuffered reader, for the one read whose size a CLINIC's
         # data decides: the archive CSV export (o19docs)
         "row_stream": make_row_stream(

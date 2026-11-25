@@ -47,6 +47,128 @@ class TestO19Compatibility(unittest.TestCase):
                             text=True, capture_output=True, timeout=30, check=True)
         return o19import.batch_rows(cp.stdout)
 
+    def test_audit_log_width_on_the_host_dry_run_and_before_copy(self):
+        self.q("CREATE TABLE {0}.Log (id BIGINT PRIMARY KEY, data TEXT CHARACTER SET latin1); "
+               "INSERT INTO {0}.Log VALUES (0, REPEAT(0x80, 65535)), (50001, 'last'); "
+               "CREATE TABLE {1}.log (id BIGINT PRIMARY KEY, data MEDIUMTEXT CHARACTER SET utf8mb4)"
+               .format(self.src, self.dst))
+        queries = []
+        etl_query = o19import.make_etl_query(self.base)
+
+        def counted(sql):
+            queries.append(sql)
+            return etl_query(sql)
+
+        ctx = {"state_dir": self.temp.name, "state": {}, "target_db": self.dst, "query": self.q,
+               "query_etl": counted, "dry_run": True, "accepted": ["content-migration"], "province": "on"}
+
+        def assess():
+            with patch.object(pf, "run_checks", return_value={"schema_map_version": "test", "findings": []}), \
+                    patch.object(o19import, "STAGING_SCHEMA", self.src):
+                return o19import.run_p2(ctx)
+
+        self.assertEqual(assess()["verdict"], "go")
+        self.assertEqual(queries, [])
+        self.assertEqual(self.q("SELECT LENGTH(CONVERT(data USING utf8mb4)) FROM {0}.Log WHERE id=0"
+                                .format(self.src)), [["196605"]])
+        self.q("ALTER TABLE {0}.Log MODIFY data MEDIUMTEXT CHARACTER SET latin1; "
+               "UPDATE {0}.Log SET data=REPEAT(0x80, 6000000) WHERE id=50001".format(self.src))
+        report = assess()
+        self.assertEqual((report["verdict"], report["exit_code"]), ("no-go", 2))
+        finding, = report["findings"]
+        self.assertNotIn("accept", finding)
+        self.assertIn("Log.data: 1 value(s)", finding["detail"])
+        self.assertIn("id 50000..50001", finding["detail"])
+        counts = [q for q in queries if "LENGTH(CONVERT(" in q]
+        self.assertEqual(len(counts), 2)
+        self.assertTrue(all(" AND s.`id` > " in q for q in counts))
+        self.assertEqual(self.q("SELECT COUNT(*) FROM {0}.log".format(self.dst)), [["0"]])
+
+        # An engine failure in a later range also withholds the verdict.
+        def failed_read(sql):
+            if "LENGTH(CONVERT(" in sql and "s.`id` > 49999" in sql:
+                raise o19etl.QueryError('ERROR 1030 (HY000): Got error 168 from InnoDB')
+            return etl_query(sql)
+        ctx["query_etl"] = failed_read
+        unreadable = assess()
+        self.assertEqual(unreadable["exit_code"], 2)
+        self.assertRegex(unreadable["findings"][0]["detail"], r"Log\.data \(id 50000\.\.50001\).*1030.*168")
+
+        o19etl.normalize_table_case(self.q, self.src, ["Log"])
+        src = o19etl.introspect_columns(self.q, self.src)
+        dst = o19etl.introspect_columns(self.q, self.dst)
+        entry, _ = o19etl.effective_entry("log", o19import.o19map_schema.TABLES["log"], src["log"])
+        args = self.src, self.src + "_archive", src, dst, {"log": entry}, {}, "MigrationAdmin"
+        problems = o19etl.etl_precheck_problems(ctx, self.q, etl_query, *args)
+        self.assertTrue(any(p.startswith("log.data: 1 value(s)") for p in problems), problems)
+        with self.assertRaisesRegex(o19etl.QueryError, r"log\.data \(id 50000\.\.50001\).*1030.*168"):
+            o19etl.etl_precheck_problems(ctx, self.q, failed_read, *args)
+
+    def test_text_foreign_key_width_is_checked_when_its_parent_map_exists(self):
+        for db in (self.src, self.dst):
+            self.q("CREATE TABLE {0}.validations (id INT PRIMARY KEY); "
+                   "CREATE TABLE {0}.measurementType (validation VARCHAR(100) NOT NULL)".format(db))
+        ctx = {"query": self.q, "query_etl": o19import.make_etl_query(self.base), "target_db": self.dst}
+        names = {"validations": "validations", "measurementtype": "measurementType"}
+        findings = []
+        with patch.object(o19import, "STAGING_SCHEMA", self.src):
+            self.assertEqual(o19import.preflight_width_problems(ctx, names, findings, None), [])
+            self.assertEqual(findings, [])
+            self.q("ALTER TABLE {0}.measurementType MODIFY validation VARCHAR(200) NOT NULL; "
+                   "INSERT INTO {0}.measurementType VALUES (CONCAT(REPEAT('0',100),'7'))".format(self.src))
+            self.assertEqual(o19import.preflight_width_problems(ctx, names, findings, None), [])
+        self.assertEqual(findings[0]["data"], ["measurementType.validation"])
+        dst = o19etl.introspect_columns(self.q, self.dst)["measurementType"]
+        src = o19etl.introspect_columns(self.q, self.src)["measurementType"]
+        entry = dict(o19import.o19map_schema.TABLES["measurementType"], cols=["validation"])
+        args = ctx["query_etl"], "measurementType", entry, self.src, dst, src
+        self.q("CREATE TABLE {0}.validations__idmap (old_id BIGINT PRIMARY KEY, new_id BIGINT NOT NULL)"
+               .format(self.dst))
+        self.assertIn("1 value(s)", o19etl.width_problems(*args, archive_schema=self.dst)[0])
+        self.q("INSERT INTO {0}.validations__idmap VALUES (7,23)".format(self.dst))
+        self.assertEqual(o19etl.width_problems(*args, archive_schema=self.dst), [])
+
+    def test_audit_log_resume_and_final_verification_cover_all_ranges(self):
+        for schema in (self.src, self.dst):
+            self.q("CREATE TABLE {0}.log (id BIGINT PRIMARY KEY, data TEXT)".format(schema))
+        self.q("INSERT INTO {0}.log VALUES (-1, NULL), (0,'first'), (49998,'edge'), (50000,'last')"
+               .format(self.src))
+        src = o19etl.introspect_columns(self.q, self.src)
+        dst = o19etl.introspect_columns(self.q, self.dst)
+        entry, _ = o19etl.effective_entry("log", o19import.o19map_schema.TABLES["log"], src["log"])
+        state = {}
+        progress = {"tables": {"log": state}}
+        query = o19import.make_etl_query(self.base)
+
+        def interrupted(sql):
+            if " JOIN " in sql and "s.`id` > 49998" in sql:
+                raise o19etl.QueryError("ERROR 1030: Got error 168 from InnoDB")
+            return query(sql)
+
+        run = SimpleNamespace(query=interrupted, plain=self.q, src=self.src, dst=self.dst, arch=self.src,
+                              state_dir=self.temp.name, progress=progress, counts={"copy": 0},
+                              seed_group=set(), admin_user=None, admin_pn=None)
+        with self.assertRaisesRegex(o19etl.QueryError, r"log \(id 49999\.\.50000\).*1030.*168"):
+            o19etl.etl_copy_table(run, "log", entry, state, dst["log"], set())
+        self.assertEqual(o19etl.load_progress(self.temp.name)["tables"]["log"], {"started": True, "done_through": 49998})
+        run.query = query
+        o19etl.etl_copy_table(run, "log", entry, state, dst["log"], set())
+        self.assertTrue(state["done"])
+        args = self.src, self.dst, src, dst
+        self.assertEqual(o19etl.copy_content_parity(query, *args)[1], [])
+        ok, bad = o19etl.copy_content_parity(interrupted, *args)
+        self.assertFalse(ok)
+        self.assertRegex(bad[0], r"id 49999\.\.50000.*1030.*168")
+        # Same row count, but one changed value and one missing twin.
+        self.q("UPDATE {0}.log SET data='changed' WHERE id=49998; "
+               "UPDATE {0}.log SET id=50001 WHERE id=50000".format(self.dst))
+        details = []
+        ok, bad = o19etl.copy_content_parity(query, *args, details=details)
+        self.assertFalse(ok)
+        self.assertIn("log: 2 copied row(s)", bad[0])
+        self.assertIn("id=49998", details[0])
+        self.assertIn("id=50000", details[1])
+
     def test_document_notice_resumes_and_preserves_exact_document_parity(self):
         for schema in (self.src, self.dst):
             self.q("CREATE TABLE {0}.document (document_no INT PRIMARY KEY, docfilename VARCHAR(255), "

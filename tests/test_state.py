@@ -350,6 +350,7 @@ class TestTheP2ReportsAreWrittenPrivately(unittest.TestCase):
         """Report a staged Consent mapping without the required ranking as a blocker."""
         with mock.patch.object(o19import.o19map_schema, "TABLES", {
                 "Consent": {"class": "copy", "cols": ["id", "optout"]}}), \
+                mock.patch.object(o19import, "preflight_width_problems", return_value=[]), \
                 mock.patch.object(o19import.o19etl, "schema_tables", return_value={"Consent"}):
             self.run_p2()
         self.assertEqual(self.report["verdict"], "no-go")
@@ -2763,6 +2764,7 @@ class TestRowParityComposition(unittest.TestCase):
                      "carlos": {table: cols}},
             value_errors=[table])
         ctx = self.ctx(query)
+        ctx["accepted"] = ["content-migration"]
         _ok, bad = o19import._row_parity(ctx)
         self.assertTrue(any("values could not be checked" in line
                             for line in bad), bad)
