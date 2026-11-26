@@ -241,11 +241,20 @@ def _free_front_door(bind_ip: str, boot: bool) -> None:
     would stop and stop it on confirmation; otherwise (at boot, from a script)
     only name it -- a repair nobody is watching does not take other services
     down. Anything the helper never stops (containers, programs started by
-    hand, database servers) is named either way, by the nginx step's failure."""
+    hand, database servers) is named either way, by the nginx step's failure.
+
+    Consent covers exactly what was listed (carlos-emr/carlos#6060): the stop
+    run is handed the units of the plan that was shown (--approved), so a
+    service that took 80/443 while the question was open is left running and
+    named, never stopped unseen. A carlos-emr whose helper predates --approved
+    prints no "will-stop-unit:" lines; only then is the older stop-everything
+    run used, which is what that helper supports."""
     plan = _host_conflicts("front-door", "--plan", bind_ip)
     if plan is None:
         return
     will_stop = [line[len("will-stop: "):] for line in plan if line.startswith("will-stop: ")]
+    approved = [line[len("will-stop-unit: "):].strip() for line in plan
+                if line.startswith("will-stop-unit: ")]
     # What the helper never stops is named before anything is asked, so an
     # operator agreeing to stop one service knows another will still block.
     for line in plan:
@@ -266,12 +275,17 @@ def _free_front_door(bind_ip: str, boot: bool) -> None:
         warn("left running; nginx cannot serve the CARLOS front door until ports 80 "
              "and 443 are free")
         return
-    for line in _host_conflicts("front-door", bind_ip) or []:
+    if approved:
+        stop_args = ("front-door", "--approved", " ".join(approved), bind_ip)
+    else:
+        stop_args = ("front-door", bind_ip)
+    for line in _host_conflicts(*stop_args) or []:
         if line.startswith("stopped: "):
             log(line[len("stopped: "):])
             _journal("front door: " + line[len("stopped: "):])
         elif line.startswith("blocked: "):
             warn(line[len("blocked: "):])
+            _journal("front door: not stopped: " + line[len("blocked: "):])
 
 
 def pending() -> bool:

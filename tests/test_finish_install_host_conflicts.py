@@ -206,6 +206,7 @@ class TestRootPasswordFromAnEarlierSetup(FinishInstallCase):
 class TestFrontDoorConflicts(FinishInstallCase):
 
     PLAN = ["will-stop: apache2.service (package apache2), on 0.0.0.0:80",
+            "will-stop-unit: apache2.service",
             "blocked: docker-proxy (pid 4, docker.service) is listening on 0.0.0.0:443"]
     STOPPED = ["stopped: apache2.service (package apache2) was listening on 0.0.0.0:80, "
                "which the CARLOS front door needs; it is stopped and disabled"]
@@ -233,8 +234,10 @@ class TestFrontDoorConflicts(FinishInstallCase):
         rc, out, err = self.finish()
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.helper_calls, [["front-door", "--plan", "0.0.0.0"],
-                                             ["front-door", "0.0.0.0"]])
-        self.assertEqual(order, ["front-door --plan 0.0.0.0", "front-door 0.0.0.0",
+                                             ["front-door", "--approved", "apache2.service",
+                                              "0.0.0.0"]])
+        self.assertEqual(order, ["front-door --plan 0.0.0.0",
+                                 "front-door --approved apache2.service 0.0.0.0",
                                  "init-config", "nginx"])
         self.assertIn("apache2.service (package apache2), on 0.0.0.0:80", out)
         self.assertIn("apache2.service (package apache2) was listening", out)
@@ -281,6 +284,41 @@ class TestFrontDoorConflicts(FinishInstallCase):
         rc, out, err = self.finish()
         self.assertFalse(getattr(self, "prompts", []))
         self.assertEqual(len(self.helper_calls), 1)
+
+    def test_the_stop_run_is_given_every_unit_the_question_listed(self):
+        self.PLAN = ["will-stop: apache2.service (package apache2), on 0.0.0.0:80",
+                     "will-stop-unit: apache2.service",
+                     "will-stop: lighttpd.socket (package lighttpd) and the lighttpd.service "
+                     "it starts, on [::]:443",
+                     "will-stop-unit: lighttpd.socket",
+                     "will-stop-unit: lighttpd.service"]
+        self.answers = ["y"]
+        self.finish()
+        self.assertEqual(self.helper_calls[1],
+                         ["front-door", "--approved",
+                          "apache2.service lighttpd.socket lighttpd.service", "0.0.0.0"])
+
+    def test_a_service_that_took_a_port_after_the_question_is_named_not_stopped(self):
+        blocked = ("blocked: caddy (pid 5, caddy.service) is listening on 0.0.0.0:443, so nginx "
+                   "cannot serve the CARLOS front door; it was not among the services approved "
+                   "for stopping")
+        self.STOPPED = self.STOPPED + [blocked]
+        self.answers = ["y"]
+        rc, out, err = self.finish()
+        self.assertIn("caddy (pid 5, caddy.service)", err)
+        self.assertNotIn("caddy", out)
+        journal = [c for c in self.commands() if c[:3] == ["logger", "-t", "carlos-emr"]]
+        self.assertTrue(any("front door: not stopped: caddy" in c[-1] for c in journal), journal)
+
+    def test_a_helper_that_predates_approved_gets_the_run_it_supports(self):
+        # carlos-emr before #6060 prints no will-stop-unit: lines and would
+        # refuse --approved as a usage error, stopping nothing at all.
+        self.PLAN = [line for line in self.PLAN if not line.startswith("will-stop-unit: ")]
+        self.answers = ["y"]
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.helper_calls, [["front-door", "--plan", "0.0.0.0"],
+                                             ["front-door", "0.0.0.0"]])
 
     def test_an_older_carlos_emr_without_the_helper_behaves_as_before(self):
         self.mocks["_host_conflicts"].side_effect = None
