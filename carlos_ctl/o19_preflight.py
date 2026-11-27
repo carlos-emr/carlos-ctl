@@ -4202,9 +4202,9 @@ def render_text(report):
         view_flags = " " + " ".join(ignore_table_flags(views[0]["data"]))
     lines.append("  # Copy /usr/share/carlos-emr/o19-manifest/export-medication-floats.py "
                  "from the matching CARLOS package into this private directory.")
-    lines.append("  {{ mysqldump --single-transaction --quick --skip-triggers "
-                 "{0}<db> &&".format(view_flags.strip() + " " if view_flags else ""))
-    lines.append("    python3 export-medication-floats.py --db <db>; } | gzip > o19.sql.gz.tmp")
+    lines.append("  mysqldump --single-transaction --quick --skip-triggers "
+                 "{0}<db> |".format(view_flags.strip() + " " if view_flags else ""))
+    lines.append("    python3 export-medication-floats.py --complete-dump --db <db> | gzip > o19.sql.gz.tmp")
     lines.append("  mv o19.sql.gz.tmp o19.sql.gz")
     lines.append("    (MySQL 5.6+: add --set-gtid-purged=OFF; the import "
                  "refuses a dump that sets GTID_PURGED)")
