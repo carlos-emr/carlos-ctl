@@ -19,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from carlos_ctl import o19_preflight as pf, o19debug, o19docs, o19etl, o19host, o19import, o19sources
+from carlos_ctl import o19_preflight as pf, o19debug, o19digest, o19docs, o19etl, o19host, o19import, o19sources
 from tests.test_docs_driver import make_tar
 
 
@@ -47,6 +47,21 @@ class TestO19Compatibility(unittest.TestCase):
         cp = subprocess.run(self.base + list(o19import.CLIENT_COMMON_ARGS), input=sql,
                             text=True, capture_output=True, timeout=30, check=True)
         return o19import.batch_rows(cp.stdout)
+
+    def test_transfer_digests_separate_distinct_stored_floats_with_the_same_display(self):
+        columns = ["id", "dose"]
+        types = {"id": "int", "dose": "float"}
+        self.q("CREATE TABLE {0}.drugs (id INT PRIMARY KEY, dose FLOAT); "
+               "CREATE TABLE {1}.drugs LIKE {0}.drugs; "
+               "INSERT INTO {0}.drugs VALUES (1,1/3),(2,NULL),(3,0),(4,-1); "
+               "INSERT INTO {1}.drugs SELECT * FROM {0}.drugs".format(self.src, self.dst))
+        expected = self.q(pf.digest_sql(self.src, "drugs", columns, types))
+        actual = o19digest.digest_sql(self.dst, "drugs", columns, types)
+        self.assertEqual(self.q(actual), expected)
+        self.q("UPDATE {0}.drugs SET dose=0.333333 WHERE id=1".format(self.dst))
+        self.assertEqual(self.q("SELECT CONVERT(dose USING utf8mb4) FROM {0}.drugs WHERE id=1".format(self.src)),
+                         self.q("SELECT CONVERT(dose USING utf8mb4) FROM {0}.drugs WHERE id=1".format(self.dst)))
+        self.assertNotEqual(self.q(actual), expected)
 
     def diagnostics(self, mode="import", verbose=False, resume=False):
         return o19debug.Diagnostics(self.temp.name, o19import.append_private, verbose=verbose, mode=mode,
