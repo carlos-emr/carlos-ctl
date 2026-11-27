@@ -229,6 +229,15 @@ class TestReadingTheDocument(unittest.TestCase):
             json.dump(obj, fh)
         return path
 
+    def test_reading_format_three_accepts_unaffected_tables_but_refuses_populated_floats(self):
+        legacy = dict(DOCUMENT, digest_format=3)
+        self.assertEqual(o19digest.load_document(self.write(legacy))["digest_format"], 3)
+        entry = {"columns": [["dose", "float"]], "rows": 1}
+        with self.assertRaisesRegex(ValueError, "FLOAT precision"):
+            o19digest.load_document(self.write(dict(legacy, tables={"drugs": entry})))
+        entry["rows"] = 0
+        self.assertEqual(o19digest.load_document(self.write(dict(legacy, tables={"drugs": entry})))["digest_format"], 3)
+
     def test_a_good_document_reads(self):
         self.assertEqual(
             o19digest.load_document(self.write(DOCUMENT))["tables"],
@@ -297,6 +306,17 @@ class TestTheRefusal(unittest.TestCase):
 
     def refusal(self, result, accepted=()):
         return o19import.content_transfer_refusal(result, accepted)
+
+    def test_a_known_weak_float_digest_requires_new_source_evidence(self):
+        result = {"status": "insufficient-float-precision", "summary": "need exact source floats"}
+        self.assertEqual(self.refusal(result, ("no-content-digests", "content-transfer")),
+                         result["summary"])
+
+    def test_a_known_medication_disagreement_refuses_generic_transfer_signoff(self):
+        for name in ("drugs", "favorites", "DrugDispensingMapping"):
+            result = dict(self.BROKEN, failed=[[name, "digest differs"]])
+            self.assertIn("medication source and staging values disagree",
+                          self.refusal(result, ("content-transfer", "no-content-digests")))
 
     def test_a_clean_comparison_does_not_refuse(self):
         self.assertIsNone(self.refusal(self.CLEAN))

@@ -42,6 +42,13 @@ class TestTheRowEncodingIsUnambiguous(unittest.TestCase):
         # a value always contributes "<digits>:...", the marker does not
         self.assertFalse(o19digest.NULL_MARK.strip("'")[0].isdigit())
 
+    def test_float_preserves_adjacent_stored_doses_in_source_and_target_sql(self):
+        from carlos_ctl import o19_preflight
+        source = o19_preflight.digest_value_expr("takemin", "float")
+        self.assertEqual(source, o19digest.value_expr("takemin", "float"))
+        self.assertIn("(`takemin` + 0e0)", source)
+        self.assertEqual(o19_preflight.DIGEST_FORMAT, o19digest.DIGEST_FORMAT)
+
     def test_a_column_list_must_not_be_empty(self):
         with self.assertRaises(ValueError):
             o19digest.row_hash_expr([], {})
@@ -178,7 +185,7 @@ class TestValuesAreNormalisedBeforeHashing(unittest.TestCase):
         """Measured: HEX() treats a numeric argument as a longlong, so
         HEX(1.4) is '1' and HEX(1.5) is '2' -- two different amounts of
         money with one digest."""
-        for t in ("decimal", "double", "int", "bigint", "float"):
+        for t in ("decimal", "double", "int", "bigint"):
             expr = o19digest.value_expr("amount", t)
             self.assertIn("CONVERT(`amount` USING utf8mb4)", expr)
             self.assertNotIn("HEX(", expr)
@@ -322,7 +329,7 @@ class TestOversizedValuesDoNotCollapse(unittest.TestCase):
     def test_the_format_was_bumped_for_it(self):
         # a format-1 document was taken under the collapsing rules and a
         # format-2 one hashed HEX(col); both must be refused, not compared
-        self.assertEqual(o19digest.DIGEST_FORMAT, 3)
+        self.assertEqual(o19digest.DIGEST_FORMAT, 4)
         self.assertEqual(o19digest.digest_entry(
             [("a", "int")], o19digest.Digest(1, 2, 3, 0))["unhashed"], 0)
         with self.assertRaises(ValueError):
