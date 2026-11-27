@@ -366,6 +366,7 @@ UTC_SESSION = "SET time_zone = '+00:00'"
 #: counted rather than filed as a NULL (format 2 hashed `HEX(col)`,
 #: which MariaDB 11.8 bounds by max_allowed_packet, and its IFNULL read
 #: the resulting NULL as a stored NULL -- see the module docstring).
+#: 4: widen binary32 before decimal rendering so a rounded dump is detected.
 DIGEST_FORMAT = 4
 
 

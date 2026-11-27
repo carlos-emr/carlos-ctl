@@ -88,6 +88,9 @@ class TestEveryTableIsMeasured(unittest.TestCase):
                                                           "'oscar'"),
                                       province="on", db_name="oscar")
 
+    def test_serialized_source_document_carries_the_precision_safe_version(self):
+        self.assertEqual(json.loads(json.dumps(self.doc))["digest_format"], 4)
+
     def test_each_table_gets_an_entry(self):
         self.assertEqual(sorted(self.doc["tables"]),
                          ["demographic", "document"])

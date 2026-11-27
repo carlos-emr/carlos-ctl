@@ -53,11 +53,19 @@ class TestO19Compatibility(unittest.TestCase):
         types = {"id": "int", "dose": "float"}
         self.q("CREATE TABLE {0}.drugs (id INT PRIMARY KEY, dose FLOAT); "
                "CREATE TABLE {1}.drugs LIKE {0}.drugs; "
-               "INSERT INTO {0}.drugs VALUES (1,1/3),(2,NULL),(3,0),(4,-1); "
-               "INSERT INTO {1}.drugs SELECT * FROM {0}.drugs".format(self.src, self.dst))
+               "INSERT INTO {0}.drugs VALUES (1,1/3),(2,NULL),(3,0),(4,-1),"
+               "(5,0.3333333730697632)".format(self.src, self.dst))
+        dump = subprocess.check_output(["mariadb-dump"] + self.base[1:] + [
+            "--single-transaction", "--skip-triggers", "--no-create-info", self.src, "drugs"])
+        subprocess.run(self.base + [self.dst], input=dump, check=True)
         expected = self.q(pf.digest_sql(self.src, "drugs", columns, types))
         actual = o19digest.digest_sql(self.dst, "drugs", columns, types)
-        self.assertEqual(self.q(actual), expected)
+        # A repaired dump from a newer client can already match. Also exercise a
+        # rounded staging value explicitly so the refusal holds on either client.
+        source_values = self.q("SELECT id, dose + 0e0 FROM {0}.drugs ORDER BY id".format(self.src))
+        restored_values = self.q("SELECT id, dose + 0e0 FROM {0}.drugs ORDER BY id".format(self.dst))
+        self.assertEqual(self.q(actual) == expected, source_values == restored_values)
+        self.assertNotEqual(source_values[0][1], source_values[4][1])
         self.q("UPDATE {0}.drugs SET dose=0.333333 WHERE id=1".format(self.dst))
         self.assertEqual(self.q("SELECT CONVERT(dose USING utf8mb4) FROM {0}.drugs WHERE id=1".format(self.src)),
                          self.q("SELECT CONVERT(dose USING utf8mb4) FROM {0}.drugs WHERE id=1".format(self.dst)))

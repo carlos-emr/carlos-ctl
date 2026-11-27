@@ -2020,7 +2020,8 @@ def content_transfer_check(ctx) -> Dict:
 
     Returns `{"status": ..., "summary": str, ...}` where status is one of
     `absent` (no digest document was supplied), `unreadable` (one was, and
-    could not be used) or `compared`. Never raises: an operator who cannot
+    could not be used), `insufficient-float-precision` (the supplied source
+    evidence cannot distinguish stored FLOATs), or `compared`. Never raises: an operator who cannot
     run the check must be told exactly that, not handed a traceback in the
     middle of a phase that has staged a clinic's whole database.
     """
