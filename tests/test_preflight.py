@@ -1450,11 +1450,13 @@ class TestAViewStopsTheRestoreBeforeTheCutover(unittest.TestCase):
     def test_the_bundling_recipe_carries_the_flags(self):
         text = pf.render_text(self.report(["v_a", "v_b"]))
         line = [ln for ln in text.splitlines()
-                if ln.startswith("  mysqldump --single-transaction")]
+                if ln.startswith("  { mysqldump --single-transaction")]
         self.assertTrue(line, text)
         self.assertIn("--ignore-table=<db>.v_a", line[0])
         self.assertIn("--ignore-table=<db>.v_b", line[0])
-        self.assertIn("<db> | gzip > o19.sql.gz", line[0])
+        self.assertTrue(line[0].endswith("<db> &&"))
+        self.assertIn("export-medication-floats.py --db <db>; } | gzip > o19.sql.gz.tmp", text)
+        self.assertIn("mv o19.sql.gz.tmp o19.sql.gz", text)
 
     def test_a_hostile_view_name_cannot_break_out_of_the_recipe(self):
         """The recipe is copied into a shell by an operator.
@@ -1468,7 +1470,7 @@ class TestAViewStopsTheRestoreBeforeTheCutover(unittest.TestCase):
         nasty = "v_a;rm -rf /"
         text = pf.render_text(self.report([nasty, "v ' b", "v_ok"]))
         line = [ln for ln in text.splitlines()
-                if ln.startswith("  mysqldump --single-transaction")][0]
+                if ln.startswith("  { mysqldump --single-transaction")][0]
         argv = shlex.split(line.strip())
         for name in (nasty, "v ' b", "v_ok"):
             self.assertIn("--ignore-table=<db>.{0}".format(name), argv)
@@ -1483,7 +1485,7 @@ class TestAViewStopsTheRestoreBeforeTheCutover(unittest.TestCase):
         report = self.report([])
         self.assertIsNone(self.finding(report))
         line = [ln for ln in pf.render_text(report).splitlines()
-                if ln.startswith("  mysqldump --single-transaction")]
+                if ln.startswith("  { mysqldump --single-transaction")]
         self.assertNotIn("--ignore-table", line[0])
 
     def test_a_refused_view_listing_is_a_hard_no_go_not_a_silence(self):
