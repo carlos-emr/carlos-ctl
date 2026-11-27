@@ -1454,7 +1454,9 @@ class TestAViewStopsTheRestoreBeforeTheCutover(unittest.TestCase):
         self.assertTrue(line, text)
         self.assertIn("--ignore-table=<db>.v_a", line[0])
         self.assertIn("--ignore-table=<db>.v_b", line[0])
-        self.assertIn("<db> | gzip > o19.sql.gz", line[0])
+        self.assertTrue(line[0].endswith("<db> |"))
+        self.assertIn("export-medication-floats.py --complete-dump --db <db> | gzip > o19.sql.gz.tmp", text)
+        self.assertIn("mv o19.sql.gz.tmp o19.sql.gz", text)
 
     def test_a_hostile_view_name_cannot_break_out_of_the_recipe(self):
         """The recipe is copied into a shell by an operator.

@@ -2020,7 +2020,8 @@ def content_transfer_check(ctx) -> Dict:
 
     Returns `{"status": ..., "summary": str, ...}` where status is one of
     `absent` (no digest document was supplied), `unreadable` (one was, and
-    could not be used) or `compared`. Never raises: an operator who cannot
+    could not be used), `insufficient-float-precision` (the supplied source
+    evidence cannot distinguish stored FLOATs), or `compared`. Never raises: an operator who cannot
     run the check must be told exactly that, not handed a traceback in the
     middle of a phase that has staged a clinic's whole database.
     """
@@ -2031,6 +2032,8 @@ def content_transfer_check(ctx) -> Dict:
                 "could be checked by row count only"}
     try:
         document = o19digest.load_document(path)
+    except o19digest.InsufficientFloatPrecision as exc:
+        return {"status": "insufficient-float-precision", "summary": str(exc)}
     except ValueError as exc:
         return {"status": "unreadable", "summary": str(exc)}
 
@@ -2060,7 +2063,14 @@ def content_transfer_refusal(result: Dict, accepted) -> Optional[str]:
     accepts one has not accepted the other. Pure, so both are testable
     without a database."""
     accepted = set(accepted or ())
+    if result.get("status") == "insufficient-float-precision":
+        return result["summary"]
     if result.get("status") == "compared" and result.get("failed"):
+        medication_tables = {"drugs", "favorites", "drugdispensingmapping"}
+        if any(table.lower() in medication_tables for table, _ in result["failed"]):
+            return ("OSCAR19 medication source and staging values disagree. Re-export "
+                    "from the quiescent original with the medication FLOAT supplement "
+                    "and fresh source digests before importing.")
         if "content-transfer" not in accepted:
             worst = result["failed"][:5]
             return ("the restored staging schema does not match what the "

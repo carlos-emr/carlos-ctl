@@ -214,6 +214,11 @@ def value_expr(col: str, coltype: str, expression: Optional[str] = None) -> str:
             # digits are what makes a BIT or a GEOMETRY unambiguous
             rendered = "HEX({0})".format(quoted)
             length = "CHAR_LENGTH({0})".format(rendered)
+    elif normalised == "float":
+        # Direct character conversion keeps only six significant digits on
+        # MariaDB. Widen binary32 exactly before requesting the decimal text.
+        rendered = "CONVERT(({0} + 0e0) USING utf8mb4)".format(quoted)
+        length = "CHAR_LENGTH({0})".format(rendered)
     elif normalised in CONVERTED_TYPES:
         rendered = "CONVERT({0} USING utf8mb4)".format(quoted)
         length = "CHAR_LENGTH({0})".format(rendered)
@@ -361,7 +366,8 @@ UTC_SESSION = "SET time_zone = '+00:00'"
 #: counted rather than filed as a NULL (format 2 hashed `HEX(col)`,
 #: which MariaDB 11.8 bounds by max_allowed_packet, and its IFNULL read
 #: the resulting NULL as a stored NULL -- see the module docstring).
-DIGEST_FORMAT = 3
+#: 4: widen binary32 before decimal rendering so a rounded dump is detected.
+DIGEST_FORMAT = 4
 
 
 def digest_entry(columns: Sequence[Sequence[str]],
@@ -431,6 +437,10 @@ class Comparison(NamedTuple):
                                   len(self.unverified)))
 
 
+class InsufficientFloatPrecision(ValueError):
+    """An earlier source digest cannot establish the stored binary32 values."""
+
+
 def load_document(path: str) -> Dict[str, object]:
     """Read and vet a digest document.
 
@@ -449,7 +459,7 @@ def load_document(path: str) -> Dict[str, object]:
     if not isinstance(doc, dict):
         raise ValueError("{0} is not a digest document".format(path))
     fmt = doc.get("digest_format")
-    if fmt != DIGEST_FORMAT:
+    if fmt not in (3, DIGEST_FORMAT):
         raise ValueError(
             "{0} carries digest format {1!r}; this build reads format {2}. "
             "Re-run the clinic assessment with a matching o19_preflight.py"
@@ -470,6 +480,18 @@ def load_document(path: str) -> Dict[str, object]:
             "{0} carries neither a table digest nor a reason one could "
             "not be taken, so it says nothing about the clinic's data; "
             "re-run the assessment with --digests".format(path))
+    if fmt == 3:
+        for table, entry in tables.items():
+            if not isinstance(entry, dict) or not isinstance(entry.get("columns"), list):
+                raise ValueError("malformed format 3 table entry")
+            columns = entry["columns"]
+            if not all(isinstance(col, list) and len(col) == 2 and isinstance(col[1], str)
+                       for col in columns):
+                raise ValueError("malformed format 3 digest columns")
+            if entry.get("rows") != 0 and any(col[1].lower() == "float" for col in columns):
+                raise InsufficientFloatPrecision(
+                    "format 3 cannot verify stored FLOAT precision for {0}; "
+                    "re-run the source assessment with format 4".format(table))
     return doc
 
 
@@ -481,6 +503,8 @@ def _rendering(coltype: str) -> str:
     identically, and refusing that pair would fail a correct restore."""
     if is_hexed(coltype):
         return "hex"
+    if (coltype or "").lower() == "float":
+        return "binary32"
     if (coltype or "").lower() in CONVERTED_TYPES:
         return "convert"
     return ""

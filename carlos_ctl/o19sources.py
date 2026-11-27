@@ -112,6 +112,48 @@ def statements(stream, spool_dir=None):
         spool.close()
 
 
+MEDICATION_KEYS = {b"drugs": b"drugid", b"favorites": b"favoriteid", b"drugdispensingmapping": b"id"}
+FLOAT_VALUE = rb"(?:NULL|-?[0-9]{1,40}(?:\.[0-9]{1,40})?(?:[eE][-+]?[0-9]{1,3})?)"
+FLOAT_ASSIGNMENT = re.compile(rb"`(takemin|takemax)`=(" + FLOAT_VALUE + rb")", re.I)
+STAMP_SELF_ASSIGNMENT = re.compile(rb"`([A-Za-z_][A-Za-z0-9_]{0,63})`=`\1`")
+
+
+def medication_float_table(statement):
+    """Accept only the bounded statements emitted by the OSCAR19 source export helper."""
+    statement.seek(0)
+    raw = statement.read(4097)
+    if len(raw) > 4096:
+        return None
+    raw = raw.strip()
+    header = b"-- Exact source medication values for this staging restore.\n"
+    if raw.startswith(header):
+        raw = raw[len(header):]
+    match = re.fullmatch(rb"UPDATE `([A-Za-z0-9_]+)` SET ([^;\r\n]+) WHERE `([A-Za-z0-9_]+)`=(-?[0-9]{1,20});", raw)
+    if not match:
+        return None
+    table, assignments, key, _ = match.groups()
+    if MEDICATION_KEYS.get(table.lower()) != key.lower():
+        return None
+    seen = set()
+    dose_fields = set()
+    for assignment in assignments.split(b", "):
+        dose = FLOAT_ASSIGNMENT.fullmatch(assignment)
+        stamp = STAMP_SELF_ASSIGNMENT.fullmatch(assignment)
+        if dose:
+            name = dose.group(1).lower()
+            dose_fields.add(name)
+        elif stamp:
+            name = stamp.group(1).lower()
+            if name in (b"takemin", b"takemax", key.lower()):
+                return None
+        else:
+            return None
+        if name in seen:
+            return None
+        seen.add(name)
+    return table.decode("ascii") if dose_fields else None
+
+
 def statement_info(statement):
     """(verb, table, first keyword offset) without materializing INSERT data."""
     statement.seek(0)
@@ -150,6 +192,10 @@ def statement_info(statement):
         if index + 1 < len(words) and words[index + 1][1] == ".":
             raise ValueError("schema-qualified dump statements need a database-only export (no --databases)")
         return verb, words[index][1], offset
+    if verb == "UPDATE":
+        table = medication_float_table(statement)
+        if table is not None:
+            return verb, table, offset
     if verb in ("USE", "DELIMITER", "DELETE", "UPDATE", "TRUNCATE") or verb == "CREATE":
         raise ValueError("unsupported {0} statement in dump set; export base tables without --databases, views, routines or triggers".format(verb))
     return verb, None, offset
@@ -287,7 +333,7 @@ def inventory(path):
                 statement.seek(offset)
                 tokens = o19sql.Lexer().feed(statement.read(32768), final=True)
                 wrapper = len(tokens) == 6 and [value.upper() for _, value in tokens[3:5]] in ([b"DISABLE", b"KEYS"], [b"ENABLE", b"KEYS"])
-            if table and (verb in ("CREATE", "INSERT", "REPLACE") or (verb == "ALTER" and not wrapper)):
+            if table and (verb in ("CREATE", "INSERT", "REPLACE", "UPDATE") or (verb == "ALTER" and not wrapper)):
                 if verb == "CREATE":
                     if table in created:
                         raise ValueError("table {0!r} is defined twice within one dump".format(table))

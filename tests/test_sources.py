@@ -34,6 +34,21 @@ class TestCompleteBackupSet(unittest.TestCase):
             path.write_bytes(content)
         return str(path)
 
+    def test_precision_supplement_is_bound_to_the_table_inventory(self):
+        name = Path(self.dump("medication.sql", table="drugs"))
+        original = name.read_bytes()
+        statement = b"UPDATE `drugs` SET `takemin`=0.3333333432674408, `takemax`=NULL, `lastUpdateDate`=`lastUpdateDate` WHERE `drugid`=1;\n"
+        name.write_bytes(original.replace(b"-- Dump completed", statement + b"-- Dump completed"))
+        measured = o19sources.inventory(str(name))
+        name.write_bytes(original)
+        self.assertNotEqual(measured["drugs"], o19sources.inventory(str(name))["drugs"])
+        for edit in (statement.replace(b"`takemin`=", b"`quantity`="),
+                     statement.replace(b"`drugid`=1", b"`provider_no`=1"),
+                     statement.replace(b" WHERE `drugid`=1", b"")):
+            name.write_bytes(original.replace(b"-- Dump completed", edit + b"-- Dump completed"))
+            with self.assertRaisesRegex(ValueError, "unsupported UPDATE"):
+                o19sources.inventory(str(name))
+
     def test_verified_snapshot_reuse_does_not_allocate_a_second_copy(self):
         source = Path(self.dump("source.sql"))
         destination = self.root / "private.sql"

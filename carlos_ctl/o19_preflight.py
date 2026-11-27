@@ -2394,7 +2394,7 @@ DIGEST_LARGE_TYPES = (
 #: hashed on their own, NULL-propagating row join, the `unhashed` lane.
 #: 3: large binary values hashed as raw bytes, and a rendering the
 #: server refuses counted in that lane rather than filed as a NULL
-DIGEST_FORMAT = 3
+DIGEST_FORMAT = 4
 
 
 def digest_value_expr(col, coltype):
@@ -2421,6 +2421,11 @@ def digest_value_expr(col, coltype):
         else:
             rendered = "HEX({0})".format(quoted)
             length = "CHAR_LENGTH({0})".format(rendered)
+    elif normalised == "float":
+        # Direct character conversion keeps only six significant digits on
+        # MariaDB. Widen binary32 exactly before requesting the decimal text.
+        rendered = "CONVERT(({0} + 0e0) USING utf8mb4)".format(quoted)
+        length = "CHAR_LENGTH({0})".format(rendered)
     elif normalised in DIGEST_CONVERTED_TYPES:
         rendered = "CONVERT({0} USING utf8mb4)".format(quoted)
         length = "CHAR_LENGTH({0})".format(rendered)
@@ -4195,9 +4200,13 @@ def render_text(report):
     view_flags = ""
     if views:
         view_flags = " " + " ".join(ignore_table_flags(views[0]["data"]))
+    lines.append("  # Copy /usr/share/carlos-emr/o19-manifest/export-medication-floats.py "
+                 "from the matching CARLOS package into this private directory.")
     lines.append("  mysqldump --single-transaction --quick --skip-triggers "
-                 "{0}<db> | gzip > o19.sql.gz".format(
-                     view_flags.strip() + " " if view_flags else ""))
+                 "{0}<db> |".format(view_flags.strip() + " " if view_flags else ""))
+    lines.append("    python3 export-medication-floats.py --complete-dump "
+                 "--db <db> | gzip > o19.sql.gz.tmp")
+    lines.append("  mv o19.sql.gz.tmp o19.sql.gz")
     lines.append("    (MySQL 5.6+: add --set-gtid-purged=OFF; the import "
                  "refuses a dump that sets GTID_PURGED)")
     if views:
