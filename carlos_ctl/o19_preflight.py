@@ -4204,7 +4204,8 @@ def render_text(report):
                  "from the matching CARLOS package into this private directory.")
     lines.append("  mysqldump --single-transaction --quick --skip-triggers "
                  "{0}<db> |".format(view_flags.strip() + " " if view_flags else ""))
-    lines.append("    python3 export-medication-floats.py --complete-dump --db <db> | gzip > o19.sql.gz.tmp")
+    lines.append("    python3 export-medication-floats.py --complete-dump "
+                 "--db <db> | gzip > o19.sql.gz.tmp")
     lines.append("  mv o19.sql.gz.tmp o19.sql.gz")
     lines.append("    (MySQL 5.6+: add --set-gtid-purged=OFF; the import "
                  "refuses a dump that sets GTID_PURGED)")
